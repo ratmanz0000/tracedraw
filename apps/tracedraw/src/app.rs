@@ -8924,15 +8924,24 @@ impl App {
             return;
         }
         // A drawing read already off the interface's thread (#2849).
-        let opened_read = match self.opened_read.take() {
-            Some((p, read)) if p == path && ext == "tdraw" => Some(read),
+        let opened_read: Option<crate::opening::OpenRead> = match self.opened_read.take() {
+            Some((p, read)) if p == path && matches!(ext.as_str(), "tdraw" | "cdr" | "cmx") => {
+                Some(read)
+            }
             _ => None,
         };
         // A large drawing is read off the interface's thread, with a
         // window that shows how far it got (#2849); the open ends when
-        // it is read ([`App::poll_opening`]).
-        if ext == "tdraw" && opened_read.is_none() {
-            if let Some(size) = crate::opening::wants_background(&path) {
+        // it is read ([`App::poll_opening`]). A `.cdr` or `.cmx` always:
+        // 76 000 objects in a 5 MB file froze the window just the same
+        // as a large picture did.
+        if matches!(ext.as_str(), "tdraw" | "cdr" | "cmx") && opened_read.is_none() {
+            let from = if ext == "tdraw" {
+                crate::opening::BACKGROUND_FROM
+            } else {
+                0
+            };
+            if let Some(size) = crate::opening::wants_background_from(&path, from) {
                 if let Some(old) = self.opening.take() {
                     old.cancel();
                 }
@@ -9314,63 +9323,78 @@ impl App {
                     (o.doc, msg)
                 })
         } else if ext == "cmx" {
-            Self::open_cdr(&path)
-                .map(|(doc, report)| {
+            match opened_read {
+                Some(Ok(crate::opening::OpenedFile::Cdr(doc, report))) => {
                     for w in &report.warnings {
                         log::warn!("cmx: {w}");
                     }
                     unread = report.skipped_objects;
-                    (
-                        doc,
-                        crate::i18n::trf(
-                            "status.opened_pages",
-                            &[
-                                ("format", "CMX"),
-                                ("pages", &report.pages.to_string()),
-                                ("objects", &report.shapes.to_string()),
-                            ],
-                        ),
-                    )
-                })
-                .map_err(|e| e.to_string())
-        } else if ext == "cdr" {
-            Self::open_cdr(&path)
-                .map(|(doc, report)| {
-                    let ver = report.version.map(|v| v.name()).unwrap_or_default();
-                    for w in &report.warnings {
-                        log::warn!("cdr: {w}");
-                    }
-                    unread = report.skipped_objects;
-                    cdr_version = report.version.map(|v| writable_cdr_version(v.0));
-                    opened_version = report.version.map(|v| v.0);
-                    let mut msg = crate::i18n::trf(
-                        "status.opened_cdr",
+                    let msg = crate::i18n::trf(
+                        "status.opened_pages",
                         &[
-                            ("version", &ver.to_string()),
+                            ("format", "CMX"),
                             ("pages", &report.pages.to_string()),
                             ("objects", &report.shapes.to_string()),
-                            ("skipped", &report.skipped_objects.to_string()),
                         ],
                     );
-                    // An older version than TraceDraw saves: say which
-                    // version Save will write.
-                    if let (Some(v), Some(w)) = (report.version, cdr_version) {
-                        if v.0 != w {
-                            msg.push(' ');
-                            msg.push_str(&crate::i18n::trf(
-                                "status.cdr_saves_as",
-                                &[("version", &w.to_string())],
-                            ));
+                    Ok((doc, msg))
+                }
+                Some(Err(e)) => Err(e),
+                _ => Self::open_cdr(&path)
+                    .map(|(doc, report)| {
+                        for w in &report.warnings {
+                            log::warn!("cmx: {w}");
                         }
-                    }
+                        unread = report.skipped_objects;
+                        (
+                            doc,
+                            crate::i18n::trf(
+                                "status.opened_pages",
+                                &[
+                                    ("format", "CMX"),
+                                    ("pages", &report.pages.to_string()),
+                                    ("objects", &report.shapes.to_string()),
+                                ],
+                            ),
+                        )
+                    })
+                    .map_err(|e| e.to_string()),
+            }
+        } else if ext == "cdr" {
+            match opened_read {
+                Some(Ok(crate::opening::OpenedFile::Cdr(doc, report))) => {
+                    let (doc, msg) = Self::cdr_opened(
+                        doc,
+                        *report,
+                        &mut unread,
+                        &mut cdr_version,
+                        &mut opened_version,
+                    );
+                    Ok((doc, msg))
+                }
+                Some(Err(e)) => Err(e),
+                _ => Self::open_cdr(&path).map(|(doc, report)| {
+                    let (doc, msg) = Self::cdr_opened(
+                        doc,
+                        report,
+                        &mut unread,
+                        &mut cdr_version,
+                        &mut opened_version,
+                    );
                     (doc, msg)
-                })
-                .map_err(|e| e.to_string())
+                }),
+            }
         } else if let Some(read) = opened_read {
-            read.map(|(d, known)| {
-                tdraw_version = Some(known);
-                (d, crate::i18n::tr("status.opened"))
-            })
+            match read {
+                Ok(crate::opening::OpenedFile::Tdraw(d, known)) => {
+                    tdraw_version = Some(known);
+                    Ok((d, crate::i18n::tr("status.opened")))
+                }
+                Ok(crate::opening::OpenedFile::Cdr(..)) => {
+                    Err("the opened file is not a drawing of TraceDraw's own".into())
+                }
+                Err(e) => Err(e),
+            }
         } else {
             crate::files::read(&path)
                 .and_then(|bytes| tracedraw_core::document::tdraw_text(&bytes))
@@ -10848,10 +10872,53 @@ impl App {
         }
     }
 
+    /// Free physical RAM in bytes; 0 when the OS will not say.
+    fn free_ram() -> u64 {
+        crate::opening::free_ram()
+    }
+
+    /// The document and the status line an opened `.cdr` leaves, from
+    /// what the reader reported.
+    fn cdr_opened(
+        doc: tracedraw_core::Document,
+        report: tracedraw_cdr::ParseReport,
+        unread: &mut usize,
+        cdr_version: &mut Option<u16>,
+        opened_version: &mut Option<u16>,
+    ) -> (tracedraw_core::Document, String) {
+        let ver = report.version.map(|v| v.name()).unwrap_or_default();
+        for w in &report.warnings {
+            log::warn!("cdr: {w}");
+        }
+        *unread = report.skipped_objects;
+        *cdr_version = report.version.map(|v| writable_cdr_version(v.0));
+        *opened_version = report.version.map(|v| v.0);
+        let mut msg = crate::i18n::trf(
+            "status.opened_cdr",
+            &[
+                ("version", &ver.to_string()),
+                ("pages", &report.pages.to_string()),
+                ("objects", &report.shapes.to_string()),
+                ("skipped", &report.skipped_objects.to_string()),
+            ],
+        );
+        if let (Some(v), Some(w)) = (report.version, *cdr_version) {
+            if v.0 != w {
+                msg.push(' ');
+                msg.push_str(&crate::i18n::trf(
+                    "status.cdr_saves_as",
+                    &[("version", &w.to_string())],
+                ));
+            }
+        }
+        (doc, msg)
+    }
+
     /// Read a `.cdr` file through the file layer (uploads in a browser).
     pub(crate) fn open_cdr(
         path: &std::path::Path,
     ) -> std::result::Result<(tracedraw_core::Document, tracedraw_cdr::ParseReport), String> {
+        tracedraw_cdr::set_open_ram(Self::free_ram());
         let bytes = crate::files::read(path).map_err(|e| e.to_string())?;
         let title = path
             .file_stem()
