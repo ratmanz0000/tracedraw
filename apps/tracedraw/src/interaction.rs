@@ -1344,6 +1344,9 @@ impl App {
                 let local = self.pivots.single.get(one)?;
                 self.doc().shape_on_page(*one)?.transform * *local
             }
+            // Most selections have no centre of rotation of their own:
+            // no copy and sort of thousands of ids a frame for them.
+            _ if self.pivots.several.is_empty() => return None,
             many => {
                 let mut key = many.to_vec();
                 key.sort();

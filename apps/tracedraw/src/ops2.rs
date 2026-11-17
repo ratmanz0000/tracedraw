@@ -802,6 +802,11 @@ impl App {
     /// Measured from the size made 100% with
     /// [`set_scale_as_100`](Self::set_scale_as_100) when it was (#2761).
     pub fn scale_shown(&self) -> (f64, f64) {
+        // Asked each frame: more than one object shows 100% without a
+        // copy of each.
+        if self.selection.len() != 1 {
+            return (100.0, 100.0);
+        }
         let shapes = self.selected_shapes();
         let [s] = shapes.as_slice() else {
             return (100.0, 100.0);
@@ -3528,11 +3533,12 @@ impl App {
     /// Whether any selected object wraps paragraph text, and the wrap
     /// style of the first one.
     pub fn wrap_state(&self) -> (bool, tracedraw_core::TextWrap) {
-        let shapes = self.selected_shapes();
-        (
-            shapes.iter().any(|s| s.wrap_text),
-            shapes.first().map(|s| s.wrap_style).unwrap_or_default(),
-        )
+        *self.from_selection("wrap_state", |shapes| {
+            (
+                shapes.iter().any(|s| s.wrap_text),
+                shapes.first().map(|s| s.wrap_style).unwrap_or_default(),
+            )
+        })
     }
 
     /// Wrap paragraph text around the selected objects with this style,

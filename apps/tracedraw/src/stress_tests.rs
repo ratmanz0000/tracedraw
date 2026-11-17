@@ -202,7 +202,8 @@ fn stress_deep_groups() {
 }
 
 /// One slow operation repeated, for sampling with a debugger:
-/// `STRESS_OP=nudge|frame|undo`.
+/// `STRESS_OP=nudge|frame|undo|pan` (`STRESS_NOSEL` leaves nothing
+/// selected).
 #[test]
 #[ignore]
 fn stress_profile_one() {
@@ -217,7 +218,9 @@ fn stress_profile_one() {
     if std::env::var_os("STRESS_DOCKER").is_some() {
         app.open_docker(DockerTab::Objects);
     }
-    app.select_all();
+    if std::env::var_os("STRESS_NOSEL").is_none() {
+        app.select_all();
+    }
     frame(&ctx, &mut app);
     eprintln!("STRESS ready");
     for i in 0..300 {
@@ -226,6 +229,10 @@ fn stress_profile_one() {
             "undo" => {
                 app.nudge(Vec2::new(0.1, 0.0));
                 app.undo()
+            }
+            "pan" => {
+                app.view.origin += egui::vec2(3.0, 2.0);
+                frame(&ctx, &mut app)
             }
             _ => frame(&ctx, &mut app),
         });

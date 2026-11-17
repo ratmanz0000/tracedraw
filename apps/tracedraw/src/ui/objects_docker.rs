@@ -466,6 +466,12 @@ fn row_of(ui: &mut Ui, look: Look, height: f32) -> (Rect, egui::Response) {
         Vec2::new(ui.available_width(), height),
         Sense::click_and_drag(),
     );
+    paint_row(ui, look, rect, &resp);
+    (rect, resp)
+}
+
+/// The background of a row: selected, active, hovered or plain.
+fn paint_row(ui: &Ui, look: Look, rect: Rect, resp: &egui::Response) {
     let p = ui.painter();
     match look {
         Look::Object { selected: true } => {
@@ -493,7 +499,6 @@ fn row_of(ui: &mut Ui, look: Look, height: f32) -> (Rect, egui::Response) {
         }
         _ => {}
     }
-    (rect, resp)
 }
 
 /// A clickable square of `size` at `x` in the row `rect`.
@@ -1309,10 +1314,17 @@ fn object_rows(app: &App, ui: &mut Ui, s: &Shape, depth: usize, act: &mut Action
     let selected = act.selected.contains(&s.id);
     act.row_order.push(s.id);
     let height = (act.thumb_size + 6.0).max(ROW_H);
-    let (rect, resp) = row_of(ui, Look::Object { selected }, height);
+    // A row scrolled out of sight only takes its place: asking egui
+    // whether the pointer is on each of 50,000 rows took most of a second
+    // a frame. The row being dragged still answers, so a drag that
+    // scrolls it away goes on.
+    let (id, rect) = ui.allocate_space(Vec2::new(ui.available_width(), height));
     if act.scroll_to == Some(s.id) {
         ui.scroll_to_rect(rect, None);
     }
+    let visible = ui.is_rect_visible(rect);
+    let resp = (visible || ui.ctx().is_being_dragged(id))
+        .then(|| ui.interact(rect, id, Sense::click_and_drag()));
     let children: Option<&Vec<Shape>> = match &s.kind {
         ShapeKind::Group { children } => Some(children),
         _ => None,
@@ -1320,7 +1332,8 @@ fn object_rows(app: &App, ui: &mut Ui, s: &Shape, depth: usize, act: &mut Action
     let expanded = app.objects_open_groups.contains(&s.id);
     // Rows scrolled out of sight are only laid out: nothing is drawn or
     // asked of them, so a long list costs little.
-    if ui.is_rect_visible(rect) {
+    if let (Some(resp), true) = (resp, visible) {
+        paint_row(ui, Look::Object { selected }, rect, &resp);
         object_row(app, ui, s, (rect, resp), depth, expanded, act);
     }
     if let (Some(children), true) = (children, expanded) {

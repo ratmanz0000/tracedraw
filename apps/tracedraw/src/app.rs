@@ -2610,6 +2610,10 @@ pub struct SelectedCache {
     shapes: std::rc::Rc<Vec<Shape>>,
     /// Their visual bounds, once asked for.
     bounds: std::cell::RefCell<Option<std::rc::Rc<Vec<Rect>>>>,
+    /// Answers worked out from them, by name, once asked for (see
+    /// [`App::from_selection`]).
+    derived:
+        std::cell::RefCell<std::collections::HashMap<&'static str, std::rc::Rc<dyn std::any::Any>>>,
 }
 
 /// An action Edit > Repeat can repeat.
@@ -5460,6 +5464,7 @@ impl App {
                 selection: self.selection.clone(),
                 shapes: shapes.clone(),
                 bounds: Default::default(),
+                derived: Default::default(),
             });
         }
         shapes
@@ -5526,14 +5531,17 @@ impl App {
         if self.selection.len() <= 8 {
             return self.selection.iter().any(|id| doc.is_nested(*id));
         }
-        // One pass over the layers rather than a search per object (#367).
-        let on_layer: std::collections::HashSet<ShapeId> = doc
-            .all_layers()
-            .flat_map(|l| l.shapes.iter().map(|s| s.id))
-            .collect();
-        self.selection
-            .iter()
-            .any(|id| !on_layer.contains(id) && doc.find_shape(*id).is_some())
+        // One pass over the layers rather than a search per object (#367),
+        // and only once for the selection: the canvas asks every frame.
+        *self.from_selection("nested", |_| {
+            let on_layer: std::collections::HashSet<ShapeId> = doc
+                .all_layers()
+                .flat_map(|l| l.shapes.iter().map(|s| s.id))
+                .collect();
+            self.selection
+                .iter()
+                .any(|id| !on_layer.contains(id) && doc.find_shape(*id).is_some())
+        })
     }
 
     /// Turn the rotate and skew handles on or off (a moved centre of
@@ -5583,6 +5591,43 @@ impl App {
             }
         }
         b
+    }
+
+    /// `f` of [`Self::selected_rc`], worked out once for the gathered
+    /// selection and kept with it under `name`: what the bars show of the
+    /// selection is asked for every frame, and going through each of
+    /// 50,000 selected objects for it made each frame take a fifth of a
+    /// second. `f` may read the app only as the selection and the drawing
+    /// it is kept for (a new revision or selection works it out anew).
+    pub fn from_selection<T: 'static>(
+        &self,
+        name: &'static str,
+        f: impl FnOnce(&[Shape]) -> T,
+    ) -> std::rc::Rc<T> {
+        let shapes = self.selected_rc();
+        let kept = |c: &SelectedCache| {
+            std::rc::Rc::ptr_eq(&c.shapes, &shapes)
+                .then(|| c.derived.borrow().get(name).cloned())
+                .flatten()
+                .and_then(|v| v.downcast::<T>().ok())
+        };
+        if let Ok(cache) = self.selected_cache.try_borrow() {
+            if let Some(v) = cache.as_ref().and_then(kept) {
+                return v;
+            }
+        }
+        let v = std::rc::Rc::new(f(&shapes));
+        if let Ok(cache) = self.selected_cache.try_borrow() {
+            if let Some(c) = cache
+                .as_ref()
+                .filter(|c| std::rc::Rc::ptr_eq(&c.shapes, &shapes))
+            {
+                c.derived
+                    .borrow_mut()
+                    .insert(name, v.clone() as std::rc::Rc<dyn std::any::Any>);
+            }
+        }
+        v
     }
 
     /// The outlines of the selected objects in page space, flattened
@@ -7102,8 +7147,10 @@ impl App {
 
     /// Something selected that Convert to Curves would change.
     pub fn can_convert_to_curves(&self) -> bool {
-        self.selected_shapes().iter().any(|s| {
-            s.converts_to_curves() || s.has_outline_warp() || crate::dimensions::is_dimension(s)
+        *self.from_selection("converts_to_curves", |shapes| {
+            shapes.iter().any(|s| {
+                s.converts_to_curves() || s.has_outline_warp() || crate::dimensions::is_dimension(s)
+            })
         })
     }
 
