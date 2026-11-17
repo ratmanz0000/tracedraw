@@ -231,3 +231,54 @@ fn letters_typed_with_altgr_type_into_text() {
         assert_eq!(app.edit_text(), "Zaąćęłźż{", "paragraph {paragraph}");
     }
 }
+
+/// #3108: Ctrl+Z (Command+Z on macOS) while a paragraph or artistic text
+/// is typed undoes the typing and leaves the text open for typing; Ctrl+
+/// Shift+Z and Ctrl+Y bring it back. The keys did nothing while typing.
+#[test]
+fn undo_and_redo_keys_work_while_typing() {
+    let key = |k: egui::Key, shift: bool| Event::Key {
+        key: k,
+        physical_key: Some(k),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        },
+    };
+    for paragraph in [false, true] {
+        let (ctx, mut app) = setup();
+        start(&ctx, &mut app, paragraph);
+        frame(&ctx, &mut app, vec![Event::Text("Hello".into())]);
+        let id = app.text_edit.as_ref().expect("typing").shape;
+        app.finish_text();
+        // Typing more into the text, then Ctrl+Z.
+        app.begin_text_edit(id);
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, vec![Event::Text(" world".into())]);
+        assert_eq!(app.edit_text(), "Hello world");
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, false)]);
+        let te = app.text_edit.as_ref().expect("still typing");
+        assert_eq!(te.shape, id, "paragraph {paragraph}");
+        assert_eq!(app.edit_text(), "Hello", "paragraph {paragraph}");
+        assert_eq!(te.caret, 5);
+        // Redo with Ctrl+Shift+Z, undo again, redo with Ctrl+Y.
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, true)]);
+        assert_eq!(app.edit_text(), "Hello world", "paragraph {paragraph}");
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, false)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Y, false)]);
+        assert_eq!(app.edit_text(), "Hello world", "paragraph {paragraph}");
+        // Typing goes on in the text.
+        frame(&ctx, &mut app, vec![Event::Text("!".into())]);
+        assert_eq!(app.edit_text(), "Hello world!", "paragraph {paragraph}");
+        // Undoing all the way takes a new text away and ends the typing.
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, false)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, false)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Z, false)]);
+        assert!(app.doc().find_shape(id).is_none(), "paragraph {paragraph}");
+        assert!(app.text_edit.is_none());
+    }
+}

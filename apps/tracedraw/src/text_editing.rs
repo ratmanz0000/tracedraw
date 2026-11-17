@@ -624,6 +624,17 @@ impl App {
                         Key::Home => self.text_move(CaretMove::LineStart, shift),
                         Key::End => self.text_move(CaretMove::LineEnd, shift),
                         Key::A if ctrl => self.text_select_all(),
+                        // Undo and Redo while typing: the drawing's step
+                        // goes back or comes again and the text stays open
+                        // for typing. The keys did nothing here (#3108).
+                        Key::Z if ctrl => {
+                            self.text_undo(shift);
+                            return;
+                        }
+                        Key::Y if ctrl && !shift => {
+                            self.text_undo(true);
+                            return;
+                        }
                         // Alignment of the paragraphs at the caret (the
                         // same keys export, combine and repeat when no
                         // text is being typed).
@@ -670,6 +681,32 @@ impl App {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Ctrl+Z (or, with `redo`, Ctrl+Shift+Z and Ctrl+Y) while a text is
+    /// typed: Edit > Undo or Redo, then the same text open for typing
+    /// again, the caret where it was (at the end when it was there). A
+    /// new text that the undo takes away ends the typing (#3108).
+    pub fn text_undo(&mut self, redo: bool) {
+        let Some(te) = self.text_edit.clone() else {
+            return;
+        };
+        let at_end = te.caret == spans_char_count(&self.edit_spans().unwrap_or_default());
+        self.finish_text();
+        if redo {
+            self.redo();
+        } else {
+            self.undo();
+        }
+        let len = match self.doc().find_shape(te.shape).map(|s| &s.kind) {
+            Some(ShapeKind::Text { spans, .. }) => spans_char_count(spans),
+            _ => return,
+        };
+        self.begin_text_edit(te.shape);
+        if let Some(t) = self.text_edit.as_mut() {
+            t.caret = if at_end { len } else { te.caret.min(len) };
+            t.anchor = t.caret;
         }
     }
 
