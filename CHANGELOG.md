@@ -25,6 +25,7 @@ full, row-by-row status.
 - Saving as `.cdr`: a filled curve set to fill with the nonzero rule (Fill winding), such as converted lettering, keeps its smooth and symmetrical nodes when none of its parts overlap; since 0.48.0 every such curve came back with all its nodes cusps.
 - Files dragged onto the window on Windows: a file dropped once was imported again every time the window was minimized and brought back, until TraceDraw was restarted. The input kept while the window was minimized listed the dragged files again at every frame, and the copies counted as a new drag (#3058).
 - Touch keys on the drawing: two quick taps on Shift, Ctrl or Alt lock the key down until the next tap, as on a phone keyboard. Since 0.47 a tap only pressed and let go the key, so it worked only while a finger held it (#3101, #3102).
+- Freehand by clicks: a click on the first node of a line of three nodes or more closes it, where the pointer shows the close mark. It added a node there and the line went on, so closing took a double-click (#2339).
 
 ## 0.48.0 (2026-11-16)
 
