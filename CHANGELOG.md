@@ -8,6 +8,7 @@ full, row-by-row status.
 
 - Lens docker: Apply with Frozen keeps what the lens shows, as a picture inside the object, and the object keeps that look when moved. It used to drop the lens, and the object went back to its own colour (#3097).
 - `.cdr` (version 16 and later): a fountain transparency whose nodes are not stored as greys, or whose nodes the object's style does not list, opens graded instead of solid or evenly see-through (#3095).
+- PDF import: text with an outline keeps it. Text filled in one colour and outlined in another, as TraceDraw's PDF export writes it, came in bold with no outline, and text drawn as an outline only came in filled black. Text outlined in its own fill colour, the way some programs make up bold, still comes in as bold.
 - `.cdr`: an object embedded as a wrapped file (Object Packager, such as a `.crv3d` project) has no picture to show; it now keeps its place as a grey box named after the file instead of being dropped (#3083).
 - Print: Fit to page scales the page to fill the paper inside its margins, larger or smaller, and what is put partly off a page stays cut at its edge, where it was drawn, on facing pages too. It pulled such objects onto the page and shrank the page's other objects with them. Printing the selection, Fit to page still shrinks it to fit the page (#2678).
 - Saving as `.cdr`: a filled curve set to fill with the nonzero rule (Fill winding), such as converted lettering, keeps its smooth and symmetrical nodes when none of its parts overlap; since 0.48.0 every such curve came back with all its nodes cusps.
