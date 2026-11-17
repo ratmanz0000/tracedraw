@@ -20,6 +20,7 @@ full, row-by-row status.
 - Saving as `.cdr` and opening it again keeps a line break made with Shift+Enter as a line break: it came back as a new paragraph, so the line after it took the first-line indent, the space before and a bullet of its own. A file for CorelDRAW 7 to 11 gets a paragraph break there instead of a "?", which had also turned every accented letter of the text into one.
 - Saving as `.cdr`: a filled curve set to fill with the nonzero rule (Fill winding), such as converted lettering, keeps its smooth and symmetrical nodes when none of its parts overlap; since 0.48.0 every such curve came back with all its nodes cusps.
 - Files dragged onto the window on Windows: a file dropped once was imported again every time the window was minimized and brought back, until TraceDraw was restarted. The input kept while the window was minimized listed the dragged files again at every frame, and the copies counted as a new drag (#3058).
+- Convert to Curves: a text whose words or letters have colours or outlines of their own becomes a group of curves, one for each colour, so every word keeps its colour. The whole text used to come out in one colour (#3107).
 
 ## 0.48.0 (2026-11-16)
 
