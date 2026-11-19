@@ -5756,9 +5756,12 @@ impl App {
             let place = Affine::translate((at.x, at.y));
             let id = self.engine.new_shape_id();
             if texts.is_empty() {
+                let mut inst = crate::scripting::extra::instance(id, index, t * place);
+                inst.opacity = g.opacity;
+                inst.shadow = g.shadow.clone();
                 cmds.push(Command::AddShape {
                     layer,
-                    shape: crate::scripting::extra::instance(id, index, t * place),
+                    shape: inst,
                 });
             } else {
                 let mut children = vec![crate::scripting::extra::instance(id, index, place)];
@@ -5769,6 +5772,8 @@ impl App {
                 grouped.name = g.name.clone();
                 grouped.fill = Fill::None;
                 grouped.stroke = None;
+                grouped.opacity = g.opacity;
+                grouped.shadow = g.shadow.clone();
                 cmds.push(Command::AddShape {
                     layer,
                     shape: grouped,
@@ -6621,6 +6626,76 @@ mod tests {
         assert!(app.doc().find_shape(sample).is_some());
         assert!(app.doc().find_shape(plain_id).is_some());
         assert!(app.doc().find_shape(nested_id).is_some());
+    }
+
+    /// Symbolize keeps what a copy looked like as a whole: the
+    /// transparency and shadow set on the group go on the instance it
+    /// becomes, so find-and-replace does not change how a copy draws
+    /// (#3497). A copy without them stays without.
+    #[test]
+    fn symbolize_keeps_the_groups_opacity_and_shadow_on_the_instance() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(x, 0.0, x + 10.0, 5.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let a = rect(&mut app, 0.0);
+        let b = rect(&mut app, 20.0);
+        let child = |app: &App, id: ShapeId| app.doc().find_shape(id).expect("rect").clone();
+        let layer = app.active_layer().expect("layer");
+        let mut styled = Shape::new(
+            app.engine.new_shape_id(),
+            ShapeKind::Group {
+                children: vec![child(&app, a), child(&app, b)],
+            },
+        );
+        styled.transform = Affine::translate((0.0, 30.0));
+        styled.opacity = 0.5;
+        styled.shadow = Some(tracedraw_core::Shadow {
+            offset: tracedraw_core::geometry::Vec2::new(2.0, 2.0),
+            blur: 2.0,
+            ..Default::default()
+        });
+        let styled_id = styled.id;
+        app.run(Command::AddShape {
+            layer,
+            shape: styled,
+        });
+        let mut plain = Shape::new(
+            app.engine.new_shape_id(),
+            ShapeKind::Group {
+                children: vec![child(&app, a), child(&app, b)],
+            },
+        );
+        plain.transform = Affine::translate((0.0, 60.0));
+        app.run(Command::AddShape { layer, shape: plain });
+        app.select(vec![styled_id]);
+        app.symbolize_selection();
+        assert_eq!(app.doc().symbols.len(), 1);
+        let inst_at = |y: f64| {
+            app.selection
+                .iter()
+                .filter_map(|id| app.doc().find_shape(*id))
+                .find(|s| {
+                    matches!(s.kind, ShapeKind::SymbolInstance { index: 0 })
+                        && (app.visual_bounds(s).y0 - y).abs() < 1e-6
+                })
+                .unwrap_or_else(|| panic!("no instance at y {y}"))
+        };
+        let see_through = inst_at(30.0);
+        assert!(
+            (see_through.opacity - 0.5).abs() < 1e-6,
+            "the instance lost the group's transparency"
+        );
+        let sh = see_through.shadow.as_ref().expect("the group's shadow");
+        assert!((sh.offset.x - 2.0).abs() < 1e-6 && (sh.blur - 2.0).abs() < 1e-6);
+        let solid = inst_at(60.0);
+        assert!((solid.opacity - 1.0).abs() < 1e-6);
+        assert!(solid.shadow.is_none(), "the plain copy grew a shadow");
     }
 
     /// New Symbol is one step to undo: the symbol goes with its instance.
