@@ -228,10 +228,9 @@ pub fn dialog(app: &mut App, ctx: &Context, st: &mut ArrowheadEditorState, close
         };
         ui.horizontal(|ui| {
             row_label(ui, "arrowhead_editor.head");
-            if crate::ui::dockers::arrow_combo(
+            if crate::ui::arrow_pick::head_pick(
                 ui,
                 id,
-                &tr("arrowhead_editor.head"),
                 &mut st.head,
                 &lib.arrows,
                 st.head_mixed && !st.head_set,

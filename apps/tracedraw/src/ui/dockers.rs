@@ -9,9 +9,9 @@ use crate::ui::tips::RichTip;
 use egui::Ui;
 use tracedraw_core::patch::{FillField, FillMix, StrokeField, StrokeMix};
 use tracedraw_core::{
-    document::ShapeKind, Arrowhead, Color, ColorBlend, Command, Fill, Fountain, FountainKind,
-    FountainRepeat, Pattern, PatternTile, Procedural, ProceduralParam, ProceduralParams,
-    ProceduralPattern, Stop, Stroke, Texture, TextureKind,
+    document::ShapeKind, Color, ColorBlend, Command, Fill, Fountain, FountainKind, FountainRepeat,
+    Pattern, PatternTile, Procedural, ProceduralParam, ProceduralParams, ProceduralPattern, Stop,
+    Stroke, Texture, TextureKind,
 };
 
 /// The vertical strip of docker tabs on the right edge of the window.
@@ -3812,51 +3812,6 @@ pub(crate) fn procedural_editor(ui: &mut Ui, p: &mut Procedural) -> bool {
     changed
 }
 
-pub(crate) fn arrow_combo(
-    ui: &mut Ui,
-    id: &str,
-    label: &str,
-    a: &mut Arrowhead,
-    custom: &[Arrowhead],
-    mixed: bool,
-) -> bool {
-    let mut changed = false;
-    let shown = if mixed {
-        format!("{label}:")
-    } else {
-        format!("{label}: {}", a.name())
-    };
-    let tip = if id.to_lowercase().ends_with("end") {
-        "toolbar.end_arrow"
-    } else {
-        "toolbar.start_arrow"
-    };
-    crate::ui::keynav::ComboBox::from_id_salt(id)
-        .selected_text(shown)
-        .show_ui(ui, |ui| {
-            for k in Arrowhead::ALL {
-                if ui.selectable_label(!mixed && *a == k, k.name()).clicked() {
-                    *a = k;
-                    changed = true;
-                }
-            }
-            for (i, k) in custom.iter().enumerate() {
-                let name = if k.name().is_empty() {
-                    trf("docker.custom_arrowhead_n", &[("n", &(i + 1).to_string())])
-                } else {
-                    k.name().to_string()
-                };
-                if ui.selectable_label(!mixed && a == k, name).clicked() {
-                    *a = k.clone();
-                    changed = true;
-                }
-            }
-        })
-        .response
-        .rich_tip(crate::ui::tips::keyed(tip));
-    changed
-}
-
 /// An outline's paint as a fill: its own fill, or its colour as a
 /// uniform fill.
 fn outline_paint_of(s: &Stroke) -> Fill {
@@ -4072,7 +4027,8 @@ fn outline_editor_mixed(
                     } else {
                         &mut s.start_arrow
                     };
-                    if arrow_combo(ui, id, &tr(key), a, custom, mix.has(field)) {
+                    ui.label(format!("{}:", tr(key)));
+                    if crate::ui::arrow_pick::head_pick(ui, id, a, custom, mix.has(field)) {
                         if !end && s.share_arrowheads {
                             s.share_start_head();
                         }

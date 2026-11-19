@@ -484,7 +484,8 @@ fn arrowheads(ui: &mut Ui, st: &mut OutlinePenState, lib: &crate::ui::line_style
                 } else {
                     &mut st.stroke.start_arrow
                 };
-                if crate::ui::dockers::arrow_combo(ui, id, &tr(key), a, &lib.arrows, mixed) {
+                ui.label(format!("{}:", tr(key)));
+                if crate::ui::arrow_pick::head_pick(ui, id, a, &lib.arrows, mixed) {
                     if !end && st.stroke.share_arrowheads {
                         st.stroke.share_start_head();
                     }

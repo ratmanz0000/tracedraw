@@ -16,8 +16,12 @@ outline when nothing is selected. Groups:
   comes back), Mitre limit (with mitred corners), Dashes (as they come,
   or aligned to corners and ends), Corners, Line caps and Position as
   picture buttons.
-- Arrowheads: start and end, each with a "..." that opens the Arrowhead
-  editor on that end, and Share attributes (see below).
+- Arrowheads: start and end, each picked by a button that shows the
+  head's silhouette and opens a menu of silhouettes, the presets and
+  then the custom heads of the outline library; a selection whose heads
+  differ shows a broken line until one is picked. Each end also has a
+  "..." that opens the Arrowhead editor on that end, and Share
+  attributes (see below) sits after the end's.
 - Calligraphy: Stretch (10 to 100 %), Angle (-90 to 90 degrees), Default
   (100 %, 0), and a picture of the nib; dragging on it sets angle and
   stretch. Behind fill, Scale with object.

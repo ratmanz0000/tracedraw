@@ -4392,6 +4392,14 @@ fn point_back(sub: &crate::geometry::BezPath, len: f64, from_end: bool) -> Optio
     })
 }
 
+/// The outline of a preset head at the unit preset size, in head space:
+/// the tip at x = 0, the body towards -x, about one unit tall, for
+/// silhouette previews of the heads in the interface. `None` gives `None`
+/// (a preset with no shape to show) and a `Custom` head its own outline.
+pub fn arrowhead_preset_outline(kind: &Arrowhead) -> Option<crate::geometry::BezPath> {
+    head_outline(kind, 1.0, 0.25)
+}
+
 /// Arrowhead outlines (page space) for an open path's ends, sized by the
 /// outline width (hairlines use 0.25 mm) and each end's placement (size,
 /// offset, mirror, rotation; the end takes the start's head and
@@ -4795,6 +4803,31 @@ mod arrowhead_tests {
         }
         assert_eq!(Arrowhead::ALL.len(), 7);
         assert_eq!(Arrowhead::Arrow.name(), "Arrow");
+    }
+
+    /// Every preset head has a silhouette to preview: `None` has none, and
+    /// a custom head shows its own outline.
+    #[test]
+    fn every_preset_head_has_a_silhouette_to_preview() {
+        for k in Arrowhead::ALL {
+            let outline = arrowhead_preset_outline(&k);
+            match k {
+                Arrowhead::None => assert!(outline.is_none()),
+                Arrowhead::Custom { path, .. } => {
+                    let outline = outline.expect("custom");
+                    let a = path.bounding_box();
+                    let b = outline.bounding_box();
+                    assert!((a.width() - b.width()).abs() < 1e-9);
+                    assert!((a.height() - b.height()).abs() < 1e-9);
+                }
+                _ => {
+                    let outline = outline.expect("silhouette");
+                    let b = outline.bounding_box();
+                    assert!(b.width() > 0.0 && b.height() > 0.0, "{k:?}");
+                    assert!(b.x1 < 1e-9, "the tip sits at x = 0: {k:?}");
+                }
+            }
+        }
     }
 
     #[test]
