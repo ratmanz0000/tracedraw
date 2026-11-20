@@ -23361,6 +23361,81 @@ fn the_property_bar_sets_the_corner_rounding_of_curves() {
     frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
 }
 
+/// Effects the renderer draws from the object as it is (a transparency,
+/// a lens, a blur) leave the pick of a plain object as it was: picked on
+/// its fill, not picked beyond its box, and a lens picked over its whole
+/// inside, filled or not (#2549). The pick reads the object itself then,
+/// without evaluating (and cloning) the effect stack on every pointer
+/// move. A warp still takes the evaluated path: the pick follows the
+/// warped outline, not the plain box.
+#[test]
+fn renderer_effects_leave_the_pick_of_a_plain_object_as_it_was() {
+    use tracedraw_core::live::{Effect, Lens, MergeMode};
+    let (_ctx, mut app, id) = setup();
+    // Unfilled objects are picked on their outline only, not as filled.
+    app.settings.treat_all_filled = false;
+    let inside = Point::new(35.0, 25.0);
+    let outside = Point::new(80.0, 25.0);
+    assert_eq!(app.hit_test(inside), Some(id), "the plain rect");
+    assert_eq!(app.hit_test(outside), None, "beyond the plain rect");
+    // Uniform transparency with a merge mode (#3581).
+    app.run(tracedraw_core::Command::SetEffects {
+        shape: id,
+        effects: vec![Effect::Transparency {
+            mask: tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(128, 128, 128)),
+            merge: MergeMode::Multiply,
+            target: 2,
+        }],
+    });
+    assert_eq!(app.hit_test(inside), Some(id), "through the transparency");
+    assert_eq!(app.hit_test(outside), None, "not beyond the box");
+    // A blur: the geometry is the object's own all the same.
+    app.run(tracedraw_core::Command::SetEffects {
+        shape: id,
+        effects: vec![Effect::GaussianBlur { radius: 3.0 }],
+    });
+    assert_eq!(app.hit_test(inside), Some(id), "through the blur");
+    assert_eq!(app.hit_test(outside), None, "the blur adds no pick area");
+    // A lens is picked over its whole inside (#2549).
+    app.run(tracedraw_core::Command::SetEffects {
+        shape: id,
+        effects: vec![Effect::Lens(Lens::Invert)],
+    });
+    assert_eq!(app.hit_test(inside), Some(id), "the lens inside");
+    assert_eq!(app.hit_test(outside), None, "not beyond the lens");
+    // Unfilled, the lens still picks its whole inside; without the lens
+    // the unfilled rect is picked on its outline only.
+    app.apply_fill(tracedraw_core::Fill::None);
+    assert_eq!(app.hit_test(inside), Some(id), "the lens over its inside");
+    app.run(tracedraw_core::Command::SetEffects {
+        shape: id,
+        effects: Vec::new(),
+    });
+    assert_eq!(app.hit_test(inside), None, "unfilled, no lens");
+    // A warp keeps the evaluated path: the bottom edge drawn in by 10 on
+    // each side leaves the corner (12, 38) outside, the centre inside.
+    app.apply_fill(tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(
+        200, 30, 30,
+    )));
+    app.run(tracedraw_core::Command::SetEffects {
+        shape: id,
+        effects: vec![Effect::Perspective {
+            corners: [
+                Point::new(10.0, 10.0),
+                Point::new(60.0, 10.0),
+                Point::new(50.0, 40.0),
+                Point::new(20.0, 40.0),
+            ],
+        }],
+    });
+    assert_eq!(app.hit_test(inside), Some(id), "the warped centre");
+    assert_eq!(
+        app.hit_test(Point::new(12.0, 38.0)),
+        None,
+        "the corner the warp cut off"
+    );
+}
+
 /// The gradient mask an object has, its start and end on the page.
 fn mask_line(app: &App, id: ShapeId) -> Option<(Point, Point)> {
     use tracedraw_core::geometry::Shape as _;

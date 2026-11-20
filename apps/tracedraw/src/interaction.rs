@@ -741,27 +741,55 @@ impl App {
             return false;
         }
         if !s.effects.is_empty() {
-            // What the object draws: its warped outline and the objects
-            // its effects add.
-            let ev = tracedraw_core::live::evaluate(s);
-            // A lens shows over its whole inside, filled or not: a closed
-            // shape with a Transparency lens lying over other objects is
-            // picked (and its colour read) there, not the objects beneath
-            // (#2549).
-            if s.effects
-                .iter()
-                .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
-                && tracedraw_core::command::close_subpaths(&ev.main.page_path()).contains(p)
-            {
-                return true;
+            // Effects the renderer draws from the object as it is (a
+            // transparency, a lens, shadows, a blur) add no objects and
+            // warp no outline: evaluate would only clone the shape and
+            // hand the same geometry back, on every pointer move. Pick
+            // the object itself then, without that clone. Containers keep
+            // the evaluated path: the box their pick re-reads spans the
+            // members' own effects and the symbols they hold.
+            let renderer_only = s.effects.iter().all(|e| e.drawn_by_renderer());
+            let container = matches!(
+                s.kind,
+                ShapeKind::Group { .. }
+                    | ShapeKind::ClipFrame { .. }
+                    | ShapeKind::SymbolInstance { .. }
+            );
+            if renderer_only && !container {
+                // A lens shows over its whole inside, filled or not
+                // (#2549); its outline is the object's own.
+                if s.effects
+                    .iter()
+                    .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
+                    && tracedraw_core::command::close_subpaths(&s.page_path()).contains(p)
+                {
+                    return true;
+                }
+                // The plain pick below reads the same geometry the
+                // evaluated part carried, within the same box.
+            } else {
+                // What the object draws: its warped outline and the objects
+                // its effects add.
+                let ev = tracedraw_core::live::evaluate(s);
+                // A lens shows over its whole inside, filled or not: a closed
+                // shape with a Transparency lens lying over other objects is
+                // picked (and its colour read) there, not the objects beneath
+                // (#2549).
+                if s.effects
+                    .iter()
+                    .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
+                    && tracedraw_core::command::close_subpaths(&ev.main.page_path()).contains(p)
+                {
+                    return true;
+                }
+                return std::iter::once(ev.main)
+                    .chain(ev.below)
+                    .chain(ev.above)
+                    .any(|mut part| {
+                        part.effects.clear();
+                        self.shape_hit_in(&part, p, tol, depth)
+                    });
             }
-            return std::iter::once(ev.main)
-                .chain(ev.below)
-                .chain(ev.above)
-                .any(|mut part| {
-                    part.effects.clear();
-                    self.shape_hit_in(&part, p, tol, depth)
-                });
         }
         // A dimension is picked on its lines, arrowheads and label only,
         // never in the empty part of its box: an object under it (the
