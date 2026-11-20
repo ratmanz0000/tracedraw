@@ -2836,7 +2836,7 @@ impl Renderer<'_> {
             return;
         }
         note_scratch(w, h);
-        let (Some(mut layer), Some(mut mask_pm)) = (Pixmap::new(w, h), Pixmap::new(w, h)) else {
+        let Some(mut layer) = Pixmap::new(w, h) else {
             return;
         };
         let screen = Affine::translate((-(ox as f64), -(oy as f64))) * self.screen;
@@ -2851,6 +2851,39 @@ impl Renderer<'_> {
         let page_path = transform * shape.local_path();
         let bounds = page_path.bounding_box();
         let rect_path = tracedraw_core::geometry::rect_path(bounds, 0.0);
+        // The mask is drawn over the object's box; past it (where the
+        // outer half of an outline lies) it goes on as it is at the box's
+        // edge, the nearest pixel wholly inside the box. Taken as no
+        // transparency there, the outline of a rounded rectangle showed
+        // opaque outside the box and faded inside it, so most of it
+        // seemed to stay and its corners to vanish (live test of 0.41).
+        let sb = (screen * rect_path.clone()).bounding_box();
+        let inner = |lo: f64, hi: f64, n: u32| -> Option<(usize, usize)> {
+            let (a, b) = (lo.ceil().max(0.0), (hi.floor() - 1.0).min(n as f64 - 1.0));
+            (a.is_finite() && b.is_finite() && a <= b).then_some((a as usize, b as usize))
+        };
+        let inside = inner(sb.x0, sb.x1, w).zip(inner(sb.y0, sb.y1, h));
+        // A solid mask is one constant luminance over the box, and the
+        // same constant past it (the edge value of a solid fill): fold it
+        // into the composite's opacity, without a second buffer and a
+        // pass over every layer pixel. A box too small for one wholly
+        // inside pixel keeps the mask path: its anti-aliased edge is not
+        // one constant.
+        if let (Fill::Solid(c), Some(_)) = (mask_fill, inside) {
+            let [r, g, b] = c.to_rgb8();
+            let m = ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) / 256) as u8;
+            composite_layer_with_opacity(
+                self.pixmap,
+                &layer,
+                (ox as i32, oy as i32),
+                merge,
+                m as f32 / 255.0,
+            );
+            return;
+        }
+        let Some(mut mask_pm) = Pixmap::new(w, h) else {
+            return;
+        };
         if let Some(sk) = to_sk_path(&(screen * rect_path.clone())) {
             let mut sub = self.sub(&mut mask_pm);
             sub.screen = screen;
@@ -2884,20 +2917,8 @@ impl Renderer<'_> {
             }
         };
         let mask_px = mask_pm.pixels();
-        // The mask is drawn over the object's box; past it (where the
-        // outer half of an outline lies) it goes on as it is at the box's
-        // edge, the nearest pixel wholly inside the box. Taken as no
-        // transparency there, the outline of a rounded rectangle showed
-        // opaque outside the box and faded inside it, so most of it
-        // seemed to stay and its corners to vanish (live test of 0.41).
-        let sb = (screen * rect_path).bounding_box();
-        let inner = |lo: f64, hi: f64, n: u32| -> Option<(usize, usize)> {
-            let (a, b) = (lo.ceil().max(0.0), (hi.floor() - 1.0).min(n as f64 - 1.0));
-            (a.is_finite() && b.is_finite() && a <= b).then_some((a as usize, b as usize))
-        };
         // Each pixel's mask value is read as the layer is worked on, with
         // no third buffer of them.
-        let inside = inner(sb.x0, sb.x1, w).zip(inner(sb.y0, sb.y1, h));
         let mask_at = |i: usize| -> u8 {
             match inside {
                 Some(((x0, x1), (y0, y1))) => {
@@ -4620,6 +4641,22 @@ pub fn composite_layer(
     at: (i32, i32),
     merge: tracedraw_core::live::MergeMode,
 ) {
+    composite_layer_with_opacity(target, layer, at, merge, 1.0);
+}
+
+/// [`composite_layer`] with the layer taken at `opacity` (0 clear,
+/// 1 opaque): a uniform transparency mask folded into the composite,
+/// the same premultiplied scaling the mask's pixel pass applied.
+pub fn composite_layer_with_opacity(
+    target: &mut Pixmap,
+    layer: &Pixmap,
+    at: (i32, i32),
+    merge: tracedraw_core::live::MergeMode,
+    opacity: f32,
+) {
+    if !(opacity > 0.0) {
+        return;
+    }
     use tracedraw_core::live::MergeMode as M;
     let mix: fn([f32; 3], [f32; 3]) -> [f32; 3] = match merge {
         M::Subtract => |cb, cs| {
@@ -4640,6 +4677,7 @@ pub fn composite_layer(
         _ => {
             let pp = tiny_skia::PixmapPaint {
                 blend_mode: merge_blend(merge),
+                opacity,
                 ..Default::default()
             };
             target.draw_pixmap(at.0, at.1, layer.as_ref(), &pp, Transform::identity(), None);
@@ -4672,7 +4710,7 @@ pub fn composite_layer(
                 continue;
             }
             let (s, d8) = (s.demultiply(), d.demultiply());
-            let (a_s, a_b) = (sa as f32 / 255.0, d8.alpha() as f32 / 255.0);
+            let (a_s, a_b) = (sa as f32 / 255.0 * opacity, d8.alpha() as f32 / 255.0);
             let cs = [
                 s.red() as f32 / 255.0,
                 s.green() as f32 / 255.0,
@@ -7801,6 +7839,60 @@ mod tests {
         // Without the mask the bar is solid black from end to end.
         assert_eq!(px(&pm, 3, 95), (0, 0, 0));
         assert_eq!(px(&pm, 96, 95), (0, 0, 0));
+    }
+
+    /// A solid transparency mask is one constant luminance: folding it
+    /// into the composite's opacity must give the pixels the mask's
+    /// pixel pass gave, for the normal merge, for Multiply, and for the
+    /// manual mixes (Subtract, Texturize; Lightness shares their opacity
+    /// scaling), over a coloured backdrop. A white mask leaves the
+    /// object whole, a black mask leaves the backdrop alone.
+    #[test]
+    fn a_solid_transparency_mask_folds_into_the_composite() {
+        use tracedraw_core::live::MergeMode as M;
+        let backdrop = rect(
+            1,
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Color::rgb8(100, 150, 200),
+        );
+        let masked = |merge: M, mask: Color| {
+            let mut s = rect(
+                2,
+                Rect::new(25.0, 25.0, 75.0, 75.0),
+                Color::rgb8(200, 30, 60),
+            );
+            s.effects.push(tracedraw_core::live::Effect::Transparency {
+                mask: Fill::Solid(mask),
+                merge,
+                target: 2,
+            });
+            s
+        };
+        let draw = |merge: M, mask: Color| {
+            let (doc, page) = doc_with(vec![backdrop.clone(), masked(merge, mask)]);
+            render_page_image(&doc, page, 25.4).unwrap()
+        };
+        let near = |pm: &Pixmap, want: (u8, u8, u8), what: &str| {
+            let (r, g, b) = px(pm, 50, 50);
+            let ok = (r as i16 - want.0 as i16).abs() <= 3
+                && (g as i16 - want.1 as i16).abs() <= 3
+                && (b as i16 - want.2 as i16).abs() <= 3;
+            assert!(ok, "{what}: ({r}, {g}, {b}) vs {want:?}");
+        };
+        // Middle grey: the mask luminance 128, alpha 128/255.
+        let grey = Color::rgb8(128, 128, 128);
+        // Normal: the source at 128/255 over the backdrop.
+        let pm = draw(M::Normal, grey);
+        near(&pm, (150, 90, 130), "normal");
+        assert_eq!(px(&pm, 5, 5), (100, 150, 200), "the backdrop stays");
+        // Multiply: the backdrop times the source, then the same alpha.
+        near(&draw(M::Multiply, grey), (89, 84, 123), "multiply");
+        // Subtract and Texturize: the manual mixes at the same alpha.
+        near(&draw(M::Subtract, grey), (72, 75, 102), "subtract");
+        near(&draw(M::Texturize, grey), (63, 95, 127), "texturize");
+        // A white mask is no transparency; a black mask hides the object.
+        near(&draw(M::Normal, Color::WHITE), (200, 30, 60), "white mask");
+        near(&draw(M::Normal, Color::BLACK), (100, 150, 200), "black mask");
     }
 
     #[test]
