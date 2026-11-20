@@ -1507,7 +1507,7 @@ pub struct Evaluated {
 }
 
 /// How many evaluations [`evaluate`] remembers.
-const EVALUATION_MEMORY: usize = 8;
+const EVALUATION_MEMORY: usize = 32;
 
 /// The latest evaluations of shapes that draw objects from their outline,
 /// newest last, each with the shape it was made from. Shared by all
@@ -1525,7 +1525,12 @@ pub fn evaluate(shape: &Shape) -> Evaluated {
         return evaluate_now(shape);
     }
     if let Ok(mut kept) = EVALUATED.lock() {
-        if let Some(i) = kept.iter().position(|(from, _)| from == shape) {
+        // The id first: a shape of another id never pays the full content
+        // comparison (paths and children) on the scan.
+        if let Some(i) = kept
+            .iter()
+            .position(|(from, _)| from.id == shape.id && from == shape)
+        {
             let hit = kept.remove(i);
             let ev = hit.1.clone();
             kept.push(hit);
@@ -4318,6 +4323,46 @@ mod tests {
         };
         let back: Effect = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
+    }
+
+    /// The evaluation cache tells shapes apart by id before comparing
+    /// their content: another id with the same geometry evaluates to the
+    /// same parts, and a changed shape of the same id is evaluated again,
+    /// not answered from the stale entry.
+    #[test]
+    fn the_evaluation_cache_keys_by_id_and_content() {
+        let base = |id: u64, color: Color| {
+            let mut s = Shape::new(
+                crate::ShapeId(id),
+                ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            s.fill = Fill::Solid(Color::BLACK);
+            s.effects = vec![Effect::ColorOverlay {
+                color,
+                opacity: 0.5,
+            }];
+            s
+        };
+        let red = Color::rgb8(255, 0, 0);
+        let blue = Color::rgb8(0, 0, 255);
+        let a = base(9001, red);
+        let first = evaluate(&a);
+        assert_eq!(first.above.len(), 1);
+        assert_eq!(first.above[0].fill, Fill::Solid(red));
+        // The same shape again: the cached evaluation, equal to the first.
+        assert_eq!(evaluate(&a).above[0].fill, Fill::Solid(red));
+        // Another id, the same content: its own evaluation, the same parts.
+        let b = base(9002, red);
+        assert_eq!(evaluate(&b).above[0].fill, Fill::Solid(red));
+        // The same id, changed content: evaluated again, not the stale red.
+        let a2 = base(9001, blue);
+        assert_eq!(evaluate(&a2).above[0].fill, Fill::Solid(blue));
+        // And the first shape still evaluates to its own colour.
+        assert_eq!(evaluate(&a).above[0].fill, Fill::Solid(red));
     }
 
     /// The parts a transparency's target fades (live test of 0.41: the
