@@ -753,6 +753,10 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     #[cfg(not(target_arch = "wasm32"))]
     crate::gpu_fx::set_enabled(app.settings.gpu_effects);
     app.raster.borrow_mut().light_zoom = app.settings.light_zoom;
+    // A fill or an outline colour dragged in a colour picker: the part
+    // of the page the selection covers, so each move renders only it
+    // anew, not the whole page (#3559).
+    app.raster.borrow_mut().live_region = live_colour_region(app, preview);
     let main = app.raster.borrow_mut().texture(
         painter.ctx(),
         doc,
@@ -917,6 +921,38 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     }
     draw_pixel_grid(app, painter, rect);
     draw_empty_clip_frames(app, painter);
+}
+
+/// The part of the page a fill or an outline colour dragged in a colour
+/// picker can change (page mm): the selection's boxes, its live effects
+/// included, widened by its outlines and shadows and by a hair for the
+/// antialiased edges. `None` while nothing is dragged so (or a drag
+/// preview moves the selection): the page renders as always. The raster
+/// renders only this part anew at every move of the pointer (#3559).
+fn live_colour_region(app: &App, preview: Option<Affine>) -> Option<Rect> {
+    if preview.is_some() || (app.live_fill.is_none() && app.live_stroke.is_none()) {
+        return None;
+    }
+    let shapes = app.selected_rc();
+    if shapes.is_empty() {
+        return None;
+    }
+    // Two pixels against the antialiased edge of the region's box.
+    let mut pad = 2.0 / app.view.zoom.max(0.01) as f64;
+    let mut region: Option<Rect> = None;
+    for s in shapes.iter() {
+        let b = app.visual_bounds(s);
+        if b.is_finite() {
+            region = Some(region.map_or(b, |r| r.union(b)));
+        }
+        if let Some(st) = &s.stroke {
+            pad = pad.max(st.width / 2.0);
+        }
+        if let Some(sh) = &s.shadow {
+            pad = pad.max(sh.offset.hypot() + 2.0 * sh.blur.max(0.0));
+        }
+    }
+    Some(region?.inflate(pad, pad))
 }
 
 /// The colour Mask Outside Page paints when the desktop is white or
