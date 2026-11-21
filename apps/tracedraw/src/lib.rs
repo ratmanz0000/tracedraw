@@ -126,6 +126,10 @@ mod grammar;
 mod guides;
 mod help;
 #[cfg(test)]
+mod help_scene_list;
+#[cfg(test)]
+mod help_scenes;
+#[cfg(test)]
 mod help_shots;
 mod hunspell;
 mod i18n;
@@ -1213,6 +1217,9 @@ impl eframe::App for Shell {
         app.refresh_live_fits();
         // Texts set to follow their paths are fitted again (#3571).
         app.refresh_text_follow();
+        // Objects of the facing page selected with the current page's go
+        // back to their page once deselected (#3817).
+        app.return_spread_adopted();
         // The window's state is kept once it has settled; until then it
         // is maximized when it should start so, and checked (#787).
         #[cfg(not(target_arch = "wasm32"))]
