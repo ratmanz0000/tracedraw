@@ -1236,7 +1236,11 @@ mod tests {
         s.hardware_acceleration = false;
         assert_eq!(Mode::for_start(&args, &s, None), Mode::Software);
         assert_eq!(Mode::for_start(&[Mode::Gl.arg()], &s, None), Mode::Gl);
+        // The renderer notes are wgpu-only: without the gpu feature the
+        // options say glow alone, in one shape.
+        #[cfg(any(feature = "gpu", target_os = "android"))]
         assert_eq!(options(Mode::Gl, "").0, eframe::Renderer::Glow);
+        #[cfg(any(feature = "gpu", target_os = "android"))]
         assert_eq!(options(Mode::Hardware, "").0, eframe::Renderer::Wgpu);
     }
 
@@ -1403,6 +1407,7 @@ mod tests {
     /// adapter, but not the built-in Intel HD 4600, which only the OpenGL
     /// renderer reaches. Fastest available takes the Vulkan one; naming
     /// the Direct3D 12 one in Options takes that.
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn the_reporters_adapters_of_1999() {
         use eframe::wgpu::DeviceType::*;
@@ -1423,6 +1428,7 @@ mod tests {
         assert!(list.iter().all(|c| c.kind != IntegratedGpu));
     }
 
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     fn adapter(name: &str, kind: eframe::wgpu::DeviceType, surface: bool) -> Candidate {
         Candidate {
             name: name.into(),
@@ -1432,6 +1438,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     fn on(c: Candidate, backend: eframe::wgpu::Backend) -> Candidate {
         Candidate { backend, ..c }
     }
@@ -1443,6 +1450,7 @@ mod tests {
     /// The faster card still wins over the API, a card named in Options
     /// is taken through Direct3D 12 when it has both, and elsewhere the
     /// order is wgpu's.
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn windows_takes_a_card_through_direct3d_12() {
         use eframe::wgpu::Backend::{Dx12, Gl, Vulkan};
@@ -1481,6 +1489,7 @@ mod tests {
     /// Hardware mode takes the card named in Options, else the fastest
     /// card, and never the software adapter, which only a start with
     /// hardware acceleration off (or the last renderer) uses (#616).
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn hardware_mode_never_draws_on_the_software_adapter() {
         use eframe::wgpu::DeviceType::*;
