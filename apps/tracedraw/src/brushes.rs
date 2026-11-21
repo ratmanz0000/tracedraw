@@ -21,6 +21,7 @@
 //! wheel scrolls instead of zooming, where Shift+wheel scrolls sideways).
 
 use crate::app::{App, Drag};
+use crate::canvas::smooth_circle_stroke;
 use crate::tools::Tool;
 use crate::ui::brush_bars::BrushSettings;
 use egui::{Modifiers, PointerButton, Response};
@@ -113,8 +114,8 @@ pub fn draw_resize(app: &App, painter: &egui::Painter) {
         return;
     }
     let c = app.view.to_screen(r.center);
-    painter.circle_stroke(c, px, egui::Stroke::new(3.0, egui::Color32::WHITE));
-    painter.circle_stroke(c, px, egui::Stroke::new(1.0, egui::Color32::BLACK));
+    smooth_circle_stroke(painter, c, px, egui::Stroke::new(3.0, egui::Color32::WHITE));
+    smooth_circle_stroke(painter, c, px, egui::Stroke::new(1.0, egui::Color32::BLACK));
 }
 
 impl App {

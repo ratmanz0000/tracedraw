@@ -305,7 +305,8 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
             // With Ctrl, the circle the line is the radius of (#2550).
             if app.three_point_circle && app.tool == Tool::ThreePointEllipse {
                 let r = (*current - *start).hypot() * view.zoom as f64;
-                painter.circle_stroke(
+                smooth_circle_stroke(
+                    painter,
                     view.to_screen(*start),
                     r as f32,
                     EStroke::new(1.0, Color32::BLACK),
@@ -3349,6 +3350,23 @@ fn start_node_marker(
     ));
 }
 
+/// The shape of a stroked circle at small screen radii. egui's `CircleShape`
+/// falls back to eight polygon points at r <= 2 px, while `EllipseShape`
+/// keeps at least eight points per quarter. A filled circle is left on
+/// egui's cached disc path, so it costs nothing extra.
+fn circle_stroke_shape(c: Pos2, r: f32, stroke: EStroke) -> epaint::Shape {
+    if r <= 5.0 {
+        epaint::Shape::ellipse_stroke(c, egui::vec2(r, r), stroke)
+    } else {
+        epaint::Shape::circle_stroke(c, r, stroke)
+    }
+}
+
+/// A stroked circle that stays round when small on screen.
+pub(crate) fn smooth_circle_stroke(painter: &Painter, c: Pos2, r: f32, stroke: EStroke) {
+    painter.add(circle_stroke_shape(c, r, stroke));
+}
+
 fn node_marker(
     painter: &Painter,
     p: Pos2,
@@ -3372,7 +3390,7 @@ fn node_marker(
             if let Some(f) = fill {
                 painter.circle_filled(p, h, f);
             }
-            painter.circle_stroke(p, h - 0.5, stroke);
+            smooth_circle_stroke(painter, p, h - 0.5, stroke);
         }
         NodeShape::Diamond => {
             let pts = vec![
@@ -4951,6 +4969,23 @@ mod tests {
         assert!(tip.y > p.y + 4.0 && (tip.x - p.x).abs() < 1e-4, "{tip:?}");
         assert!(b1.y < p.y && b2.y < p.y);
         assert!((b1.x - b2.x).abs() > 9.0, "the base is across the way");
+    }
+
+    /// Small stroked overlays use the ellipse path, which egui tessellates
+    /// with at least eight points per quarter instead of eight in total.
+    #[test]
+    fn small_circle_strokes_use_the_ellipse_path() {
+        match circle_stroke_shape(Pos2::ZERO, 2.0, EStroke::new(1.0, Color32::BLACK)) {
+            epaint::Shape::Ellipse(shape) => {
+                assert_eq!(shape.radius, egui::vec2(2.0, 2.0));
+                assert_eq!(shape.stroke.width, 1.0);
+            }
+            _ => panic!("a small circle stroke used the polygon path"),
+        }
+        assert!(matches!(
+            circle_stroke_shape(Pos2::ZERO, 6.0, EStroke::new(1.0, Color32::BLACK)),
+            epaint::Shape::Circle(_)
+        ));
     }
 
     /// Non-finite screen geometry is skipped before subdivision.
