@@ -29,7 +29,7 @@ fn std_frame(ui: &Ui, rect: egui::Rect, hovered: bool, pressed: bool) {
 }
 
 /// The Save button is lit while the drawing has changes to save (or has
-/// never been saved) and pale once it is saved, as in CorelDRAW: it
+/// never been saved) and pale once it is saved: it
 /// looked the same whether the drawing was saved or not (#2640).
 pub(crate) fn save_button_lit(app: &App) -> bool {
     app.engine.is_dirty() || app.file.is_none()
@@ -682,7 +682,7 @@ pub(crate) fn draw_item(app: &mut App, ui: &mut Ui, bar: &str, id: &str) {
             )
             .clicked()
             {
-                app.fullscreen_preview = true;
+                super::preview::begin(app, ui.ctx(), false);
             }
         }
         "rulers" => {
@@ -1244,6 +1244,9 @@ fn shape_builder_bar(app: &mut App, ui: &mut Ui) {
     vsep(ui);
     ui.checkbox(&mut app.builder.keep_originals, tr("toolbar.builder_keep"))
         .rich_tip(crate::ui::tips::keyed("toolbar.builder_keep"));
+    // The guidelines cut the objects too (#3558), off by default.
+    ui.checkbox(&mut app.builder.use_guides, tr("toolbar.builder_guides"))
+        .rich_tip(crate::ui::tips::keyed("toolbar.builder_guides"));
     vsep(ui);
     let made = app.builder.session_steps > 0;
     if ui
@@ -1668,6 +1671,7 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
             | Tool::Polyline
             | Tool::TwoPointLine
             | Tool::BSpline
+            | Tool::CurvaturePen
             | Tool::ThreePointCurve => curve_tool_properties(app, ui),
             Tool::Blend => crate::ui::effect_bars::blend_bar(app, ui),
             Tool::Extrude => crate::ui::extrude_bar::extrude_bar(app, ui),
@@ -2523,6 +2527,14 @@ fn text_properties(app: &mut App, ui: &mut Ui) {
             app.text_default_align = a;
         }
     }
+    // Curve Text: with artistic text selected, a curve for it (circle,
+    // arch, bowl, wave) with no path to draw.
+    if let Some(curve) = app.text_curve() {
+        curve_text_button(app, ui, curve);
+    }
+    // The vertical alignment in the frame, beside the alignment, for
+    // paragraph text (#3543): the Text docker's list, nearer at hand.
+    text_vertical_align_list(app, ui);
     // Horizontal or vertical text, offered with a CJK interface language
     // or for text in those scripts (#257).
     if app.vertical_text_offered() {
@@ -2582,6 +2594,70 @@ fn text_properties(app: &mut App, ui: &mut Ui) {
     if changed {
         app.apply_text_style();
     }
+}
+
+/// The little picture of curve `k` (straight with `None`) in `r`.
+fn curve_picture(p: &egui::Painter, r: egui::Rect, k: Option<tracedraw_core::CurvePreset>, c: egui::Color32) {
+    use tracedraw_core::CurvePreset as K;
+    let s = egui::Stroke::new(1.4, c);
+    let r = r.shrink(4.0);
+    let pts: Vec<egui::Pos2> = (0..=24)
+        .map(|i| {
+            let t = i as f32 / 24.0;
+            match k {
+                Some(K::Circle) => {
+                    let a = std::f32::consts::TAU * t;
+                    r.center() + Vec2::new(a.cos(), a.sin()) * r.width().min(r.height()) / 2.0
+                }
+                Some(K::ArcUp) | Some(K::ArcDown) => {
+                    let x = r.left() + r.width() * t;
+                    let bump = (std::f32::consts::PI * t).sin() * r.height() * 0.7;
+                    let y = if k == Some(K::ArcUp) {
+                        r.bottom() - bump
+                    } else {
+                        r.top() + bump
+                    };
+                    egui::pos2(x, y)
+                }
+                Some(K::Wave) => egui::pos2(
+                    r.left() + r.width() * t,
+                    r.center().y - (std::f32::consts::TAU * t).sin() * r.height() * 0.35,
+                ),
+                None => egui::pos2(r.left() + r.width() * t, r.center().y),
+            }
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, s));
+}
+
+/// The text bar's Curve Text button: its curve's picture; a click lists
+/// the curves, straight first.
+fn curve_text_button(app: &mut App, ui: &mut Ui, curve: Option<tracedraw_core::CurvePreset>) {
+    let resp = ui
+        .add_sized([22.0, 22.0], egui::Button::selectable(curve.is_some(), ""))
+        .rich_tip(crate::ui::tips::keyed("toolbar.curve_text"));
+    curve_picture(ui.painter(), resp.rect, curve.or(Some(tracedraw_core::CurvePreset::ArcUp)), Tokens::text());
+    egui::Popup::menu(&resp)
+        .id(egui::Id::new("curve_text_menu"))
+        .show(|ui| {
+            let mut pick = None;
+            for k in std::iter::once(None).chain(tracedraw_core::CurvePreset::ALL.map(Some)) {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
+                    curve_picture(ui.painter(), rect, k, Tokens::text());
+                    if ui
+                        .selectable_label(curve == k, tr(crate::text_curve::preset_key(k)))
+                        .clicked()
+                    {
+                        pick = Some(k);
+                    }
+                });
+            }
+            if let Some(k) = pick {
+                app.set_text_curve(k);
+                ui.close();
+            }
+        });
 }
 
 /// The transparency settings of the Transparency tool's bar: the kind
@@ -2782,8 +2858,11 @@ fn transparency_controls(app: &mut App, ui: &mut Ui, stacked: bool) {
                     f.angle = angle;
                     field = Some(F::MaskAngle);
                 }
-                let kinds = tracedraw_core::style::FountainKind::ALL
-                    .map(|k| (k, crate::ui::dockers::fountain_kind_key(k)));
+                let kinds: Vec<_> = tracedraw_core::style::FountainKind::ALL
+                    .into_iter()
+                    .filter(|k| *k != tracedraw_core::style::FountainKind::Points)
+                    .map(|k| (k, crate::ui::dockers::fountain_kind_key(k)))
+                    .collect();
                 let kind_shown = !mixed.contains(&F::MaskKind);
                 let name = kinds
                     .iter()
@@ -3025,6 +3104,46 @@ pub(crate) fn text_size_list(app: &mut App, ui: &mut Ui) -> bool {
         return true;
     }
     false
+}
+
+/// The vertical alignment of paragraph text in its frame (#3543): a
+/// button with the alignment's picture dropping Top, Center and Bottom.
+/// Shown only while paragraph text is selected or edited.
+fn text_vertical_align_list(app: &mut App, ui: &mut Ui) {
+    use tracedraw_core::VerticalAlign;
+    let Some(current) = app.frame_text_vertical_align() else {
+        return;
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::splat(crate::ui::propbar::btn()),
+        egui::Sense::click(),
+    );
+    crate::ui::propbar::frame(ui, rect, resp.hovered(), false);
+    crate::ui::text_docker::paint_vertical_align(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), Vec2::splat(Tokens::prop_icon())),
+        current,
+        Tokens::icon(),
+    );
+    let resp = resp.rich_tip(tr("docker.vertical_align"));
+    let mut picked = None;
+    egui::Popup::menu(&resp)
+        .id(egui::Id::new("bar_text_valign"))
+        .show(|ui| {
+            for (v, key) in [
+                (VerticalAlign::Top, "docker.valign_top"),
+                (VerticalAlign::Center, "docker.valign_center"),
+                (VerticalAlign::Bottom, "docker.valign_bottom"),
+            ] {
+                if ui.selectable_label(current == v, tr(key)).clicked() {
+                    picked = Some(v);
+                    ui.close();
+                }
+            }
+        });
+    if let Some(v) = picked {
+        app.set_frame_text_vertical_align(v);
+    }
 }
 
 /// The alignment: a button with the alignment's picture dropping the
@@ -4273,6 +4392,7 @@ fn inner_shadow_bar(app: &mut App, ui: &mut Ui) {
         opacity: st.opacity,
         blur: st.blur,
         merge: st.merge,
+        spread: st.spread,
     };
     if changed {
         app.inner_shadow = st;

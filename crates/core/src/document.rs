@@ -1077,6 +1077,14 @@ pub fn axis_scale(t: Affine) -> (f64, f64) {
     (a.hypot(b), c.hypot(d))
 }
 
+/// True when `t` has no turn or skew (moves, scales and mirrors only):
+/// it maps an axis-aligned box onto the exact axis-aligned box of what
+/// it transforms, so the box can be mapped instead of the outline.
+fn axis_aligned(t: Affine) -> bool {
+    let [_, b, c, _, _, _] = t.as_coeffs();
+    b == 0.0 && c == 0.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ShapeKind {
@@ -1195,6 +1203,27 @@ impl ShapeKind {
             ShapeKind::Path { closed, .. } => !closed,
             ShapeKind::Ellipse { arc: Some(a), .. } => !a.pie,
             _ => false,
+        }
+    }
+
+    /// The box this kind knows without an outline: a rectangle whose
+    /// edges are not bowed (its corners stay inside the rect, a bulged
+    /// edge reaches past it, #2188), a whole ellipse (an arc or pie
+    /// covers part of it), a bitmap, a table and a symbol instance's
+    /// placeholder box (what `local_path` draws for one). `None` for
+    /// the kinds whose box the outline gives.
+    fn known_box(&self) -> Option<Rect> {
+        match self {
+            ShapeKind::Rect { rect, corners, .. }
+                if corners.as_ref().is_none_or(|c| !c.has_bulge()) =>
+            {
+                Some(*rect)
+            }
+            ShapeKind::Ellipse { rect, arc: None } => Some(*rect),
+            ShapeKind::Bitmap { rect, .. } => Some(*rect),
+            ShapeKind::Table(t) => Some(t.rect),
+            ShapeKind::SymbolInstance { .. } => Some(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            _ => None,
         }
     }
 
@@ -2004,6 +2033,13 @@ pub struct ParagraphStyle {
     pub hyphenate: bool,
     /// Fit text to frame: scale the font so the text fills the frame height.
     pub fit_to_frame: bool,
+    /// Type block (paragraph text): the words are shared out between the
+    /// lines and each line takes a size of its own so that it fills the
+    /// frame's width exactly, the lines together filling its height as
+    /// nearly as they can; laid out anew whenever the frame changes. Each
+    /// word keeps its own font.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub type_block: bool,
     /// Align baselines to a grid of this pitch in mm (Text > Align to
     /// Baseline Grid); 0 = off. Only paragraph text snaps. The grid is the
     /// page's (from its top and the grid's start offset) for a frame that
@@ -2041,6 +2077,36 @@ pub struct ParagraphStyle {
     /// [`crate::text_flow`]); not saved.
     #[serde(skip)]
     pub flow: crate::text_flow::FrameFlow,
+    /// Which bullets this text draws when it is one part of a text drawn
+    /// in parts ([`Shape::text_parts`], #3682); `None` (a whole text):
+    /// every bullet, in its paragraph's first letter's look. Set only on
+    /// the parts, never in a drawing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullet_part: Option<BulletPart>,
+}
+
+/// The bullets a part of a text drawn in parts draws (#3682).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BulletPart {
+    /// The characters' part: bullets without a colour of their own, with
+    /// the paragraph's first letter.
+    Text,
+    /// Only the bullets of this colour of their own, no characters.
+    Color(crate::Color),
+}
+
+impl BulletPart {
+    /// Whether a bullet of `own` colour (`None`: none of its own) whose
+    /// paragraph's first letter is drawn (`letter_drawn`) is drawn in
+    /// this part (`None`: a whole text).
+    pub fn draws(part: Option<BulletPart>, own: Option<crate::Color>, letter_drawn: bool) -> bool {
+        match (part, own) {
+            (None, _) | (Some(BulletPart::Text), None) => letter_drawn,
+            (Some(BulletPart::Text), Some(_)) => false,
+            (Some(BulletPart::Color(c)), Some(o)) => c == o,
+            (Some(BulletPart::Color(_)), None) => false,
+        }
+    }
 }
 
 /// The distance between the default tab stops of a paragraph with no
@@ -2313,12 +2379,14 @@ impl Default for ParagraphStyle {
             tabs: Vec::new(),
             hyphenate: false,
             fit_to_frame: false,
+            type_block: false,
             baseline_grid_mm: 0.0,
             vertical_align: VerticalAlign::Top,
             vertical: false,
             vertical_columns: VerticalColumns::RightToLeft,
             direction: TextDirection::LeftToRight,
             frame_fill: None,
+            bullet_part: None,
             flow: crate::text_flow::FrameFlow::default(),
         }
     }
@@ -2496,7 +2564,40 @@ pub struct BulletStyle {
     /// the bullet standing out on its own. On: they go back to the left
     /// indent, under the bullet.
     pub no_hanging: bool,
+    /// The bullet's or number's own colour; `None` = the colour of the
+    /// paragraph's first letter (#3682).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<crate::Color>,
+    /// The bullet's or number's own bold and italic; `None` = as the
+    /// paragraph's first letter (#3682).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    /// The list level, 0 for the top: each level is set in by
+    /// `level_indent` and numbers on its own, starting again under each
+    /// paragraph of the level above (#3685).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub level: u32,
+    /// How far each list level is set in, mm (#3685).
+    pub level_indent: f64,
+    /// This paragraph's number starts again at `start`, though the
+    /// paragraph before it is numbered on the same level (#3685).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restart: bool,
+    /// After paragraphs without bullets, this paragraph's number goes on
+    /// from the last number given on its level instead of starting again
+    /// (#3685).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub continue_list: bool,
 }
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// The deepest list level a bullet can have (#3685).
+pub const MAX_LIST_LEVEL: u32 = 20;
 
 impl Default for BulletStyle {
     fn default() -> Self {
@@ -2510,6 +2611,13 @@ impl Default for BulletStyle {
             baseline_shift: 0.0,
             offset: 0.0,
             no_hanging: false,
+            color: None,
+            bold: None,
+            italic: None,
+            level: 0,
+            level_indent: 6.35,
+            restart: false,
+            continue_list: false,
         }
     }
 }
@@ -2518,6 +2626,52 @@ impl BulletStyle {
     /// Nothing beyond the plain symbol bullet: not written to files.
     pub fn is_plain(&self) -> bool {
         *self == BulletStyle::default()
+    }
+
+    /// How far the bullet sits past the left indent: its distance from
+    /// the frame plus its list level's indent (#3685), mm.
+    pub fn lead(&self) -> f64 {
+        let step = if self.level_indent.is_finite() {
+            self.level_indent.max(0.0)
+        } else {
+            0.0
+        };
+        self.offset.max(0.0) + self.level.min(MAX_LIST_LEVEL) as f64 * step
+    }
+
+    /// One list level deeper (`deeper`) or higher (#3685). A number takes
+    /// the next numbering of 1, a, i and a symbol the next of the plain
+    /// bullets, so each level shows apart; `symbol` is the paragraph's
+    /// bullet character. False when the level does not change.
+    pub fn change_level(&mut self, symbol: &mut String, deeper: bool) -> bool {
+        let level = if deeper {
+            (self.level + 1).min(MAX_LIST_LEVEL)
+        } else {
+            self.level.saturating_sub(1)
+        };
+        if level == self.level {
+            return false;
+        }
+        self.level = level;
+        const NUMBERS: [Numbering; 3] = [
+            Numbering::Arabic,
+            Numbering::LowerAlpha,
+            Numbering::LowerRoman,
+        ];
+        const SYMBOLS: [&str; 3] = ["\u{2022}", "\u{25E6}", "\u{25AA}"];
+        let step = |at: usize, n: usize| {
+            if deeper {
+                (at + 1) % n
+            } else {
+                (at + n - 1) % n
+            }
+        };
+        if let Some(at) = NUMBERS.iter().position(|k| *k == self.numbering) {
+            self.numbering = NUMBERS[step(at, NUMBERS.len())];
+        } else if let Some(at) = SYMBOLS.iter().position(|c| c == symbol) {
+            *symbol = SYMBOLS[step(at, SYMBOLS.len())].to_string();
+        }
+        true
     }
 
     /// What the bullet of a paragraph numbered `n` shows: `symbol` or
@@ -2533,19 +2687,43 @@ impl BulletStyle {
 /// The number of each paragraph's bullet, given whether each has bullets
 /// and how it is set: the first of a run of numbered paragraphs takes its
 /// start, the next ones count on; a paragraph without bullets, or with a
-/// symbol, ends the run (#1443).
+/// symbol, ends the run (#1443). Each list level counts on its own: a
+/// paragraph ends the runs of the levels below it, so a sub-list starts
+/// again under each paragraph above it. `restart` starts a paragraph at
+/// its start within a run, and `continue_list` goes on from the last
+/// number of its level after paragraphs without bullets (#3685).
 pub fn bullet_numbers<'a>(paras: impl IntoIterator<Item = (bool, &'a BulletStyle)>) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut next: Option<u32> = None;
+    // The number last given on each level in the current run, and the
+    // last ever given on each level.
+    let mut run: Vec<Option<u32>> = Vec::new();
+    let mut last: Vec<Option<u32>> = Vec::new();
     for (on, b) in paras {
-        if !on || b.numbering == Numbering::Symbol {
-            next = None;
+        if !on {
+            run.clear();
             out.push(0);
             continue;
         }
-        let n = next.unwrap_or(b.start.max(1));
+        let level = b.level.min(MAX_LIST_LEVEL) as usize;
+        run.resize(level + 1, None);
+        if last.len() <= level {
+            last.resize(level + 1, None);
+        }
+        if b.numbering == Numbering::Symbol {
+            run[level] = None;
+            out.push(0);
+            continue;
+        }
+        let start = b.start.max(1);
+        let n = match run[level] {
+            _ if b.restart => start,
+            Some(n) => n + 1,
+            None if b.continue_list => last[level].map_or(start, |n| n + 1),
+            None => start,
+        };
+        run[level] = Some(n);
+        last[level] = Some(n);
         out.push(n);
-        next = Some(n + 1);
     }
     out
 }
@@ -2692,6 +2870,9 @@ pub enum PathTextOrientation {
     HorizontalSkew,
     /// Letters stay upright, only moved along the path.
     Upright,
+    /// Each letter turned so its upright lies on a line through the
+    /// middle of the path's box, like the numbers round a dial.
+    Radial,
 }
 
 /// Which line of the letters sits on the path.
@@ -2733,6 +2914,34 @@ pub struct TextOnPath {
     pub orientation: PathTextOrientation,
     #[serde(default)]
     pub vertical: PathTextVertical,
+    /// The text was curved by Curve Text (no path object): which curve
+    /// it took, so the bar shows it and a circle fits round a round
+    /// object it is dropped on. `None`: a path of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<CurvePreset>,
+}
+
+/// The curves of Curve Text (see [`TextOnPath::preset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurvePreset {
+    /// Round a whole circle, reading clockwise over the top.
+    Circle,
+    /// Over the top of an arch.
+    ArcUp,
+    /// Along the bottom of a bowl.
+    ArcDown,
+    /// Along a wave.
+    Wave,
+}
+
+impl CurvePreset {
+    pub const ALL: [CurvePreset; 4] = [
+        CurvePreset::Circle,
+        CurvePreset::ArcUp,
+        CurvePreset::ArcDown,
+        CurvePreset::Wave,
+    ];
 }
 
 impl TextOnPath {
@@ -3039,6 +3248,61 @@ impl Baseline {
     }
 }
 
+/// A further fill's look of its own (the Properties docker's Grow, Move
+/// and Blur under the fill): its area grown (or, below nothing, shrunk)
+/// by `grow` mm, moved by `move_x` / `move_y` mm and blurred by `blur`
+/// mm, as live effects on that fill alone, after the object's own.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FillLook {
+    pub grow: f64,
+    pub move_x: f64,
+    pub move_y: f64,
+    pub blur: f64,
+}
+
+impl FillLook {
+    /// No look of its own: the fill drawn as the object is.
+    pub fn is_plain(&self) -> bool {
+        *self == FillLook::default()
+    }
+
+    /// The live effects that draw the look, in order: grow, move, blur.
+    pub fn effects(&self) -> Vec<crate::live::Effect> {
+        use crate::live::Effect;
+        let mut out = Vec::new();
+        if self.grow.abs() > 1e-9 {
+            out.push(Effect::OffsetPath {
+                distance: self.grow,
+                smooth: 0.0,
+                join: Default::default(),
+                merge: false,
+            });
+        }
+        if self.move_x.abs() > 1e-9 || self.move_y.abs() > 1e-9 {
+            out.push(Effect::Transform {
+                scale_x: 100.0,
+                scale_y: 100.0,
+                move_x: self.move_x,
+                move_y: self.move_y,
+                angle: 0.0,
+                copies: 0,
+                reflect_x: false,
+                reflect_y: false,
+                random: false,
+                seed: 0,
+                scale_strokes: false,
+                pivot_x: 0.0,
+                pivot_y: 0.0,
+            });
+        }
+        if self.blur > 1e-9 {
+            out.push(Effect::GaussianBlur { radius: self.blur });
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shape {
     pub id: ShapeId,
@@ -3153,6 +3417,10 @@ pub struct Shape {
     /// Further outlines, drawn over `stroke` in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_strokes: Vec<Stroke>,
+    /// The looks of the further fills of their own, one for each of
+    /// `extra_fills` in order (missing ones plain; see [`FillLook`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_looks: Option<Box<Vec<FillLook>>>,
     /// Bitmap effects on an object that is not a bitmap: the object stays
     /// as it is and is drawn as the picture they make of it (see
     /// [`Shape::drawn_as`]).
@@ -3533,6 +3801,7 @@ impl Shape {
             picture_inks: None,
             extra_fills: Vec::new(),
             extra_strokes: Vec::new(),
+            fill_looks: None,
             raster_fx: None,
             qr: None,
             fill_rule: crate::shaping::FillRule::EvenOdd,
@@ -3588,6 +3857,7 @@ impl Shape {
         s.stroke = None;
         s.extra_fills.clear();
         s.extra_strokes.clear();
+        s.fill_looks = None;
         s.shadow = None;
         s.effects.clear();
         s.parked_effects.clear();
@@ -3605,11 +3875,33 @@ impl Shape {
     /// other shapes and for text whose characters all take the object's
     /// fill, outline and overprint.
     pub fn text_parts(&self) -> Option<Vec<Shape>> {
-        let ShapeKind::Text { spans, .. } = &self.kind else {
+        let ShapeKind::Text {
+            spans, align, para, ..
+        } = &self.kind
+        else {
             return None;
         };
-        if spans.iter().any(|s| s.layout_only)
-            || spans.iter().all(|s| {
+        if spans.iter().any(|s| s.layout_only) || para.bullet_part.is_some() {
+            return None;
+        }
+        // Bullets and numbers of a colour of their own: each colour is a
+        // part of its own (#3682).
+        let mut bullet_colors: Vec<crate::Color> = Vec::new();
+        let styled = spans.iter().any(|s| s.paragraph.is_some());
+        let styles = if styled {
+            crate::paragraphs::paragraph_styles(spans, *align, para)
+        } else {
+            vec![(*align, para.clone())]
+        };
+        for (_, ps) in &styles {
+            if let (true, Some(c)) = (ps.bullets, ps.bullet.color) {
+                if !bullet_colors.contains(&c) {
+                    bullet_colors.push(c);
+                }
+            }
+        }
+        if bullet_colors.is_empty()
+            && spans.iter().all(|s| {
                 s.fill.is_none()
                     && s.outline.is_none()
                     && s.overprint_fill.is_none_or(|o| o == self.overprint_fill)
@@ -3619,6 +3911,7 @@ impl Shape {
         {
             return None;
         }
+        let bullet_part = (!bullet_colors.is_empty()).then_some(BulletPart::Text);
         let look = |s: &TextSpan| -> TextLook {
             let fill = s.fill.clone().unwrap_or_else(|| self.fill.clone());
             let stroke = match &s.outline {
@@ -3640,7 +3933,7 @@ impl Shape {
                 looks.push(l);
             }
         }
-        let parts = looks
+        let mut parts = looks
             .into_iter()
             .enumerate()
             .map(|(i, l)| {
@@ -3655,6 +3948,7 @@ impl Shape {
                         s.overprint_outline = None;
                     }
                     para.frame_fill = None;
+                    para.bullet_part = bullet_part;
                 }
                 part.fill = l.fill;
                 part.stroke = l.stroke;
@@ -3665,7 +3959,25 @@ impl Shape {
                 }
                 part
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for c in bullet_colors {
+            let mut part = self.clone();
+            if let ShapeKind::Text { spans, para, .. } = &mut part.kind {
+                for s in spans.iter_mut() {
+                    s.layout_only = true;
+                    s.background = None;
+                    s.fill = None;
+                    s.outline = None;
+                    s.overprint_fill = None;
+                    s.overprint_outline = None;
+                }
+                para.frame_fill = None;
+                para.bullet_part = Some(BulletPart::Color(c));
+            }
+            part.fill = Fill::Solid(c);
+            part.shadow = None;
+            parts.push(part);
+        }
         Some(parts)
     }
 
@@ -3739,6 +4051,14 @@ impl Shape {
         (effects, parked)
     }
 
+    /// The look of further fill `i` (plain when it has none).
+    pub fn fill_look(&self, i: usize) -> FillLook {
+        self.fill_looks
+            .as_ref()
+            .and_then(|v| v.get(i).copied())
+            .unwrap_or_default()
+    }
+
     /// An object with further fills or outlines as the plain objects that
     /// draw it, bottom first: the outlines drawn behind the fill, its
     /// fill, each further fill, then the other outlines, its own first
@@ -3751,6 +4071,7 @@ impl Shape {
         let mut plain = self.clone();
         plain.extra_fills.clear();
         plain.extra_strokes.clear();
+        plain.fill_looks = None;
         plain.shadow = None;
         let strokes: Vec<&Stroke> = self.stroke.iter().chain(&self.extra_strokes).collect();
         let stroke_part = |st: &Stroke| {
@@ -3769,10 +4090,12 @@ impl Shape {
         let mut fill = plain.clone();
         fill.stroke = None;
         out.push(fill);
-        for f in &self.extra_fills {
+        for (i, f) in self.extra_fills.iter().enumerate() {
             let mut s = plain.clone();
             s.fill = f.clone();
             s.stroke = None;
+            // A look of its own: live effects on this fill alone.
+            s.effects.extend(self.fill_look(i).effects());
             out.push(s);
         }
         out.extend(
@@ -4298,8 +4621,7 @@ impl Shape {
 
     /// Whether Convert to Curves changes this object: curves already are
     /// curves, a bitmap has no outline to become one, and a group changes
-    /// when something it holds does (as in CorelDRAW, a group converts
-    /// whole and stays a group, #1324).
+    /// when something it holds does.
     pub fn converts_to_curves(&self) -> bool {
         match &self.kind {
             // A B-spline becomes an ordinary curve: its nodes instead of
@@ -4742,6 +5064,30 @@ impl Shape {
         self.bounds_under(Affine::IDENTITY)
     }
 
+    /// The exact box of the shape in its own (local) coordinates. Kinds
+    /// that know their box answer without an outline; a curve's box is
+    /// read off its stored path, not off a copy of it.
+    pub fn local_bounds(&self) -> Rect {
+        match &self.kind {
+            ShapeKind::Path { path, .. } => path.bounding_box(),
+            ShapeKind::Group { children } => {
+                // A member that draws nothing takes no room, as in
+                // [`Shape::bounds_under`] (#996).
+                children
+                    .iter()
+                    .filter(|c| !c.is_empty_path())
+                    .map(|c| c.bounds())
+                    .reduce(|a, b| a.union(b))
+                    .unwrap_or_else(|| self.local_path().bounding_box())
+            }
+            ShapeKind::ClipFrame { frame, .. } => frame.bounds(),
+            _ => match self.kind.known_box() {
+                Some(r) => r,
+                None => self.local_path().bounding_box(),
+            },
+        }
+    }
+
     /// [`Shape::bounds`] with `outer` applied on top of the shape's own
     /// transformation. A group passes its transformation down instead of
     /// copying each member with it: the copy took the member's whole
@@ -4805,7 +5151,13 @@ impl Shape {
                 .text_bounds()
                 .unwrap_or_else(|| self.page_path().bounding_box()),
             ShapeKind::Path { path, .. } => path_bounds_under(path, self.transform),
-            _ => self.page_path().bounding_box(),
+            // A rectangle, a whole ellipse, a bitmap, a table or a
+            // symbol's box is known without an outline; a move, scale or
+            // mirror (no turn or skew) maps the box exactly.
+            _ => match self.kind.known_box().filter(|_| axis_aligned(self.transform)) {
+                Some(r) => self.transform.transform_rect_bbox(r),
+                None => self.page_path().bounding_box(),
+            },
         }
     }
 
@@ -5835,7 +6187,7 @@ impl GuideStyle {
 
 /// A guideline on a page: its line, and how it looks. A guideline
 /// without its own colour uses the document's default guideline colour.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Guide {
     #[serde(flatten)]
     pub line: GuideLine,
@@ -5850,6 +6202,10 @@ pub struct Guide {
     /// or snapped to, while the others of its set show (#1775).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// The name given in the Objects docker (Rename), shown in its row
+    /// instead of where the guideline is (#3574).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl From<GuideLine> for Guide {
@@ -5860,6 +6216,7 @@ impl From<GuideLine> for Guide {
             style: GuideStyle::default(),
             locked: false,
             hidden: false,
+            name: None,
         }
     }
 }
@@ -5887,13 +6244,16 @@ impl Guide {
     pub fn through(&self, p: crate::geometry::Point) -> Guide {
         Guide {
             line: self.line.through(p),
-            ..*self
+            ..self.clone()
         }
     }
 
     /// The same guideline with another line.
     pub fn with_line(&self, line: GuideLine) -> Guide {
-        Guide { line, ..*self }
+        Guide {
+            line,
+            ..self.clone()
+        }
     }
 }
 
@@ -6658,7 +7018,7 @@ impl Document {
             .iter()
             .chain(own.iter())
             .filter(|g| !g.hidden)
-            .copied()
+            .cloned()
             .collect())
     }
 
@@ -7914,6 +8274,75 @@ mod tests {
         assert_eq!(n, vec![3, 4, 0, 3, 0, 3]);
     }
 
+    /// List levels (#3685): each level counts on its own and starts again
+    /// under each paragraph above it; Restart starts again within a run,
+    /// Continue goes on after paragraphs without bullets; one level
+    /// deeper sets the bullet in and takes the next numbering or symbol.
+    #[test]
+    fn list_levels_number_on_their_own() {
+        use super::{bullet_numbers, BulletStyle, Numbering, MAX_LIST_LEVEL};
+        let top = BulletStyle {
+            numbering: Numbering::Arabic,
+            ..Default::default()
+        };
+        let sub = BulletStyle {
+            level: 1,
+            numbering: Numbering::LowerAlpha,
+            ..Default::default()
+        };
+        let restart = BulletStyle {
+            restart: true,
+            ..top.clone()
+        };
+        let cont = BulletStyle {
+            continue_list: true,
+            ..top.clone()
+        };
+        let n = bullet_numbers([
+            (true, &top),
+            (true, &sub),
+            (true, &sub),
+            (true, &top),
+            (true, &sub),
+            (true, &top),
+            (true, &restart),
+            (false, &top),
+            (true, &cont),
+            (false, &top),
+            (true, &top),
+        ]);
+        assert_eq!(n, vec![1, 1, 2, 2, 1, 3, 1, 0, 2, 0, 1]);
+        assert_eq!(sub.label("", 2), "b.");
+        // Set in by the level's indent, past the bullet's offset.
+        let deep = BulletStyle {
+            offset: 2.0,
+            level: 2,
+            level_indent: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(deep.lead(), 12.0);
+        assert_eq!(BulletStyle::default().lead(), 0.0);
+        // Deeper and higher.
+        let mut b = top.clone();
+        let mut sym = String::from("1");
+        assert!(b.change_level(&mut sym, true));
+        assert_eq!((b.level, b.numbering), (1, Numbering::LowerAlpha));
+        assert!(b.change_level(&mut sym, true));
+        assert_eq!((b.level, b.numbering), (2, Numbering::LowerRoman));
+        assert!(b.change_level(&mut sym, false));
+        assert_eq!((b.level, b.numbering), (1, Numbering::LowerAlpha));
+        let mut s = BulletStyle::default();
+        let mut dot = String::from("\u{2022}");
+        assert!(s.change_level(&mut dot, true));
+        assert_eq!(dot, "\u{25E6}");
+        assert!(s.change_level(&mut dot, false));
+        assert_eq!(dot, "\u{2022}");
+        assert!(!s.change_level(&mut dot, false), "already at the top");
+        s.level = MAX_LIST_LEVEL;
+        assert!(!s.change_level(&mut dot, true), "already at the deepest");
+        assert!(!s.is_plain());
+    }
+
     /// Columns of their own widths share the frame in proportion and
     /// turn round right to left (#2192); equal columns stay as they were.
     #[test]
@@ -8040,6 +8469,302 @@ mod tests {
         assert!(
             (b.y0 - 0.0).abs() < 1e-9 && (b.y1 - 2.0).abs() < 1e-9,
             "{b:?}"
+        );
+    }
+
+    /// The quick box paths (`ShapeKind::known_box`,
+    /// `geometry::transformed_bounds`, `Shape::local_bounds`) give the
+    /// boxes the outline gives (#3559): snapping, picking and the
+    /// renderer's culling read a box for every object on every pointer
+    /// move and every render, and must see the same boxes as before.
+    #[test]
+    fn the_quick_box_matches_the_outlines_box() {
+        use crate::geometry::{Affine, BezPath, Rect};
+        let mut curve = BezPath::new();
+        curve.move_to((1.0, 2.0));
+        curve.curve_to((10.0, 20.0), (30.0, -5.0), (40.0, 8.0));
+        curve.line_to((5.0, 9.0));
+        curve.close_path();
+        let rect = Rect::new(0.0, 0.0, 10.0, 6.0);
+        let shapes: Vec<Shape> = vec![
+            Shape::new(
+                ShapeId(1),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: None,
+                },
+            ),
+            Shape::new(
+                ShapeId(2),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 1.5,
+                    corners: None,
+                },
+            ),
+            Shape::new(
+                ShapeId(3),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: Some(Corners {
+                        radii: [1.0, 0.0, 2.0, 0.0],
+                        kind: CornerKind::Scallop,
+                        ..Corners::default()
+                    }),
+                },
+            ),
+            // A bowed edge reaches past the rect: no quick box (#2188).
+            Shape::new(
+                ShapeId(4),
+                ShapeKind::Rect {
+                    rect,
+                    radius: 0.0,
+                    corners: Some(Corners {
+                        bulge: [0.5, 0.0, 0.0, 0.0],
+                        ..Corners::default()
+                    }),
+                },
+            ),
+            Shape::new(ShapeId(5), ShapeKind::Ellipse { rect, arc: None }),
+            Shape::new(
+                ShapeId(6),
+                ShapeKind::Ellipse {
+                    rect,
+                    arc: Some(EllipseArc {
+                        start_deg: 10.0,
+                        end_deg: 250.0,
+                        pie: true,
+                        inner: 0.0,
+                    }),
+                },
+            ),
+            Shape::new(
+                ShapeId(7),
+                ShapeKind::Ellipse {
+                    rect,
+                    arc: Some(EllipseArc {
+                        start_deg: 10.0,
+                        end_deg: 250.0,
+                        pie: false,
+                        inner: 0.0,
+                    }),
+                },
+            ),
+            Shape::new(
+                ShapeId(8),
+                ShapeKind::Polygon {
+                    rect,
+                    points: 5,
+                    sharpness: 0.0,
+                    complex: None,
+                    twist: 0.0,
+                    bend: 0.0,
+                },
+            ),
+            Shape::new(
+                ShapeId(9),
+                ShapeKind::Polygon {
+                    rect,
+                    points: 7,
+                    sharpness: 0.5,
+                    complex: None,
+                    twist: 0.2,
+                    bend: 0.3,
+                },
+            ),
+            Shape::new(
+                ShapeId(10),
+                ShapeKind::Path {
+                    path: curve.clone(),
+                    closed: true,
+                },
+            ),
+            Shape::new(
+                ShapeId(11),
+                ShapeKind::Path {
+                    path: curve,
+                    closed: false,
+                },
+            ),
+            Shape::new(
+                ShapeId(12),
+                ShapeKind::Bitmap {
+                    rect,
+                    width_px: 2,
+                    height_px: 2,
+                    png: Vec::new().into(),
+                    fx: None,
+                },
+            ),
+            Shape::new(ShapeId(13), ShapeKind::SymbolInstance { index: 0 }),
+            Shape::new(
+                ShapeId(14),
+                ShapeKind::Table(Table {
+                    rect,
+                    col_widths: vec![5.0, 5.0],
+                    row_heights: vec![6.0],
+                    cells: Vec::new(),
+                    border: None,
+                    cell_fill: Fill::None,
+                    padding: 0.0,
+                    margins: None,
+                    spacing: None,
+                }),
+            ),
+        ];
+        // A clip frame's box is its frame's, a group's its members'.
+        let frame = shapes[0].clone();
+        let clip = Shape::new(
+            ShapeId(15),
+            ShapeKind::ClipFrame {
+                frame: Box::new(frame),
+                contents: Vec::new(),
+            },
+        );
+        let mut moved = shapes[9].clone();
+        moved.transform = Affine::translate((3.0, -2.0)) * Affine::rotate(0.4);
+        let group = Shape::new(
+            ShapeId(16),
+            ShapeKind::Group {
+                children: vec![shapes[0].clone(), moved],
+            },
+        );
+        let transforms = [
+            Affine::IDENTITY,
+            Affine::translate((17.0, -4.0)),
+            Affine::scale_non_uniform(2.0, 0.5),
+            Affine::scale(-1.0),
+            Affine::rotate(0.7),
+            Affine::skew(0.3, -0.1),
+            Affine::translate((5.0, 6.0)) * Affine::rotate(1.1) * Affine::scale_non_uniform(3.0, 0.25),
+        ];
+        for s in shapes.iter().chain([&clip, &group]) {
+            // The local box is the box of the local outline, up to the
+            // wobble of the outline's curve fitting (a rounded corner's
+            // outline starts a hair outside its own rectangle).
+            let from_outline = s.local_path().bounding_box();
+            let local = s.local_bounds();
+            assert!(
+                (local.x0 - from_outline.x0).abs() < 1e-9
+                    && (local.y0 - from_outline.y0).abs() < 1e-9
+                    && (local.x1 - from_outline.x1).abs() < 1e-9
+                    && (local.y1 - from_outline.y1).abs() < 1e-9,
+                "local box of {s:?}: {local:?} vs outline {from_outline:?}"
+            );
+            for t in transforms {
+                let mut m = s.clone();
+                m.transform = t * m.transform;
+                let from_outline = m.page_path().bounding_box();
+                let b = m.bounds();
+                assert!(
+                    (b.x0 - from_outline.x0).abs() < 1e-9
+                        && (b.y0 - from_outline.y0).abs() < 1e-9
+                        && (b.x1 - from_outline.x1).abs() < 1e-9
+                        && (b.y1 - from_outline.y1).abs() < 1e-9,
+                    "{:?} under {t:?}: {b:?} vs outline {from_outline:?}",
+                    s.kind
+                );
+            }
+        }
+    }
+
+    /// Round numbers map exactly: the quick box is bit-for-bit the
+    /// rectangle the shape was given, where the outline's curve fitting
+    /// wobbles by a hair under a move (#3559).
+    #[test]
+    fn the_quick_box_is_exact_on_whole_numbers() {
+        use crate::geometry::{Affine, Rect};
+        let mut s = Shape::new(
+            ShapeId(1),
+            ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                arc: None,
+            },
+        );
+        for (t, want) in [
+            (Affine::IDENTITY, Rect::new(0.0, 0.0, 10.0, 6.0)),
+            (Affine::translate((17.0, -4.0)), Rect::new(17.0, -4.0, 27.0, 2.0)),
+            (Affine::scale_non_uniform(2.0, 0.5), Rect::new(0.0, 0.0, 20.0, 3.0)),
+            (Affine::scale(-1.0), Rect::new(-10.0, -6.0, 0.0, 0.0)),
+        ] {
+            s.transform = t;
+            let b = s.bounds();
+            assert_eq!(b, want, "{t:?}");
+            // The outline's own box stays within a hair of it.
+            let from_outline = s.page_path().bounding_box();
+            assert!(
+                (b.x0 - from_outline.x0).abs() < 1e-9
+                    && (b.y0 - from_outline.y0).abs() < 1e-9
+                    && (b.x1 - from_outline.x1).abs() < 1e-9
+                    && (b.y1 - from_outline.y1).abs() < 1e-9,
+                "{t:?}: {b:?} vs outline {from_outline:?}"
+            );
+        }
+    }
+
+    /// The cost of [`Shape::bounds`] against the way it was found before
+    /// (build the page outline, then box it) on a drawing's worth of
+    /// shapes: run with `cargo test --release -p tracedraw-core --
+    /// --ignored bounds_cost --nocapture` (#3559).
+    #[test]
+    #[ignore]
+    fn bounds_cost_against_the_outline_way() {
+        use crate::geometry::{Affine, BezPath, Rect};
+        let mut curve = BezPath::new();
+        curve.move_to((0.0, 0.0));
+        for i in 1..40 {
+            let x = f64::from(i);
+            curve.curve_to((x, 2.0), (x + 0.3, -2.0), (x + 1.0, 0.0));
+        }
+        let mut shapes = Vec::new();
+        for i in 0..80_000u64 {
+            let mut s = match i % 3 {
+                0 => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Rect {
+                        rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                        radius: 1.5,
+                        corners: None,
+                    },
+                ),
+                1 => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Ellipse {
+                        rect: Rect::new(0.0, 0.0, 10.0, 6.0),
+                        arc: None,
+                    },
+                ),
+                _ => Shape::new(
+                    ShapeId(i),
+                    ShapeKind::Path {
+                        path: curve.clone(),
+                        closed: false,
+                    },
+                ),
+            };
+            s.transform = Affine::translate((f64::from(i as u32) * 0.01, 3.0))
+                * Affine::scale_non_uniform(1.5, 0.75);
+            shapes.push(s);
+        }
+        let t = std::time::Instant::now();
+        let mut area = 0.0;
+        for s in &shapes {
+            let b = s.bounds();
+            area += b.width() * b.height();
+        }
+        let quick = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut area2 = 0.0;
+        for s in &shapes {
+            let b = s.page_path().bounding_box();
+            area2 += b.width() * b.height();
+        }
+        let outline = t.elapsed();
+        eprintln!(
+            "80k shapes: bounds() {quick:?}, page_path().bounding_box() {outline:?} ({:.1}x), areas {area:.3} {area2:.3}",
+            outline.as_secs_f64() / quick.as_secs_f64().max(1e-9)
         );
     }
 
@@ -8786,6 +9511,55 @@ mod tests {
         assert!(matches!(children[0].kind, ShapeKind::Path { .. }));
     }
 
+    /// A further fill's look of its own: its part gets the live effects
+    /// that draw it, after the object's own; the other parts stay plain.
+    /// Set Extra Paint keeps the looks with as many fills as there are.
+    #[test]
+    fn a_further_fill_has_a_look_of_its_own() {
+        use crate::Color;
+        let mut s = Shape::new(
+            ShapeId(1),
+            ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        s.stroke = None;
+        s.extra_fills = vec![Fill::Solid(Color::BLACK), Fill::Solid(Color::WHITE)];
+        let look = FillLook {
+            grow: 2.0,
+            move_x: 1.0,
+            move_y: 0.0,
+            blur: 0.5,
+        };
+        s.fill_looks = Some(Box::new(vec![look]));
+        assert!(FillLook::default().effects().is_empty());
+        let parts = s.layers().expect("parts");
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].effects.is_empty() && parts[2].effects.is_empty());
+        assert_eq!(parts[1].effects, look.effects());
+        assert_eq!(parts[1].effects.len(), 3);
+        assert!(parts.iter().all(|p| p.fill_looks.is_none()));
+        // Saved and read back.
+        let back: Shape = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.fill_look(0), look);
+        assert!(back.fill_look(1).is_plain());
+        // Fewer fills: the looks go with them; none left plain stays None.
+        let mut doc = Document::new("t", crate::geometry::Size::new(50.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        doc.pages[0].layers[0].shapes.push(s.clone());
+        crate::Command::SetExtraPaint {
+            shapes: vec![s.id],
+            fills: vec![],
+            strokes: vec![],
+            looks: None,
+        }
+        .apply(&mut doc)
+        .unwrap();
+        assert!(doc.layer(layer).unwrap().shapes[0].fill_looks.is_none());
+    }
+
     #[test]
     fn further_fills_and_outlines_draw_in_layers() {
         use crate::{Color, Stroke};
@@ -9168,6 +9942,7 @@ mod tests {
             style: GuideStyle::Dotted,
             locked: true,
             hidden: true,
+            name: Some("Fold".into()),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("\"dir\":\"vertical\""));
@@ -10348,6 +11123,60 @@ mod tests {
             },
         );
         assert!(rect.text_parts().is_none());
+    }
+
+    /// A bullet of its own colour (#3682) is drawn in a part of its own,
+    /// which draws no characters, and the characters' part leaves it out.
+    #[test]
+    fn bullets_of_their_own_colour_are_a_part_of_their_own() {
+        use crate::color::Color;
+        let red = Color::rgb8(255, 0, 0);
+        let para = ParagraphStyle {
+            bullets: true,
+            bullet: BulletStyle {
+                color: Some(red),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut shape = Shape::new(
+            ShapeId(1),
+            ShapeKind::Text {
+                spans: vec![TextSpan::new("ab", "Arial", 12.0)],
+                origin: Point::ZERO,
+                frame: None,
+                align: Default::default(),
+                para,
+                on_path: None,
+            },
+        );
+        shape.fill = Fill::Solid(Color::BLACK);
+        let parts = shape.text_parts().expect("parts");
+        assert_eq!(parts.len(), 2);
+        let part = |p: &Shape| match &p.kind {
+            ShapeKind::Text { spans, para, .. } => {
+                (spans.iter().all(|s| s.layout_only), para.bullet_part)
+            }
+            _ => panic!("text"),
+        };
+        assert_eq!(part(&parts[0]), (false, Some(BulletPart::Text)));
+        assert_eq!(parts[0].fill, Fill::Solid(Color::BLACK));
+        assert_eq!(part(&parts[1]), (true, Some(BulletPart::Color(red))));
+        assert_eq!(parts[1].fill, Fill::Solid(red));
+        assert!(parts.iter().all(|p| p.text_parts().is_none()));
+        assert!(!BulletPart::draws(Some(BulletPart::Text), Some(red), true));
+        assert!(BulletPart::draws(Some(BulletPart::Text), None, true));
+        assert!(BulletPart::draws(
+            Some(BulletPart::Color(red)),
+            Some(red),
+            false
+        ));
+        assert!(BulletPart::draws(None, Some(red), true));
+        // Without a colour of its own the text is drawn whole.
+        if let ShapeKind::Text { para, .. } = &mut shape.kind {
+            para.bullet.color = None;
+        }
+        assert!(shape.text_parts().is_none());
     }
 
     #[test]

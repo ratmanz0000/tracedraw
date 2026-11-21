@@ -525,6 +525,11 @@ pub struct Settings {
     /// Options > Tools > Pick: the Pick tool's pointer is a cross hair.
     #[serde(default)]
     pub crosshair_cursor: bool,
+    /// Options > Tools > Pick: the lines of the cross hair pointer (the
+    /// Pick tool's with the option above, and the drawing tools') run to
+    /// the edges of the drawing window. Off by default (#2996).
+    #[serde(default)]
+    pub crosshair_to_edges: bool,
     /// Options > Display > Ruler calibration: pixels per inch of the
     /// screen at the system's scaling, so that zoom 100% shows real sizes
     /// (96 by default; see `screen_points_per_inch`).
@@ -887,13 +892,18 @@ pub struct StackSetup {
 }
 
 /// A floating docker as it was left: its name key, the window's top left
-/// corner and its size (screen points).
+/// corner and its size (screen points); whether it was in a window of its
+/// own (#2884) and where that window was on the desktop.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FloatingSetup {
     pub tab: String,
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_window: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<[f32; 2]>,
 }
 
 /// Which bars are shown (Window > Toolbars, the bars' menu). The palette
@@ -1430,6 +1440,10 @@ pub struct PalettePrefs {
     /// title left out): its rows or columns flow from it (see
     /// `ui::palette::floating_flow`).
     pub float_size: [f32; 2],
+    /// The colours' names beside their swatches in the palette opened
+    /// out by a strip's double arrow, a scrolling list (#3512). Off by
+    /// default: the swatches in a grid.
+    pub show_names: bool,
 }
 
 /// The most rows (or columns) a docked palette bar shows.
@@ -1643,6 +1657,7 @@ impl Default for PalettePrefs {
             swatch_size: SWATCH_DEFAULT,
             document_swatch_size: 0,
             float_size: FLOAT_SIZE,
+            show_names: false,
         }
     }
 }
@@ -2445,6 +2460,7 @@ impl Default for Settings {
             connector_gap: 0.0,
             upgrades: UPGRADES,
             crosshair_cursor: false,
+            crosshair_to_edges: false,
             screen_ppi: default_screen_ppi(),
             zoom_right_click_out: true,
             zoom_relative_1to1: true,
@@ -3570,22 +3586,26 @@ mod tests {
     }
 
     /// Preferences as an older version saved them, migrated as at start.
-    /// A first start snaps to guidelines and the page but not to objects,
-    /// within 10 screen pixels (#1814); a choice saved before is kept,
-    /// either way, and the app takes it.
+    /// A first start snaps to guidelines, the page and objects, within
+    /// 10 screen pixels (objects were off at first from #1814 on); a
+    /// choice saved before is kept, either way, and the app takes it.
     #[test]
-    fn new_installs_do_not_snap_to_objects_and_saved_choices_stay() {
+    fn new_installs_snap_to_objects_and_saved_choices_stay() {
         let s = Settings::default();
-        assert!(!s.snap.objects, "snapping to objects starts off");
+        assert!(s.snap.objects, "snapping to objects starts on");
         assert!(s.snap.guides && s.snap.page && !s.snap.off);
         assert_eq!(s.snap.threshold_px, 10.0);
         let on = migrated(r#"{"upgrades": 5, "snap": {"objects": true, "page": true}}"#);
         assert!(on.snap.objects);
+        let off = migrated(r#"{"upgrades": 5, "snap": {"objects": false, "page": true}}"#);
+        assert!(!off.snap.objects, "a saved choice of off stays");
         let old = migrated(r#"{"snap": {"objects": true, "page": false}}"#);
         assert!(old.snap.objects && !old.snap.page);
         let mut app = crate::app::App::headless();
         app.apply_settings(Settings::default());
-        assert!(!app.snap.objects && app.snap.page && app.snap.guides);
+        assert!(app.snap.objects && app.snap.page && app.snap.guides);
+        app.apply_settings(off);
+        assert!(!app.snap.objects);
         app.apply_settings(on);
         assert!(app.snap.objects);
     }

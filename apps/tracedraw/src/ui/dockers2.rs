@@ -673,6 +673,109 @@ fn styles_list(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// The special characters a Find or Replace field's right-click menu
+/// puts in (#3679), with their codes; `^w` only in Find.
+pub(crate) const FIND_CODES: [(&str, &str); 5] = [
+    ("find.code_paragraph", "^p"),
+    ("menu.text.code_line_break", "^l"),
+    ("find.code_tab", "^t"),
+    ("menu.text.code_nonbreaking_space", "^s"),
+    ("find.code_spaces", "^w"),
+];
+
+/// `text` with the letters `from..to` (counted in characters) replaced
+/// by `put`, and where the cursor goes after it.
+pub(crate) fn put_in_field(text: &mut String, from: usize, to: usize, put: &str) -> usize {
+    let byte = |n: usize| text.char_indices().nth(n).map_or(text.len(), |(b, _)| b);
+    let (a, b) = (byte(from.min(to)), byte(from.max(to)));
+    text.replace_range(a..b, put);
+    from.min(to) + put.chars().count()
+}
+
+/// A Find or Replace field with a right-click menu: Cut, Copy, Paste,
+/// Select All, and the special characters as their codes (#3678, #3679).
+/// `spaces`: the menu offers `^w` (two or more spaces), a Find code only.
+fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> egui::Response {
+    let id = ui.make_persistent_id(name);
+    let out = egui::TextEdit::singleline(text).id(id).show(ui);
+    let all = text.chars().count();
+    let (from, to) = egui::TextEdit::load_state(ui.ctx(), id)
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| {
+            let (a, b) = (r.primary.index.0, r.secondary.index.0);
+            (a.min(b), a.max(b))
+        })
+        .unwrap_or((all, all));
+    let mut put: Option<(usize, usize, String)> = None;
+    let mut select_all = false;
+    let response = out.response.response.clone();
+    response.context_menu(|ui| {
+        let picked: String = text.chars().skip(from).take(to - from).collect();
+        if ui
+            .add_enabled(from < to, egui::Button::new(tr("menu.edit.cut")))
+            .clicked()
+        {
+            ui.ctx().copy_text(picked.clone());
+            put = Some((from, to, String::new()));
+            ui.close();
+        }
+        if ui
+            .add_enabled(from < to, egui::Button::new(tr("menu.edit.copy")))
+            .clicked()
+        {
+            ui.ctx().copy_text(picked);
+            ui.close();
+        }
+        if ui.button(tr("menu.edit.paste")).clicked() {
+            if let Some(t) = crate::clipboard::system_text() {
+                // One line: the field has no room for line ends.
+                put = Some((from, to, t.replace(['\r', '\n'], " ")));
+            }
+            ui.close();
+        }
+        if ui.button(tr("menu.edit.select_all")).clicked() {
+            select_all = true;
+            ui.close();
+        }
+        ui.separator();
+        ui.menu_button(tr("find.special_character"), |ui| {
+            for (key, code) in FIND_CODES {
+                if code == "^w" && !spaces {
+                    continue;
+                }
+                if ui.button(format!("{}  {code}", tr(key))).clicked() {
+                    put = Some((from, to, code.to_string()));
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .rich_tip(crate::ui::tips::pair(
+            "find.special_character",
+            "find.special_character_desc",
+        ));
+    });
+    let cursor = match put {
+        Some((a, b, s)) => Some(put_in_field(text, a, b, &s)),
+        None => None,
+    };
+    if cursor.is_some() || select_all {
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+            let range = match cursor {
+                Some(c) => egui::text::CCursorRange::one(egui::text::CCursor::new(c)),
+                None => egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(text.chars().count()),
+                ),
+            };
+            state.cursor.set_char_range(Some(range));
+            state.store(ui.ctx(), id);
+        }
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    response
+}
+
 fn find_replace(app: &mut App, ui: &mut Ui) {
     let mut st = std::mem::take(&mut app.find_state);
     ui.horizontal(|ui| {
@@ -699,20 +802,17 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
     }
     ui.horizontal(|ui| {
         ui.label(tr("dialog.find"));
-        ui.text_edit_singleline(&mut st.find)
-            .rich_tip(crate::ui::tips::pair(
-                "docker.find_field",
-                "docker.find_field_desc",
-            ));
+        find_field(ui, &mut st.find, "find_replace_find", true).rich_tip(crate::ui::tips::pair(
+            "docker.find_field",
+            "docker.find_field_desc",
+        ));
     });
     if st.kind == 0 {
         ui.horizontal(|ui| {
             ui.label(tr("dialog.replace_with"));
-            ui.text_edit_singleline(&mut st.replace)
-                .rich_tip(crate::ui::tips::pair(
-                    "docker.replace_field",
-                    "docker.replace_field_desc",
-                ));
+            find_field(ui, &mut st.replace, "find_replace_replace", false).rich_tip(
+                crate::ui::tips::pair("docker.replace_field", "docker.replace_field_desc"),
+            );
         });
         ui.checkbox(&mut st.match_case, tr("dialog.match_case"))
             .rich_tip(crate::ui::tips::pair(
@@ -1735,6 +1835,9 @@ fn blend(app: &mut App, ui: &mut Ui) {
             ),
         };
     let mut changed = false;
+    // A bent line is followed as a path is: spacing and turning with it
+    // apply.
+    let follows = has_path || opt.bend.is_some();
     let mut spacing_mm = opt.spacing.unwrap_or(app.blend_spacing_mm);
     // Steps or spacing: spacing needs a path.
     ui.horizontal(|ui| {
@@ -1765,7 +1868,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
             ui,
             &tr("docker.blend_by_spacing"),
             by_spacing,
-            has_path,
+            follows,
             |p, r, c| {
                 let s = egui::Stroke::new(1.3, c);
                 let y = r.center().y;
@@ -1849,12 +1952,28 @@ fn blend(app: &mut App, ui: &mut Ui) {
         .changed();
     changed |= ui
         .add_enabled(
-            has_path,
+            follows,
             egui::Checkbox::new(&mut rotate_on_path, tr("docker.rotate_all_objects")),
         )
         .rich_tip(crate::ui::tips::keyed("docker.rotate_all_objects"))
         .rich_disabled_tip(crate::ui::tips::keyed("docker.rotate_all_objects"))
         .changed();
+    // Two groups: object by object, each in its own colours.
+    changed |= ui
+        .checkbox(&mut opt.by_parts, tr("docker.blend_by_parts"))
+        .rich_tip(crate::ui::tips::keyed("docker.blend_by_parts"))
+        .changed();
+    // A bent line (the round handle in its middle, Blend tool) made
+    // straight again.
+    if opt.bend.is_some()
+        && ui
+            .button(tr("docker.blend_straighten"))
+            .rich_tip(crate::ui::tips::keyed("docker.blend_straighten"))
+            .clicked()
+    {
+        opt.bend = None;
+        changed = true;
+    }
     if has_path {
         blend_path_ends(app, ui, &opt);
     }
@@ -2859,6 +2978,10 @@ pub(crate) fn symbol_uses(doc: &tracedraw_core::Document, index: usize) -> usize
 
 fn symbols(app: &mut App, ui: &mut Ui) {
     let has = !app.selection.is_empty();
+    let has_group = app
+        .selected_shapes()
+        .iter()
+        .any(|s| matches!(s.kind, ShapeKind::Group { .. }));
     ui.horizontal(|ui| {
         if ui
             .add_enabled(has, egui::Button::new(tr("docker.new_symbol")))
@@ -2868,6 +2991,16 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         {
             app.create_symbol_from_selection();
         }
+        // Every group copying the selected one becomes an instance where
+        // it stood, labels staying text (#2343).
+        if ui
+            .add_enabled(has_group, egui::Button::new(tr("docker.symbolize_similar")))
+            .rich_tip(tr("docker.symbolize_similar_tip"))
+            .rich_disabled_tip(tr("docker.symbolize_similar_tip"))
+            .clicked()
+        {
+            app.symbolize_similar();
+        }
         if ui
             .button(tr("docker.revert_to_objects"))
             .rich_tip(crate::ui::tips::keyed("docker.revert_to_objects"))
@@ -2876,78 +3009,116 @@ fn symbols(app: &mut App, ui: &mut Ui) {
             app.revert_symbol_instances();
         }
     });
+    ui.add(
+        egui::TextEdit::singleline(&mut app.symbol_filter)
+            .hint_text(tr("docker.symbol_search"))
+            .desired_width(f32::INFINITY),
+    );
+    let filter = app.symbol_filter.to_lowercase();
     let syms: Vec<(usize, String)> = app
         .doc()
         .symbols
         .iter()
         .enumerate()
+        .filter(|(_, s)| filter.is_empty() || s.name.to_lowercase().contains(&filter))
         .map(|(i, s)| (i, s.name.clone()))
         .collect();
     let editing = app.symbol_edit_index();
+    let count = app.doc().symbols.len();
+    let selected_index = app.selected_shapes().iter().find_map(|s| match s.kind {
+        ShapeKind::SymbolInstance { index } => Some(index),
+        _ => None,
+    });
     let mut thumbs = std::mem::take(&mut app.symbol_thumbs);
     thumbs.begin_frame();
     let drawing = (app.engine.instance(), app.engine.revision());
     for (i, name) in syms {
-        ui.horizontal(|ui| {
-            // What the symbol draws, beside its name (#3249).
-            symbol_picture(app, ui, &mut thumbs, drawing, i);
-            ui.label(&name);
-            if ui
-                .small_button(tr("docker.insert"))
-                .rich_tip(crate::ui::tips::pair(
-                    "docker.insert",
-                    "docker.insert_symbol_desc",
-                ))
-                .clicked()
-            {
-                app.insert_symbol_instance(i);
-            }
-            // Edit: the symbol's objects edited on the page; Finish while
-            // they are (#1980).
-            if editing == Some(i) {
-                if ui
-                    .small_button(tr("clip.finish"))
-                    .rich_tip(tr("menu.object.symbol_finish"))
-                    .clicked()
-                {
-                    app.finish_clip_frame_edit();
-                }
-                // Cancel: the edit ends and the symbol stays as it was
-                // (#3437).
-                if ui
-                    .small_button(tr("docker.cancel_symbol_edit"))
-                    .rich_tip(tr("docker.cancel_symbol_edit_tip"))
-                    .clicked()
-                {
-                    app.cancel_symbol_edit();
-                }
-            } else if ui
-                .add_enabled(
-                    app.clip_frame_edit.is_none(),
-                    egui::Button::new(tr("docker.edit_symbol")).small(),
-                )
-                .rich_tip(crate::ui::tips::pair(
-                    "docker.edit_symbol",
-                    "docker.edit_symbol_desc",
-                ))
-                .clicked()
-            {
-                app.edit_symbol(i);
-            }
-            // A copy of the symbol, placed nowhere (#3437).
-            if ui
-                .add_enabled(
-                    app.clip_frame_edit.is_none(),
-                    egui::Button::new(tr("docker.duplicate_symbol")).small(),
-                )
-                .rich_tip(tr("docker.duplicate_symbol_tip"))
-                .clicked()
-            {
-                app.duplicate_symbol(i);
-            }
-            let uses = symbol_uses(app.doc(), i);
-            dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
-        });
+        let selected = selected_index == Some(i);
+        egui::Frame::new()
+            .fill(egui::Color32::from_white_alpha(6))
+            .corner_radius(4.0)
+            .inner_margin(6.0)
+            .stroke(if selected {
+                egui::Stroke::new(1.5, ui.style().visuals.selection.stroke.color)
+            } else {
+                egui::Stroke::NONE
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // What the symbol draws, beside its name (#3249).
+                    symbol_picture(app, ui, &mut thumbs, drawing, i);
+                    ui.label(&name);
+                    let uses = symbol_uses(app.doc(), i);
+                    dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(tr("docker.insert"))
+                        .rich_tip(crate::ui::tips::pair(
+                            "docker.insert",
+                            "docker.insert_symbol_desc",
+                        ))
+                        .clicked()
+                    {
+                        app.insert_symbol_instance(i);
+                    }
+                    // Edit: the symbol's objects edited on the page; Finish
+                    // while they are (#1980).
+                    if editing == Some(i) {
+                        if ui
+                            .small_button(tr("clip.finish"))
+                            .rich_tip(tr("menu.object.symbol_finish"))
+                            .clicked()
+                        {
+                            app.finish_clip_frame_edit();
+                        }
+                        // Cancel: the edit ends and the symbol stays as it
+                        // was (#3437).
+                        if ui
+                            .small_button(tr("docker.cancel_symbol_edit"))
+                            .rich_tip(tr("docker.cancel_symbol_edit_tip"))
+                            .clicked()
+                        {
+                            app.cancel_symbol_edit();
+                        }
+                    } else if ui
+                        .add_enabled(
+                            app.clip_frame_edit.is_none(),
+                            egui::Button::new(tr("docker.edit_symbol")).small(),
+                        )
+                        .rich_tip(crate::ui::tips::pair(
+                            "docker.edit_symbol",
+                            "docker.edit_symbol_desc",
+                        ))
+                        .clicked()
+                    {
+                        app.edit_symbol(i);
+                    }
+                    // Merge this symbol into another: every instance
+                    // follows, the source goes.
+                    if ui
+                        .add_enabled(
+                            count > 1 && app.clip_frame_edit.is_none(),
+                            egui::Button::new(tr("docker.replace_symbol")).small(),
+                        )
+                        .rich_tip(tr("docker.replace_symbol_tip"))
+                        .clicked()
+                    {
+                        app.symbol_merge = Some((i, if i == 0 { 1 } else { 0 }));
+                    }
+                    // A copy of the symbol, placed nowhere (#3437).
+                    if ui
+                        .add_enabled(
+                            app.clip_frame_edit.is_none(),
+                            egui::Button::new(tr("docker.duplicate_symbol")).small(),
+                        )
+                        .rich_tip(tr("docker.duplicate_symbol_tip"))
+                        .clicked()
+                    {
+                        app.duplicate_symbol(i);
+                    }
+                });
+            });
     }
     thumbs.trim(crate::object_thumbs::MAX_BYTES / 4);
     if thumbs.waiting {
@@ -2956,6 +3127,91 @@ fn symbols(app: &mut App, ui: &mut Ui) {
     app.symbol_thumbs = thumbs;
     if app.doc().symbols.is_empty() {
         dim(ui, tr("docker.symbols_hint"));
+    }
+    if let Some(r) = app.symbolize_report.clone() {
+        dim(ui, r);
+    }
+    symbol_merge_dialog(app, ui);
+}
+
+/// The Replace Symbol dialog: the source, a target picked among the other
+/// symbols, what the merge will do, and the merge in one undo step.
+fn symbol_merge_dialog(app: &mut App, ui: &mut Ui) {
+    let Some((from, mut to)) = app.symbol_merge else {
+        return;
+    };
+    let count = app.doc().symbols.len();
+    if from >= count || to >= count || from == to {
+        app.symbol_merge = None;
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    crate::ui::chrome::modal_blocker(&ctx);
+    let mut open = true;
+    egui::Window::new(tr("dialog.symbol_merge_title"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(&ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(tr("dialog.symbol_merge_from"));
+                    ui.label(&app.doc().symbols[from].name);
+                    dim(
+                        ui,
+                        trf(
+                            "docker.instances_n",
+                            &[("n", &symbol_uses(app.doc(), from).to_string())],
+                        ),
+                    );
+                });
+                ui.label("->");
+                ui.vertical(|ui| {
+                    ui.label(tr("dialog.symbol_merge_to"));
+                    egui::ComboBox::from_id_salt("symbol_merge_target")
+                        .selected_text(app.doc().symbols[to].name.clone())
+                        .show_ui(ui, |ui| {
+                            for (j, s) in app.doc().symbols.iter().enumerate() {
+                                if j != from {
+                                    ui.selectable_value(&mut to, j, s.name.clone());
+                                }
+                            }
+                        });
+                    dim(
+                        ui,
+                        trf(
+                            "docker.instances_n",
+                            &[("n", &symbol_uses(app.doc(), to).to_string())],
+                        ),
+                    );
+                });
+            });
+            ui.label(trf(
+                "dialog.symbol_merge_desc",
+                &[
+                    ("n", &symbol_uses(app.doc(), from).to_string()),
+                    ("from", &app.doc().symbols[from].name),
+                    ("to", &app.doc().symbols[to].name),
+                ],
+            ));
+            ui.horizontal(|ui| {
+                if ui
+                    .button(tr("dialog.symbol_merge_ok"))
+                    .clicked()
+                {
+                    app.merge_symbols(from, to);
+                    app.symbol_merge = None;
+                }
+                if ui.button(tr("dialog.cancel")).clicked() {
+                    app.symbol_merge = None;
+                }
+            });
+        });
+    if !open {
+        app.symbol_merge = None;
+    } else {
+        app.symbol_merge = Some((from, to));
     }
 }
 
@@ -4293,5 +4549,34 @@ mod object_data_copy_tests {
         app.undo();
         let data = app.doc().find_shape(b).expect("b").data.clone();
         assert_eq!(data.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod find_field_tests {
+    use super::*;
+
+    /// The Find and Replace fields' right-click menu puts its text where
+    /// the cursor is, or over the letters picked, counted in characters
+    /// (#3678); the special characters go in as their codes (#3679).
+    #[test]
+    fn the_find_fields_menu_puts_text_at_the_cursor() {
+        let mut t = "größe text".to_string();
+        assert_eq!(put_in_field(&mut t, 5, 5, "^p"), 7);
+        assert_eq!(t, "größe^p text");
+        // Over a selection made backwards: the selection goes.
+        assert_eq!(put_in_field(&mut t, 12, 8, "^t"), 10);
+        assert_eq!(t, "größe^p ^t");
+        // Cut: nothing put over the picked letters.
+        assert_eq!(put_in_field(&mut t, 0, 5, ""), 0);
+        assert_eq!(t, "^p ^t");
+        // At the end.
+        assert_eq!(put_in_field(&mut t, 5, 5, "^w"), 7);
+        assert_eq!(t, "^p ^t^w");
+        let codes: Vec<&str> = FIND_CODES.iter().map(|(_, c)| *c).collect();
+        assert_eq!(codes, ["^p", "^l", "^t", "^s", "^w"]);
+        for (key, _) in FIND_CODES {
+            assert_ne!(tr(key), key, "{key} is in the language files");
+        }
     }
 }

@@ -70,7 +70,8 @@ pub fn midpoint_params(f: &Fountain) -> Vec<(usize, f64)> {
 /// The nodes of a fountain on the object's page bounds: start, end and
 /// skew handle; none for a shaped fountain (it follows the outline).
 pub fn fountain_handles(f: &Fountain, b: Rect) -> Vec<(FountainHandle, Point)> {
-    if f.kind == FountainKind::Shaped {
+    // Colour points have their own nodes (`crate::color_points`).
+    if matches!(f.kind, FountainKind::Shaped | FountainKind::Points) {
         return Vec::new();
     }
     let h = f.handles.unwrap_or_else(|| f.default_handles(b));
@@ -676,7 +677,9 @@ impl App {
         };
         let b = s.page_path().bounding_box();
         let mut f = match &s.fill {
-            Fill::Fountain(f) if f.kind != FountainKind::Shaped => f.clone(),
+            Fill::Fountain(f) if !matches!(f.kind, FountainKind::Shaped | FountainKind::Points) => {
+                f.clone()
+            }
             other => {
                 let first = match (other, &self.default_fill()) {
                     (Fill::Solid(c), _) | (_, Fill::Solid(c)) => *c,
@@ -937,6 +940,33 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         (a - b).hypot() < 1e-6
+    }
+
+    /// #3747: Ctrl+click on a palette colour with a fountain node picked
+    /// mixes a tenth of the colour into that node; it did nothing.
+    #[test]
+    fn ctrl_click_on_a_palette_colour_mixes_into_the_picked_node() {
+        let mut app = App::headless();
+        let id = square(&mut app);
+        app.apply_fill(Fill::Fountain(tracedraw_core::Fountain::two(
+            tracedraw_core::FountainKind::Linear,
+            Color::WHITE,
+            Color::BLACK,
+            0.0,
+        )));
+        app.set_tool(crate::tools::Tool::InteractiveFill);
+        app.fill_node = Some(0);
+        app.mix_into_fill(Color::rgb8(255, 0, 0));
+        let Fill::Fountain(f) = &app.doc().find_shape(id).expect("shape").fill else {
+            panic!("still a fountain");
+        };
+        let want = crate::ui::palette::mix(Color::WHITE, Color::rgb8(255, 0, 0), 0.1);
+        assert_eq!(f.stops[0].color.to_rgb8(), want.to_rgb8());
+        assert_eq!(
+            f.stops[1].color.to_rgb8(),
+            [0, 0, 0],
+            "the other node stays"
+        );
     }
 
     /// #2827: with the Transparency tool and a node of the gradient

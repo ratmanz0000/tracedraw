@@ -55,6 +55,7 @@ pub mod envelope_ui;
 pub mod export_docker;
 pub mod extrude_bar;
 pub mod field;
+pub mod flare;
 pub mod fill_tool_bars;
 pub mod focus_bar;
 pub mod font_list;
@@ -142,6 +143,7 @@ pub mod tips;
 pub mod toolbar;
 pub mod toolbox;
 pub mod transform_docker;
+pub mod transform_each;
 pub mod transparency_docker;
 pub mod shape_gen_docker;
 pub mod symbol_scatter_docker;
@@ -456,8 +458,11 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     keep_tab_on_the_drawing(app, &ctx);
     // The menu bar and an open menu or list take their keys first, so
     // that the arrows never nudge the drawing then (#1839).
-    keynav::frame(&ctx, app.shortcut_editor.capture.is_some());
-    app.keyboard(&ctx);
+    // The preview owns its keys until it returns to the drawing.
+    if !app.fullscreen_preview {
+        keynav::frame(&ctx, app.shortcut_editor.capture.is_some());
+        app.keyboard(&ctx);
+    }
     // A menu command run by a shortcut of the user's.
     if let Some(cmd) = app.pending_command.take() {
         if !menus::run_command(app, &ctx, &cmd) {
@@ -737,6 +742,8 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
             palette_bars::mark_bar(app, dock, r);
         }
     }
+    // Toolbars the user made docked at a side: columns inside the toolbox.
+    bars::docked_columns(app, ui);
     bars_at(app, ui, COLUMNS, BarSlot::AfterToolbox);
 
     // The docker columns: the default one at the right (right-to-left
@@ -922,6 +929,7 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
         clip_bar::show(app, &ctx);
         focus_bar::show(app, &ctx);
         effect_picker::show(app, &ctx);
+        crate::cut_tools::grid_cut_window(app, &ctx);
         crate::perspective_draw::show_bar(app, &ctx);
     }
     update_card::show(app, &ctx);
@@ -1402,6 +1410,11 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
         });
         let cursor = cursors::for_tool_with_ctrl(app, shift, ctrl, primary, middle, pos);
         cursors::show(ui.ctx(), cursor, pos);
+        if app.settings.crosshair_to_edges {
+            if let Some(p) = pos.filter(|p| canvas_rect.contains(*p)) {
+                cursors::paint_edge_lines(&painter, cursor, p, canvas_rect);
+            }
+        }
         // A colour eyedropper waiting to sample: the colour under the
         // pointer beside it (#990).
         let picker = crate::ui::color_picker::picking(ui.ctx());
@@ -1523,7 +1536,7 @@ pub(crate) fn view_navigator(app: &mut App, ui: &mut Ui, corner: egui::Rect, can
         egui::pos2(corner.max.x - thumb_w - 8.0, corner.min.y - thumb_h - 8.0),
         egui::pos2(corner.max.x, corner.min.y),
     );
-    // Opened with its key, it comes up at the pointer, as in CorelDRAW,
+    // Opened with its key, it comes up at the pointer,
     // with the spot of the view's centre under the pointer so the view
     // does not jump: it always came up in the corner (#3086). The place
     // is kept while it is open, so moving over it pans.

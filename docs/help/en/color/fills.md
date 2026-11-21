@@ -33,8 +33,13 @@ the [[docker.properties]] panel:
 
 - The type: [[fill.linear]] (along a line), [[fill.radial]] (from the center
   out), [[fill.conical]] (around the center), [[fill.square]] (in growing
-  squares) or [[fill.shaped]] (following the outline of the object, from the
-  edge inwards).
+  squares), [[fill.shaped]] (following the outline of the object, from the
+  edge inwards) or **Color points** (each color at a point of its own
+  anywhere in the object, blending into the others around it). With the
+  Interactive Fill or Shape tool the color points show on the object: drag
+  one to move it, click one and then a palette color to recolor it,
+  double-click inside the object to add one, and press Delete to remove the
+  chosen one (two always stay).
 - [[docker.gradient_presets]]: ready-made gradients to start from.
 - The **stops**: the colors and where they sit along the gradient, 2 to 64.
   Select a stop to change its color or position; [[docker.add_stop]] and
@@ -167,6 +172,10 @@ go back.
 - A [[docker.fill_texture]] fill is a generated, natural-looking texture:
   [[texture.clouds]], [[texture.marble]], [[texture.noise]] or
   [[texture.wood]], with its colors and scale.
+- [[texture.holographic]] and [[texture.holo_glitter]] give a fixed holographic foil look: rainbow colors flowing
+  through dark and light patches (colors A and B), the glitter with
+  sparkling grains. It does not change with the viewing angle; PDF and SVG
+  carry it as a picture.
 
 ## Several fills on one object {#several-fills}
 
@@ -179,6 +188,11 @@ same way.
 The arrows beside each further fill or outline paint it one place earlier or
 later; the second trades places with the first, so any of them can go
 bottom or top.
+
+Under each further fill, Grow, Move and Blur give it a look of its own:
+its area grown (or shrunk, below zero), moved and blurred, while the
+object and its other fills stay as they are. A smaller fill of another colour,
+moved and blurred a little, makes a soft highlight, for example.
 
 Fills can also be painted on outlines; see
 [Setting outlines](../lines-shapes/outlines.md#outline-pen).

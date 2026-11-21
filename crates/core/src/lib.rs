@@ -40,6 +40,7 @@ pub mod patch;
 pub mod picture_inks;
 mod press;
 pub mod procedural;
+pub mod rough;
 pub mod recolor;
 pub mod scale_grid;
 pub mod shadow;
@@ -47,6 +48,7 @@ pub mod shaping;
 pub mod spreads;
 pub mod style;
 pub mod surface_map;
+pub mod symbols;
 pub mod table;
 pub mod text_flow;
 pub mod tiles;
@@ -63,9 +65,10 @@ pub use document::{
     FollowBlack, FontVariation, Layer, LeadingUnit, LineStyle, MasterScope, Metadata, Numbering,
     ObjectDefaults, ObjectStyle, Page, ParagraphStyle, PathTextOrientation, PathTextVertical,
     QrCode, QrKind, Shadow, Shape, ShapeKind, StyleParts, Symbol, TabKind, TabStop, Table,
-    TableCell, TextAlign, TextDirection, TextOnPath, TextPosition, TextSpan, TimeTracker,
+    TableCell, TextAlign, TextDirection, TextOnPath, CurvePreset, TextPosition, TextSpan, TimeTracker,
     TrackedTask, VerticalAlign, VerticalColumns, DEFAULT_TAB_STEP,
 };
+pub use document::{BulletPart, MAX_LIST_LEVEL};
 pub use engine::Engine;
 pub use geometry::{Affine, BezPath, Point, Rect, Size, Vec2};
 pub use icc::{Intent as RenderingIntent, Profile as IccProfile, Transform as IccTransform};

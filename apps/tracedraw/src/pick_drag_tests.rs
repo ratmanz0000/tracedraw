@@ -1274,6 +1274,8 @@ fn the_pointer_shows_what_a_press_would_do() {
         start_angle: 0.0,
         current_angle: 0.0,
         grab: None,
+        start_radius: 0.0,
+        scale: 1.0,
     };
     assert_eq!(cursor(&app, empty), ToolCursor::Rotate);
     // Moving: the arrow with a dotted box; once a right click makes the
@@ -1333,6 +1335,8 @@ fn the_status_bar_tells_how_far_how_much_and_what_angle() {
         start_angle: 0.0,
         current_angle: 30f64.to_radians(),
         grab: None,
+        start_radius: 0.0,
+        scale: 1.0,
     };
     assert!(info(&app).contains("30.0"), "{}", info(&app));
     app.drag = Drag::Skew {
@@ -5272,6 +5276,60 @@ fn bspline_clicks_place_control_points_of_a_smooth_curve() {
             .any(|p| near(p, q))
     };
     assert!(!on(pts[1]) && !on(pts[2]));
+}
+
+/// The Curvature Pen: each click places a point the curve runs through,
+/// smooth there; a point placed with Alt held is a corner; the curve
+/// made is a plain curve with those points as its nodes, as previewed.
+#[test]
+fn the_curvature_pen_draws_a_smooth_curve_through_its_clicks() {
+    use tracedraw_core::geometry::curvature_path;
+    let (ctx, mut app, _) = setup();
+    app.select(Vec::new());
+    app.set_tool(Tool::CurvaturePen);
+    let pts = [
+        Point::new(100.0, 150.0),
+        Point::new(130.0, 190.0),
+        Point::new(160.0, 150.0),
+        Point::new(190.0, 190.0),
+        Point::new(220.0, 150.0),
+    ];
+    for (i, p) in pts.iter().enumerate() {
+        let mods = if i == 2 {
+            Modifiers::ALT
+        } else {
+            Modifiers::NONE
+        };
+        let at = app.view.to_screen(*p);
+        click_at(&ctx, &mut app, at, mods);
+        assert!(app.curve.is_some(), "still drawing after point {i}");
+    }
+    let want = vec![false, false, true, false, false];
+    let c = app.curve.as_ref().expect("a curve being drawn");
+    assert_eq!(c.spline_fixed_flags(), Some(want.clone()));
+    let placed: Vec<Point> = c.nodes.iter().map(|n| n.0).collect();
+    assert_eq!(c.path(None), curvature_path(&placed, &want, false));
+    frame(
+        &ctx,
+        &mut app,
+        vec![key(egui::Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert!(app.curve.is_none());
+    let made = last_path(&app);
+    assert_eq!(made, curvature_path(&placed, &want, false));
+    let ends: Vec<Point> = made
+        .elements()
+        .iter()
+        .filter_map(|e| e.end_point())
+        .collect();
+    assert_eq!(ends.len(), pts.len());
+    for (e, p) in ends.iter().zip(&pts) {
+        assert!((*e - *p).hypot() < 1e-3, "the curve runs through every click");
+    }
+    let id = app.selection[0];
+    let s = app.doc().find_shape(id).expect("the curve");
+    assert!(s.spline.is_none(), "a plain curve, its points its nodes");
 }
 
 /// The curve the B-Spline tool previews, as the canvas draws it.
@@ -15977,7 +16035,7 @@ fn a_double_click_on_a_mesh_node_removes_its_grid_lines() {
     assert_eq!((mesh(&app).rows, mesh(&app).cols), (3, 3));
 }
 
-/// Discussion #2387, Mesh Fill as in CorelDRAW: Shift+click adds mesh
+/// Discussion #2387, Mesh Fill: Shift+click adds mesh
 /// nodes to the chosen ones (and takes a chosen one out), a marquee
 /// chooses the nodes inside it, a palette colour, the transparency and
 /// the mesh eyedropper act on every chosen node, and a drag moves them
@@ -28712,14 +28770,14 @@ fn a_drag_with_the_inner_shadow_tool_casts_a_shadow_inside_the_object() {
         opacity: 0.0,
         blur: 0.0,
         merge: tracedraw_core::live::MergeMode::Normal,
+        spread: 0.0,
     });
     assert!(inner(&app).is_empty());
 }
 
 /// A right-click on a menu row, greyed or not, opens Options >
 /// Customization > Commands at that command, on its Shortcut Keys tab,
-/// to give it a key, as CorelDRAW's Customize > Menu Item Properties
-/// (#2504).
+/// to give it a key (#2504).
 #[test]
 fn a_right_click_on_a_menu_row_opens_its_shortcut_keys() {
     use crate::ui::dialogs::Dialog;
@@ -28931,7 +28989,7 @@ fn a_guideline_over_a_picture_is_dragged_and_the_picture_stays() {
 fn a_guideline_over_a_shape_or_a_group_is_dragged_and_they_stay() {
     // #2640 (tested in 0.48): a guideline across a filled shape or a
     // group showed no arrows and took no press, as only pictures let a
-    // guideline win. Guidelines lie above the layers, as in CorelDRAW:
+    // guideline win. Guidelines lie above the layers:
     // over any object that is not selected the guideline moves.
     let (ctx, mut app, _) = setup();
     let fill = tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(200, 30, 30));
@@ -29454,6 +29512,45 @@ fn ctrl_shift_l_turns_bullets_on_and_off() {
     assert_eq!(row.shortcut, "Ctrl+Shift+L");
 }
 
+/// Text > Increase List Level and Decrease List Level (#3685): the
+/// paragraphs with bullets of the selected paragraph text go one level
+/// deeper and back, numbers taking the next numbering; without bullets
+/// nothing changes. One Undo takes a step back.
+#[test]
+fn list_level_menu_items_move_bulleted_paragraphs() {
+    let (ctx, mut app, _) = setup();
+    let id = paragraph_frame(&ctx, &mut app, 12);
+    let bullet = |app: &App| {
+        let s = app.doc().find_shape(id).cloned().expect("text");
+        app.paragraph_style_of(&s).expect("paragraph").1.bullet
+    };
+    app.set_tool(Tool::Pick);
+    app.select(vec![id]);
+    let unchanged = app.doc().find_shape(id).cloned();
+    app.change_list_level(true);
+    assert_eq!(app.doc().find_shape(id).cloned(), unchanged, "no bullets");
+    app.edit_paragraph_style(id, |p| {
+        p.bullets = true;
+        p.bullet.numbering = tracedraw_core::Numbering::Arabic;
+    });
+    app.change_list_level(true);
+    let b = bullet(&app);
+    assert_eq!(
+        (b.level, b.numbering),
+        (1, tracedraw_core::Numbering::LowerAlpha)
+    );
+    app.change_list_level(false);
+    assert_eq!(bullet(&app).level, 0);
+    app.change_list_level(false);
+    assert_eq!(bullet(&app).level, 0, "already at the top");
+    app.undo();
+    assert_eq!(bullet(&app).level, 1);
+    let entries = crate::ui::menus::commands(&mut app, &ctx);
+    for key in ["menu.text.list_level_down", "menu.text.list_level_up"] {
+        assert!(entries.iter().any(|e| e.key == key), "{key}");
+    }
+}
+
 /// File > Import of several files at once (discussion #2695): each waits
 /// for its own click in turn, and all of them end up selected together;
 /// Esc calls off the one waiting and those after it.
@@ -29585,7 +29682,7 @@ fn several_imported_files_come_in_at_once_without_the_cursor() {
     assert!(app.import_batch.is_none());
 }
 
-/// The result of a node edit stays chosen, as in CorelDRAW (#2358): the
+/// The result of a node edit stays chosen (#2358): the
 /// node two ends were joined into, both ends a Break makes, the ends
 /// Extend Curve to Close links, the nodes Reverse Direction turns.
 #[test]
@@ -29860,6 +29957,8 @@ fn windows_keys_swap_ctrl_and_shift_for_transforms() {
         start_angle: 0.0,
         current_angle: 0.0,
         grab: None,
+        start_radius: 0.0,
+        scale: 1.0,
     };
     assert_eq!(app.pick_mods(Modifiers::CTRL), Modifiers::CTRL);
     app.settings.pick_windows_keys = true;
@@ -30451,6 +30550,9 @@ fn the_guidelines_panel_works_from_the_keyboard() {
 #[test]
 fn the_handles_of_a_straight_line_do_not_overlap() {
     let (ctx, mut app, rect) = setup();
+    // The line is stretched by a set distance, which would otherwise end
+    // within the snapping radius of the rectangle's bottom.
+    app.snap.objects = false;
     app.select(Vec::new());
     let mut ids = Vec::new();
     for (a, b) in [((40.0, 20.0), (40.0, 120.0)), ((20.0, 150.0), (120.0, 150.0))] {
@@ -30495,4 +30597,241 @@ fn the_handles_of_a_straight_line_do_not_overlap() {
     let grown = 30.0 / app.view.zoom as f64;
     assert!(close(after.height(), before.height() + grown), "{before:?} {after:?}");
     assert!(close(after.width(), before.width()), "{before:?} {after:?}");
+}
+
+/// In rotate mode Shift scales the selection while it turns, keeping its
+/// proportions, by the pointer's distance from the centre (#3772).
+#[test]
+fn shift_scales_while_rotating() {
+    use crate::interaction::rotate_drag_scale;
+    assert_eq!(rotate_drag_scale(false, 10.0, 20.0), 1.0);
+    assert_eq!(rotate_drag_scale(true, 10.0, 20.0), 2.0);
+    assert_eq!(rotate_drag_scale(true, 0.0, 20.0), 1.0);
+    assert!(rotate_drag_scale(true, 10.0, 0.0) > 0.0);
+    let app = App::headless();
+    let drag = Drag::Rotate {
+        center: Point::new(10.0, 10.0),
+        start_angle: 0.0,
+        current_angle: std::f64::consts::FRAC_PI_2,
+        grab: None,
+        start_radius: 10.0,
+        scale: 2.0,
+    };
+    let t = app.preview_transform_of(&drag).unwrap();
+    let q = t * Point::new(20.0, 10.0);
+    assert!((q.x - 10.0).abs() < 1e-9 && (q.y - 30.0).abs() < 1e-9, "{q:?}");
+    // The centre stays put.
+    let c = t * Point::new(10.0, 10.0);
+    assert!((c.x - 10.0).abs() < 1e-9 && (c.y - 10.0).abs() < 1e-9, "{c:?}");
+}
+
+/// Symbols docker > By similarity (#2343): the sample group, a moved
+/// copy and a copy nested in a holder group become instances of one
+/// symbol where each group stood, the holder keeping its child slot;
+/// one undo puts every group back.
+#[test]
+fn symbolize_similar_in_place() {
+    use tracedraw_core::{Color, Command, Fill, Shape};
+    let (ctx, mut app, rect) = setup();
+    app.run(Command::DeleteShapes { shapes: vec![rect] });
+    let layer = app.active_layer().expect("layer");
+    // The two rectangles every copy of the sample repeats.
+    let pair = |app: &mut App| -> Vec<Shape> {
+        let mut children = Vec::new();
+        for x in [0.0, 10.0] {
+            let mut s = Shape::new(
+                app.engine.new_shape_id(),
+                ShapeKind::Rect {
+                    rect: Rect::new(x, 0.0, x + 5.0, 5.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            s.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+            children.push(s);
+        }
+        children
+    };
+    let mut sample = Shape::new(
+        app.engine.new_shape_id(),
+        ShapeKind::Group {
+            children: pair(&mut app),
+        },
+    );
+    sample.transform = Affine::translate((20.0, 20.0));
+    let mut moved = Shape::new(
+        app.engine.new_shape_id(),
+        ShapeKind::Group {
+            children: pair(&mut app),
+        },
+    );
+    moved.transform = Affine::translate((80.0, 60.0));
+    let mut nested = Shape::new(
+        app.engine.new_shape_id(),
+        ShapeKind::Group {
+            children: pair(&mut app),
+        },
+    );
+    nested.transform = Affine::translate((5.0, 5.0));
+    let mut holder = Shape::new(
+        app.engine.new_shape_id(),
+        ShapeKind::Group {
+            children: vec![nested.clone()],
+        },
+    );
+    holder.transform = Affine::translate((140.0, 30.0));
+    let (sample_id, moved_id, holder_id, nested_id) =
+        (sample.id, moved.id, holder.id, nested.id);
+    for shape in [sample, moved, holder] {
+        app.engine
+            .run(&Command::AddShape { layer, shape })
+            .expect("add");
+    }
+    app.select(vec![sample_id]);
+    app.symbolize_similar();
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert_eq!(app.doc().symbols.len(), 1, "one symbol for every copy");
+    assert!(app.symbolize_report.is_some(), "the result is reported");
+    assert!(
+        app.symbolize_report
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Symbol 1"),
+        "{:?}",
+        app.symbolize_report
+    );
+    let shapes = |app: &App| -> Vec<Shape> {
+        app.doc()
+            .all_layers()
+            .find(|l| l.id == layer)
+            .expect("layer")
+            .shapes
+            .clone()
+    };
+    let now = shapes(&app);
+    assert_eq!(now.len(), 3, "the layer keeps its three slots");
+    assert_eq!(now[2].id, holder_id, "the holder stays");
+    // The sample and the moved copy became instances in their places.
+    for (slot, x, y) in [(0, 20.0, 20.0), (1, 80.0, 60.0)] {
+        assert!(
+            matches!(now[slot].kind, ShapeKind::SymbolInstance { index: 0 }),
+            "slot {slot}: {:?}",
+            now[slot].kind
+        );
+        let b = now[slot].bounds();
+        assert!(close(b.x0, x) && close(b.y0, y), "slot {slot}: {b:?}");
+    }
+    // The nested copy became an instance inside its holder.
+    let ShapeKind::Group { children } = &now[2].kind else {
+        panic!("holder")
+    };
+    assert_eq!(children.len(), 1);
+    assert!(matches!(
+        children[0].kind,
+        ShapeKind::SymbolInstance { index: 0 }
+    ));
+    // One undo puts every group back.
+    app.undo();
+    assert_eq!(app.doc().symbols.len(), 0);
+    let back = shapes(&app);
+    assert_eq!(
+        back.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![sample_id, moved_id, holder_id]
+    );
+    for s in &back {
+        assert!(matches!(s.kind, ShapeKind::Group { .. }), "{:?}", s.kind);
+    }
+    let ShapeKind::Group { children } = &back[2].kind else {
+        panic!("holder")
+    };
+    assert_eq!(children[0].id, nested_id);
+    assert!(matches!(children[0].kind, ShapeKind::Group { .. }));
+}
+
+/// Symbols docker > Replace: merging symbol 0 into symbol 1 moves every
+/// instance to the target, the source definition goes and the target's
+/// index shifts down a place; one undo brings both symbols back.
+#[test]
+fn merge_symbols_via_app() {
+    let (ctx, mut app, _rect) = setup();
+    // Two symbols from two different rectangles; each creation leaves
+    // an instance of the new symbol selected.
+    app.create_symbol_from_selection();
+    let a0 = app.selection[0];
+    let second = app
+        .new_shape(ShapeKind::Rect {
+            rect: Rect::new(100.0, 80.0, 130.0, 100.0),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![second]);
+    app.create_symbol_from_selection();
+    let b0 = app.selection[0];
+    assert_eq!(app.doc().symbols.len(), 2);
+    // One more instance of each.
+    app.insert_symbol_instance(0);
+    let a1 = app.selection[0];
+    app.insert_symbol_instance(1);
+    let b1 = app.selection[0];
+    let index_of = |app: &App, id: ShapeId| {
+        match &app.doc().find_shape(id).expect("instance").kind {
+            ShapeKind::SymbolInstance { index } => *index,
+            k => panic!("{k:?}"),
+        }
+    };
+    assert_eq!(index_of(&app, a0), 0);
+    assert_eq!(index_of(&app, a1), 0);
+    assert_eq!(index_of(&app, b0), 1);
+    assert_eq!(index_of(&app, b1), 1);
+    app.merge_symbols(0, 1);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert_eq!(app.doc().symbols.len(), 1, "the source definition goes");
+    assert_eq!(app.doc().symbols[0].name, "Symbol 2");
+    for id in [a0, a1, b0, b1] {
+        assert_eq!(
+            index_of(&app, id),
+            0,
+            "every instance follows, the target shifted"
+        );
+    }
+    assert!(app.symbolize_report.is_some(), "the merge is reported");
+    app.undo();
+    assert_eq!(app.doc().symbols.len(), 2, "one undo brings both back");
+    assert_eq!(app.doc().symbols[0].name, "Symbol 1");
+    assert_eq!(index_of(&app, a0), 0);
+    assert_eq!(index_of(&app, a1), 0);
+    assert_eq!(index_of(&app, b0), 1);
+    assert_eq!(index_of(&app, b1), 1);
+}
+
+/// The Replace dialog's state (`app.symbol_merge`) and the merge's
+/// guard: while a symbol edit is going on, `merge_symbols` refuses with
+/// a status message, the symbols stay and the dialog state is untouched.
+#[test]
+fn replace_dialog_state() {
+    let (_ctx, mut app, _rect) = setup();
+    app.create_symbol_from_selection();
+    let second = app
+        .new_shape(ShapeKind::Rect {
+            rect: Rect::new(100.0, 80.0, 130.0, 100.0),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![second]);
+    app.create_symbol_from_selection();
+    assert_eq!(app.doc().symbols.len(), 2);
+    app.symbol_merge = Some((0, 1));
+    // Edit symbol 0: the clip frame edit the merge must wait for.
+    app.edit_symbol(0);
+    assert!(app.clip_frame_edit.is_some(), "the symbol edit is going on");
+    app.merge_symbols(0, 1);
+    assert_eq!(app.doc().symbols.len(), 2, "the merge is refused");
+    assert_eq!(
+        app.status,
+        crate::i18n::tr("status.symbol_merge_finish_edit")
+    );
+    assert_eq!(app.symbol_merge, Some((0, 1)), "the dialog state stays");
+    assert!(app.clip_frame_edit.is_some(), "the edit stays");
 }

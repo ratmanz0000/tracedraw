@@ -1346,6 +1346,14 @@ pub enum Dialog {
         resize: bool,
         delete: bool,
     },
+    /// Object > Align and Distribute > Arrange in Grid (#3489): how many
+    /// objects go in a row and the gaps between the cells, in the
+    /// drawing's units.
+    ArrangeGrid {
+        columns: usize,
+        gap_x: f64,
+        gap_y: f64,
+    },
     /// Object > Outline Offset (#2622): the distance, in the drawing's
     /// units, and whether the new outline goes outside or inside.
     OutlineOffset {
@@ -1390,6 +1398,12 @@ pub enum Dialog {
     LayerProperties(crate::ui::objects_docker::LayerProps),
     RenameObject {
         shape: tracedraw_core::ShapeId,
+        name: String,
+    },
+    /// A guideline's Rename from its menu in the Objects docker (#3574):
+    /// its index among the guidelines being edited.
+    RenameGuide {
+        index: usize,
         name: String,
     },
     /// How a PDF's text is read in (#386).
@@ -1497,6 +1511,10 @@ pub enum Dialog {
     Barcode(BarcodeState),
     /// Object > Insert > Formula (#2183).
     Formula(crate::ui::formula_dialog::FormulaState),
+    /// Object > Transformations > Transform Each.
+    TransformEach(crate::ui::transform_each::TransformEach),
+    /// Object > Insert > Light Flare.
+    Flare(crate::ui::flare::Flare),
     ConvertToBitmap(crate::bitmap_modes::ConvertOptions),
     StraightenImage(crate::ui::straighten_dialog::StraightenState),
     Resample(crate::resample::ResampleState),
@@ -2259,6 +2277,53 @@ pub fn show(app: &mut App, ctx: &Context) {
                 }
             });
         }
+        Dialog::ArrangeGrid {
+            columns,
+            gap_x,
+            gap_y,
+        } => {
+            let u = app.units;
+            window(ctx, tr("dialog.arrange_grid")).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(tr("dialog.arrange_grid_columns"));
+                    ui.add(
+                        crate::ui::field::NumField::new(columns)
+                            .range(1..=1000)
+                            .speed(0.1),
+                    )
+                    .rich_tip(crate::ui::tips::pair(
+                        "dialog.arrange_grid_columns",
+                        "dialog.arrange_grid_columns_desc",
+                    ));
+                });
+                for (label, desc, gap) in [
+                    (
+                        "dialog.arrange_grid_gap_h",
+                        "dialog.arrange_grid_gap_h_desc",
+                        &mut *gap_x,
+                    ),
+                    (
+                        "dialog.arrange_grid_gap_v",
+                        "dialog.arrange_grid_gap_v_desc",
+                        &mut *gap_y,
+                    ),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(label));
+                        ui.add(
+                            crate::ui::field::NumField::new(gap)
+                                .range(0.0..=u.from_mm(1000.0))
+                                .speed(0.1)
+                                .suffix(format!(" {}", u.short())),
+                        )
+                        .rich_tip(crate::ui::tips::pair(label, desc));
+                    });
+                }
+                if ok_cancel(ui, &mut close) {
+                    app.arrange_in_grid(*columns, u.to_mm(*gap_x), u.to_mm(*gap_y));
+                }
+            });
+        }
         Dialog::OutlineOffset { distance, outside } => {
             let u = app.units;
             window(ctx, tr("dialog.outline_offset")).show(ctx, |ui| {
@@ -2548,6 +2613,17 @@ pub fn show(app: &mut App, ctx: &Context) {
                         shape: *shape,
                         name: (!trimmed.is_empty()).then(|| trimmed.to_string()),
                     });
+                }
+            });
+        }
+        Dialog::RenameGuide { index, name } => {
+            window(ctx, tr("guides.rename_title")).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(tr("dialog.object_name"));
+                    ui.text_edit_singleline(name);
+                });
+                if ok_cancel(ui, &mut close) {
+                    app.rename_guide(*index, name);
                 }
             });
         }
@@ -3246,6 +3322,8 @@ pub fn show(app: &mut App, ctx: &Context) {
         }
         Dialog::Barcode(st) => crate::ui::barcode_wizard::dialog(app, ctx, st, &mut close),
         Dialog::Formula(st) => crate::ui::formula_dialog::dialog(app, ctx, st, &mut close),
+        Dialog::TransformEach(st) => crate::ui::transform_each::dialog(app, ctx, st, &mut close),
+        Dialog::Flare(st) => crate::ui::flare::dialog(app, ctx, st, &mut close),
         Dialog::CopyProperties(c) => {
             window(ctx, tr("dialog.copy_properties")).show(ctx, |ui| {
                 ui.checkbox(&mut c.outline_pen, tr("dialog.copy_outline_pen"));
@@ -8331,6 +8409,86 @@ fn bullet_settings(
         p.bullet.no_hanging = !hanging;
         changed = true;
     }
+    // The bullet's or number's own colour, bold and italic (#3682).
+    let mut own_color = p.bullet.color.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut own_color, tr("dialog.bullet_color"))
+            .rich_tip(crate::ui::tips::keyed("dialog.bullet_color"))
+            .changed()
+        {
+            p.bullet.color = own_color.then_some(tracedraw_core::Color::BLACK);
+            changed = true;
+        }
+        if let Some(c) = p.bullet.color.as_mut() {
+            changed |= crate::ui::color_picker::color_button(ui, c);
+        }
+    });
+    let mut own_style = p.bullet.bold.is_some() || p.bullet.italic.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut own_style, tr("dialog.bullet_style"))
+            .rich_tip(crate::ui::tips::keyed("dialog.bullet_style"))
+            .changed()
+        {
+            p.bullet.bold = own_style.then_some(false);
+            p.bullet.italic = own_style.then_some(false);
+            changed = true;
+        }
+        if own_style {
+            for (key, v) in [
+                ("dialog.bullet_bold", &mut p.bullet.bold),
+                ("dialog.bullet_italic", &mut p.bullet.italic),
+            ] {
+                let mut on = v.unwrap_or(false);
+                if ui
+                    .checkbox(&mut on, tr(key))
+                    .rich_tip(crate::ui::tips::keyed(key))
+                    .changed()
+                {
+                    *v = Some(on);
+                    changed = true;
+                }
+            }
+        }
+    });
+    // The list level, from 1 for the top (#3685).
+    crate::ui::tips::tip_over(ui, crate::ui::tips::keyed("dialog.bullet_level"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(tr("dialog.bullet_level"));
+            let mut shown = p.bullet.level + 1;
+            if ui
+                .add(
+                    crate::ui::field::NumField::new(&mut shown)
+                        .range(1..=tracedraw_core::MAX_LIST_LEVEL + 1),
+                )
+                .changed()
+            {
+                p.bullet.level = shown.saturating_sub(1).min(tracedraw_core::MAX_LIST_LEVEL);
+                changed = true;
+            }
+        })
+    });
+    let tip = crate::ui::tips::keyed("dialog.bullet_level_indent");
+    changed |= unit_value(
+        ui,
+        &tr("dialog.bullet_level_indent"),
+        &tip,
+        &mut p.bullet.level_indent,
+        u,
+    );
+    p.bullet.level_indent = p.bullet.level_indent.max(0.0);
+    if p.bullet.numbering != Numbering::Symbol {
+        for (key, v) in [
+            ("dialog.bullet_restart", &mut p.bullet.restart),
+            ("dialog.bullet_continue", &mut p.bullet.continue_list),
+        ] {
+            changed |= ui
+                .checkbox(v, tr(key))
+                .rich_tip(crate::ui::tips::keyed(key))
+                .changed();
+        }
+    }
     changed
 }
 
@@ -9148,6 +9306,11 @@ pub(crate) mod tests {
                 distance: 2.0,
                 outside: true,
             },
+            Dialog::ArrangeGrid {
+                columns: 3,
+                gap_x: 2.0,
+                gap_y: 2.0,
+            },
             Dialog::GatherPages {
                 gap: 5.0,
                 resize: true,
@@ -9228,6 +9391,8 @@ pub(crate) mod tests {
             Dialog::PasteSpecial(PasteSpecialState::default()),
             Dialog::Barcode(BarcodeState::default()),
             Dialog::Formula(Default::default()),
+            Dialog::TransformEach(Default::default()),
+            Dialog::Flare(Default::default()),
             Dialog::ConvertToBitmap(crate::bitmap_modes::ConvertOptions {
                 dpi: 150.0,
                 mode: crate::bitmap_modes::ConvertMode::BlackWhite,
@@ -10897,41 +11062,14 @@ pub(crate) enum EditTextAsk {
     Spell,
 }
 
-/// Change Case on characters `from..to` of the Edit Text box's spans,
-/// each keeping its look; a sentence or a word goes on from one span
-/// into the next (#3270).
+/// Change Case on characters `from..to` of the Edit Text box's spans.
 fn edit_text_change_case(
     spans: &mut [tracedraw_core::TextSpan],
     from: usize,
     to: usize,
     mode: crate::ops2::CaseMode,
 ) {
-    // The part of each span inside the selection, as byte ranges.
-    let mut parts = Vec::new();
-    let mut at = 0usize;
-    for (i, s) in spans.iter().enumerate() {
-        let n = s.text.chars().count();
-        let (a, b) = (from.max(at), to.min(at + n));
-        if a < b {
-            let byte = |c: usize| {
-                s.text
-                    .char_indices()
-                    .nth(c - at)
-                    .map(|(k, _)| k)
-                    .unwrap_or(s.text.len())
-            };
-            parts.push((i, byte(a), byte(b)));
-        }
-        at += n;
-    }
-    let runs: Vec<&str> = parts
-        .iter()
-        .map(|&(i, a, b)| &spans[i].text[a..b])
-        .collect();
-    let changed = crate::ops2::apply_case_runs(&runs, mode);
-    for (&(i, a, b), new) in parts.iter().zip(changed).rev() {
-        spans[i].text.replace_range(a..b, &new);
-    }
+    crate::ops2::change_case_in_range(spans, from, to, mode);
 }
 
 /// [`edit_text_job`] at the box's zoom (#3270), with spaces drawn as
