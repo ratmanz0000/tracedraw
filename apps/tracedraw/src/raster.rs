@@ -854,23 +854,24 @@ impl Raster {
             let hold = self.hold.clone();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let gives_up = cancel.clone();
-            // The main canvas's picture comes a band at a time, the middle
-            // of the window first, laid over the last one as it comes
-            // (#2389); the pages beside it come whole. Only over a picture
-            // of the same drawing (the view moved): over one from before a
-            // change, the bands showed two drawings at once, cut along the
-            // bands' edges, so a shadow being dragged flickered in pieces
-            // as each step of the drag came (#3562).
+            // SMOOTH_ZOOM_NO_BANDS: the last picture scales on the card,
+            // the new one replaces it whole. The bands of #2389 read as
+            // pieces of a large raster on a slow machine: for a raster
+            // the page is one texture to move and scale, not strips to
+            // redraw. Over a picture of a changed drawing the bands
+            // showed two drawings at once anyway (#3562).
+            const SMOOTH_ZOOM_NO_BANDS: bool = true;
             let same_drawing = self
                 .key
                 .as_ref()
                 .is_some_and(|old| old.same_but_view(&key, true));
-            let (bands_tx, bands) = if self.follows_zoom || !same_drawing {
-                (None, None)
-            } else {
-                let (t, r) = std::sync::mpsc::channel();
-                (Some(t), Some(r))
-            };
+            let (bands_tx, bands) =
+                if SMOOTH_ZOOM_NO_BANDS || self.follows_zoom || !same_drawing {
+                    (None, None)
+                } else {
+                    let (t, r) = std::sync::mpsc::channel();
+                    (Some(t), Some(r))
+                };
             std::thread::spawn(move || {
                 #[cfg(test)]
                 let _held = hold.as_ref().map(|m| m.lock());

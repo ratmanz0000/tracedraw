@@ -807,12 +807,16 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         (app.view_mode == crate::app::ViewMode::Pixels).then(|| app.document_dpi()),
     );
     let main_rendered = app.raster.borrow().render_count() != renders_before;
-    // The whole page drawn small, with what is drawn beside it (#2354),
-    // for where the picture does not reach while the view moves (#2048).
-    // Not while something is previewed or only part of the drawing
-    // shows: the backdrop is the drawing as it stands.
+    // SMOOTH_ZOOM_NO_BACKDROP: the last picture reprojects; the gaps show
+    // paper, not a second, smaller picture of the page. The backdrop of
+    // #2048 read as pieces of a large raster (two scales of the drawing
+    // on screen at once), and was a whole extra render of the page.
     #[cfg(not(target_arch = "wasm32"))]
-    let backdrop = if preview.is_none()
+    const SMOOTH_ZOOM_NO_BACKDROP: bool = true;
+    #[cfg(not(target_arch = "wasm32"))]
+    let backdrop = if SMOOTH_ZOOM_NO_BACKDROP {
+        None
+    } else if preview.is_none()
         && app.render_focus().is_none()
         && app.view_mode != crate::app::ViewMode::Pixels
     {
