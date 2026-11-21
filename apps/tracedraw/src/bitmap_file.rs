@@ -724,22 +724,33 @@ fn inks_to_picture(
     let mut planes = vec![0u8; n.checked_mul(4)?];
     let mut rgba = Vec::with_capacity(n * 4);
     let mut known: std::collections::HashMap<[u8; 4], [u8; 3]> = std::collections::HashMap::new();
+    // A photo's CMYK colours are almost all unique: past a few thousand
+    // the map is a cache, not a table, and a 100-megapixel picture does
+    // not hold millions of entries.
+    const KNOWN_MAX: usize = 4096;
     for (i, (ink, a)) in px.take(n).enumerate() {
         for (k, v) in ink.iter().enumerate() {
             if let Some(p) = planes.get_mut(k * n + i) {
                 *p = *v;
             }
         }
-        let rgb = *known.entry(ink).or_insert_with(|| {
-            let f = |v: u8| f32::from(v) / 255.0;
-            Color::Cmyk {
-                c: f(ink[0]),
-                m: f(ink[1]),
-                y: f(ink[2]),
-                k: f(ink[3]),
+        let rgb = match known.get(&ink) {
+            Some(rgb) => *rgb,
+            None => {
+                let f = |v: u8| f32::from(v) / 255.0;
+                let rgb = Color::Cmyk {
+                    c: f(ink[0]),
+                    m: f(ink[1]),
+                    y: f(ink[2]),
+                    k: f(ink[3]),
+                }
+                .to_rgb8();
+                if known.len() < KNOWN_MAX {
+                    known.insert(ink, rgb);
+                }
+                rgb
             }
-            .to_rgb8()
-        });
+        };
         rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
     }
     let rgba = image::RgbaImage::from_raw(w, h, rgba)?;
