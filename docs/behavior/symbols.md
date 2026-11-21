@@ -33,8 +33,11 @@ for By similarity and Replace; the panel opens with Ctrl+F3.
 
 ## By similarity (#2343)
 
-By similarity turns every group that copies the selected group into an
-instance of one symbol, where each group stands. The measure is a
+By similarity turns every group that copies the selection into an
+instance of one symbol, where each group stands. The sample is the
+selected group, or, when the selection is a symbol instance, that
+symbol's definition, or, for loose selected objects, those objects
+themselves (text apart). The measure is a
 fingerprint of the group's objects that are not text, in order
 (`tracedraw_core::symbols::fingerprint`):
 
@@ -76,10 +79,12 @@ The status bar tells when no group is selected
 
 ## Replace: merge one symbol into another
 
-Replace on a card opens the Replace symbol dialog: the source with its
-instance count, a target picked among the other symbols (the first
-other symbol by default), what the merge will do
-(`dialog.symbol_merge_desc`) and Replace and merge or Cancel.
+Replace works without a window, in two presses. The first press on a
+card's Replace picks that symbol as the source: its own button turns
+into Cancel, and every other card's Replace turns into "Merge into this
+symbol" (`docker.replace_target`). A press on another card's button
+merges the source into it; a press on the source's own button, or Esc,
+cancels the pick (`docker.replace_pick` hints the state).
 
 The merge is `Command::MergeSymbols { from, to }`:
 
@@ -97,14 +102,18 @@ The merge is `Command::MergeSymbols { from, to }`:
 
 While a symbol or clip frame edit is going on the merge is refused with
 `status.symbol_merge_finish_edit`; finish or cancel the edit first
-(`pick_drag_tests::replace_dialog_state`). The result is shown under
+(`pick_drag_tests::replace_pick_and_merge_guard`). The result is shown under
 the list (`status.symbol_merged`).
 
 ## Scripting
 
-`symbolize_groups(id, {name})` delegates to the same core plan the
-panel's button uses (`tracedraw_core::symbols::plan`), builds the same
-`AddSymbol` and `ReplaceShapes` commands with the script host's own id
-source, and returns the counts (`replaced`, `with_text`, `skipped`), the
-symbol's index and name, and the new ids
+`symbolize_groups(id, {name})` keeps its own top-level walk: it matches
+the top-level groups of every page whose graphics copy the sample
+group, replaces each by an instance (labels staying text beside it),
+reuses an existing symbol with the same fingerprint, and returns the
+counts (`replaced`, `with_text`, `skipped`), the symbol's index and name,
+and the new ids
 (`scripting::extra::tests::similar_groups_become_one_symbol_and_keep_their_text`).
+The panel's By similarity uses the deeper recursive core plan
+(`tracedraw_core::symbols::plan` / `plan_graphics`) instead, so it also
+reaches groups nested in groups and clip frames and replaces in place.

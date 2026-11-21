@@ -10773,3 +10773,6 @@ shapegen.slice_keep_desc = "Deixa a seleção no lugar e adiciona a cópia fatia
 shapegen.slice_apply = "Fatiar seleção"
 shapegen.slice_apply_desc = "Corta os objetos, textos ou imagens selecionados nas peças e move cada uma; cada peça é uma moldura de recorte que continua editável."
 status.shape_generator_sliced = "Seleção fatiada"
+
+docker.replace_target = "Mesclar neste símbolo" # mt
+docker.replace_pick = "Escolha o símbolo destino ou Esc para cancelar." # mt

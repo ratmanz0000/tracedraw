@@ -6035,15 +6035,43 @@ impl App {
     /// instance of one symbol where the group stood; the group's labels
     /// stay text beside the instance (#2343). One undo step.
     pub fn symbolize_similar(&mut self) {
-        let Some(sample) = self
-            .selected_shapes()
-            .into_iter()
+        let shapes = self.selected_shapes();
+        // The sample: a selected group, else a selected instance's
+        // definition, else the selected non-text objects themselves.
+        let graphics: Vec<Shape> = if let Some(g) = shapes
+            .iter()
             .find(|s| matches!(s.kind, ShapeKind::Group { .. }))
-        else {
+        {
+            tracedraw_core::symbols::split_group(g)
+                .map(|(gr, _)| gr.into_iter().cloned().collect())
+                .unwrap_or_default()
+        } else if let Some(index) = shapes.iter().find_map(|s| match s.kind {
+            ShapeKind::SymbolInstance { index } => Some(index),
+            _ => None,
+        }) {
+            self.doc()
+                .symbols
+                .get(index)
+                .map(|sym| {
+                    tracedraw_core::symbols::definition_objects(&sym.shape)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            shapes
+                .iter()
+                .filter(|s| !matches!(s.kind, ShapeKind::Text { .. }))
+                .cloned()
+                .collect()
+        };
+        if graphics.is_empty() {
             self.status = crate::i18n::tr("status.symbolize_needs_group");
             return;
-        };
-        let plan = match tracedraw_core::symbols::plan(self.doc(), sample.id, None) {
+        }
+        let refs: Vec<&Shape> = graphics.iter().collect();
+        let plan = match tracedraw_core::symbols::plan_graphics(self.doc(), &refs, None) {
             Ok(p) => p,
             Err(e) => {
                 self.status = e;

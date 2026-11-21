@@ -113,7 +113,18 @@ pub fn plan(doc: &Document, sample: ShapeId, name: Option<&str>) -> Result<Plan,
         .find_shape(sample)
         .ok_or_else(|| "symbolize needs an object of the drawing".to_string())?;
     let (graphics, _) = split_group(s).ok_or("symbolize needs a group")?;
-    let (key, origin) = fingerprint(&graphics).ok_or("the group has no objects to match")?;
+    plan_graphics(doc, &graphics, name)
+}
+
+/// The same plan for a set of objects taken as the sample directly: a
+/// selection that is not a group (loose objects, or a symbol instance's
+/// definition) can be symbolized by similarity too.
+pub fn plan_graphics(
+    doc: &Document,
+    graphics: &[&Shape],
+    name: Option<&str>,
+) -> Result<Plan, String> {
+    let (key, origin) = fingerprint(graphics).ok_or("the group has no objects to match")?;
     // An existing symbol that draws the same, else a new one appended.
     let found = doc.symbols.iter().position(|sym| {
         fingerprint(&definition_objects(&sym.shape)).is_some_and(|(k, _)| k == key)

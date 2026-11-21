@@ -2978,10 +2978,6 @@ pub(crate) fn symbol_uses(doc: &tracedraw_core::Document, index: usize) -> usize
 
 fn symbols(app: &mut App, ui: &mut Ui) {
     let has = !app.selection.is_empty();
-    let has_group = app
-        .selected_shapes()
-        .iter()
-        .any(|s| matches!(s.kind, ShapeKind::Group { .. }));
     ui.horizontal(|ui| {
         if ui
             .add_enabled(has, egui::Button::new(tr("docker.new_symbol")))
@@ -2994,7 +2990,7 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         // Every group copying the selected one becomes an instance where
         // it stood, labels staying text (#2343).
         if ui
-            .add_enabled(has_group, egui::Button::new(tr("docker.symbolize_similar")))
+            .add_enabled(has, egui::Button::new(tr("docker.symbolize_similar")))
             .rich_tip(tr("docker.symbolize_similar_tip"))
             .rich_disabled_tip(tr("docker.symbolize_similar_tip"))
             .clicked()
@@ -3095,17 +3091,33 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                     {
                         app.edit_symbol(i);
                     }
-                    // Merge this symbol into another: every instance
-                    // follows, the source goes.
+                    // Merge this symbol into another, without a window:
+                    // the first press picks the source, a press on another
+                    // symbol's button merges the source into it.
+                    let picking = app.symbol_replace_source;
+                    let label = if picking == Some(i) {
+                        tr("dialog.cancel")
+                    } else if picking.is_some() {
+                        tr("docker.replace_target")
+                    } else {
+                        tr("docker.replace_symbol")
+                    };
                     if ui
                         .add_enabled(
                             count > 1 && app.clip_frame_edit.is_none(),
-                            egui::Button::new(tr("docker.replace_symbol")).small(),
+                            egui::Button::new(label).small(),
                         )
                         .rich_tip(tr("docker.replace_symbol_tip"))
                         .clicked()
                     {
-                        app.symbol_merge = Some((i, if i == 0 { 1 } else { 0 }));
+                        match picking {
+                            Some(src) if src == i => app.symbol_replace_source = None,
+                            Some(src) => {
+                                app.merge_symbols(src, i);
+                                app.symbol_replace_source = None;
+                            }
+                            None => app.symbol_replace_source = Some(i),
+                        }
                     }
                     // A copy of the symbol, placed nowhere (#3437).
                     if ui
@@ -3129,97 +3141,14 @@ fn symbols(app: &mut App, ui: &mut Ui) {
     if app.doc().symbols.is_empty() {
         dim(ui, tr("docker.symbols_hint"));
     }
+    if app.symbol_replace_source.is_some() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.symbol_replace_source = None;
+        }
+        dim(ui, tr("docker.replace_pick"));
+    }
     if let Some(r) = app.symbolize_report.clone() {
         dim(ui, r);
-    }
-    symbol_merge_dialog(app, ui);
-}
-
-/// The Replace Symbol dialog: the source, a target picked among the other
-/// symbols, what the merge will do, and the merge in one undo step.
-fn symbol_merge_dialog(app: &mut App, ui: &mut Ui) {
-    let Some((from, mut to)) = app.symbol_merge else {
-        return;
-    };
-    let count = app.doc().symbols.len();
-    if from >= count || to >= count || from == to {
-        app.symbol_merge = None;
-        return;
-    }
-    let ctx = ui.ctx().clone();
-    crate::ui::chrome::modal_blocker(&ctx);
-    let mut open = true;
-    egui::Window::new(tr("dialog.symbol_merge_title"))
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .open(&mut open)
-        .show(&ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(tr("dialog.symbol_merge_from"));
-                    ui.label(&app.doc().symbols[from].name);
-                    dim(
-                        ui,
-                        trf(
-                            "docker.instances_n",
-                            &[("n", &symbol_uses(app.doc(), from).to_string())],
-                        ),
-                    );
-                });
-                ui.label("->");
-                ui.vertical(|ui| {
-                    ui.label(tr("dialog.symbol_merge_to"));
-                    egui::ComboBox::from_id_salt("symbol_merge_target")
-                        .selected_text(app.doc().symbols[to].name.clone())
-                        .show_ui(ui, |ui| {
-                            for (j, s) in app.doc().symbols.iter().enumerate() {
-                                if j != from {
-                                    ui.selectable_value(&mut to, j, s.name.clone());
-                                }
-                            }
-                        })
-                        .response
-                        .rich_tip(tr("dialog.symbol_merge_to"));
-                    dim(
-                        ui,
-                        trf(
-                            "docker.instances_n",
-                            &[("n", &symbol_uses(app.doc(), to).to_string())],
-                        ),
-                    );
-                });
-            });
-            ui.label(trf(
-                "dialog.symbol_merge_desc",
-                &[
-                    ("n", &symbol_uses(app.doc(), from).to_string()),
-                    ("from", &app.doc().symbols[from].name),
-                    ("to", &app.doc().symbols[to].name),
-                ],
-            ));
-            ui.horizontal(|ui| {
-                if ui
-                    .button(tr("dialog.symbol_merge_ok"))
-                    .rich_tip(tr("dialog.symbol_merge_ok"))
-                    .clicked()
-                {
-                    app.merge_symbols(from, to);
-                    app.symbol_merge = None;
-                }
-                if ui
-                    .button(tr("dialog.cancel"))
-                    .rich_tip(tr("dialog.cancel"))
-                    .clicked()
-                {
-                    app.symbol_merge = None;
-                }
-            });
-        });
-    if !open {
-        app.symbol_merge = None;
-    } else {
-        app.symbol_merge = Some((from, to));
     }
 }
 

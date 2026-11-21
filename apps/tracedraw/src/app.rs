@@ -2013,8 +2013,9 @@ pub struct App {
     pub symbolize_report: Option<String>,
     /// The Symbols list's search text.
     pub symbol_filter: String,
-    /// The Replace Symbol dialog: (source, target) symbol indices.
-    pub symbol_merge: Option<(usize, usize)>,
+    /// The Replace Symbol pick: the source symbol whose instances will
+    /// move; the next press on another symbol's Replace button merges.
+    pub symbol_replace_source: Option<usize>,
     /// When `autosave_settings` last wrote the preferences, and the
     /// preferences as last saved or looked at (JSON), to save them only
     /// when they changed.
@@ -3588,7 +3589,7 @@ impl App {
             symbol_thumbs: Default::default(),
             symbolize_report: None,
             symbol_filter: String::new(),
-            symbol_merge: None,
+            symbol_replace_source: None,
             objects_master_closed: false,
             picked_layer: None,
             navigator_tex: None,
