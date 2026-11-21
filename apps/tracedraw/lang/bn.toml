@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "এই প্রতীকে একত্র করুন" # mt
 docker.replace_pick = "লক্ষ্য প্রতীক বেছে নিন বা বাতিল করতে Esc চাপুন।" # mt
+
+docker.rename_symbol_tip = "প্রতীকের নাম বদলাতে নামে ডাবল-ক্লিক করুন।" # mt

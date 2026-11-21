@@ -2016,6 +2016,8 @@ pub struct App {
     /// The Replace Symbol pick: the source symbol whose instances will
     /// move; the next press on another symbol's Replace button merges.
     pub symbol_replace_source: Option<usize>,
+    /// The symbol name being edited inline: (index, draft text).
+    pub symbol_rename: Option<(usize, String)>,
     /// When `autosave_settings` last wrote the preferences, and the
     /// preferences as last saved or looked at (JSON), to save them only
     /// when they changed.
@@ -3590,6 +3592,7 @@ impl App {
             symbolize_report: None,
             symbol_filter: String::new(),
             symbol_replace_source: None,
+            symbol_rename: None,
             objects_master_closed: false,
             picked_layer: None,
             navigator_tex: None,

@@ -10772,3 +10772,5 @@ status.symbol_merged = "Merged {n} instances of {from} into {to}" # mt
 status.symbolize_needs_group = "Select a group to symbolize by similarity." # mt
 status.symbolize_none = "No group copies the selection." # mt
 status.symbolized = "Found {n} similar groups -> {name}" # mt
+
+docker.rename_symbol_tip = "Nhấp đúp vào tên để đổi tên biểu tượng." # mt

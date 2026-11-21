@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "इस प्रतीक में मिलाएँ" # mt
 docker.replace_pick = "लक्ष्य प्रतीक चुनें या रद्द करने के लिए Esc दबाएँ।" # mt
+
+docker.rename_symbol_tip = "प्रतीक का नाम बदलने के लिए नाम पर डबल-क्लिक करें।" # mt

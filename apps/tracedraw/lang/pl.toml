@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "Scal w ten symbol" # mt
 docker.replace_pick = "Wybierz symbol docelowy lub Esc, aby anulować." # mt
+
+docker.rename_symbol_tip = "Kliknij dwukrotnie nazwę, aby zmienić nazwę symbolu." # mt

@@ -9,7 +9,7 @@ use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
 use egui::Ui;
-use tracedraw_core::{document::ShapeKind, live::Effect, Color, Command, Fill, ShapeId};
+use tracedraw_core::{document::ShapeKind, geometry::Affine, live::Effect, Color, Command, Fill, ShapeId};
 
 /// The colour picker every colour of the drawing uses (#442).
 fn color_button(ui: &mut Ui, c: &mut Color) -> bool {
@@ -3044,7 +3044,33 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     // What the symbol draws, beside its name (#3249).
                     symbol_picture(app, ui, &mut thumbs, drawing, i);
-                    ui.label(&name);
+                    let renaming = app
+                        .symbol_rename
+                        .as_ref()
+                        .filter(|(idx, _)| *idx == i)
+                        .map(|(_, s)| s.clone());
+                    if let Some(mut text) = renaming {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut text).desired_width(90.0),
+                        );
+                        if !resp.has_focus() && !resp.lost_focus() {
+                            resp.request_focus();
+                        }
+                        if resp.lost_focus() || ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                            app.rename_symbol(i, text.clone());
+                            app.symbol_rename = None;
+                        } else if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                            app.symbol_rename = None;
+                        } else {
+                            app.symbol_rename = Some((i, text));
+                        }
+                    } else {
+                        let resp = ui.label(&name);
+                        if resp.double_clicked() {
+                            app.symbol_rename = Some((i, name.clone()));
+                        }
+                        resp.rich_tip(tr("docker.rename_symbol_tip"));
+                    }
                     let uses = symbol_uses(app.doc(), i);
                     dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
                 });
@@ -3179,6 +3205,13 @@ fn symbol_picture(
         ShapeId(u64::MAX - index as u64),
         ShapeKind::SymbolInstance { index },
     );
+    // Centre the definition in the tile: definitions saved by older files
+    // may sit away from the origin, which left their preview blank.
+    let mut shape = shape;
+    if let Some(sym) = app.doc().symbols.get(index) {
+        let c = sym.shape.bounds().center();
+        shape.transform = Affine::translate((-c.x, -c.y));
+    }
     let ppp = ui.ctx().pixels_per_point().max(0.5);
     let inner = r.shrink(2.0);
     let px = (inner.width() * ppp).round().max(4.0) as u32;

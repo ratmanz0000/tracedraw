@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "合併到此符號" # mt
 docker.replace_pick = "選擇目標符號，或按 Esc 取消。" # mt
+
+docker.rename_symbol_tip = "雙擊名稱可重新命名符號。" # mt

@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "Samenvoegen in dit symbool" # mt
 docker.replace_pick = "Kies het doelsymbool of Esc om te annuleren." # mt
+
+docker.rename_symbol_tip = "Dubbelklik op de naam om het symbool te hernoemen." # mt

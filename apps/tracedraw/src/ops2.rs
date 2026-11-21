@@ -6099,6 +6099,15 @@ impl App {
         self.selection.clear();
     }
 
+    /// Symbols docker: rename symbol `index` (double-click its name).
+    pub fn rename_symbol(&mut self, index: usize, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.run(Command::SetSymbolName { index, name });
+    }
+
     /// Symbols docker > Replace: merge symbol `from` into `to`; every
     /// instance follows and the source definition goes. One undo step.
     pub fn merge_symbols(&mut self, from: usize, to: usize) {

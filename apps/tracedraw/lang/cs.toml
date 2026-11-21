@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "Sloučit do tohoto symbolu" # mt
 docker.replace_pick = "Vyberte cílový symbol nebo Esc pro zrušení." # mt
+
+docker.rename_symbol_tip = "Dvojklikem na název symbol přejmenujete." # mt

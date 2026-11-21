@@ -10776,3 +10776,5 @@ status.shape_generator_sliced = "Selection sliced"
 
 docker.replace_target = "Fusionner dans ce symbole" # mt
 docker.replace_pick = "Choisissez le symbole cible ou Échap pour annuler." # mt
+
+docker.rename_symbol_tip = "Double-cliquez sur le nom pour renommer le symbole." # mt
