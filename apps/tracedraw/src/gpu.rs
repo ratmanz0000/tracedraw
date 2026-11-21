@@ -67,19 +67,29 @@ impl Mode {
     }
 
     /// The renderer Options asks for: the graphics card, or the software
-    /// adapter with hardware acceleration off.
+    /// adapter with hardware acceleration off. Without wgpu in the build
+    /// (the `gpu` feature, always on Android) it is OpenGL whatever the
+    /// option says: the page is CPU tiny-skia, the window is glow.
     pub fn first(s: &crate::settings::Settings) -> Mode {
+        #[cfg(any(feature = "gpu", target_os = "android"))]
         if s.hardware_acceleration {
-            Mode::Hardware
-        } else {
-            Mode::Software
+            return Mode::Hardware;
         }
+        let _ = s;
+        Mode::Gl
     }
 
     /// The renderers tried in turn when `first` is the choice: OpenGL
     /// before the software adapter, which draws every frame on the CPU,
     /// and the software adapter last because it always opens (#616).
+    /// Without wgpu there is only OpenGL.
     pub fn chain(first: Mode) -> &'static [Mode] {
+        #[cfg(not(any(feature = "gpu", target_os = "android")))]
+        {
+            let _ = first;
+            &[Mode::Gl]
+        }
+        #[cfg(any(feature = "gpu", target_os = "android"))]
         match first {
             Mode::Hardware => &[Mode::Hardware, Mode::Gl, Mode::Software],
             Mode::Software => &[Mode::Software, Mode::Gl],
@@ -96,6 +106,7 @@ impl Mode {
 }
 
 /// What the adapter choice knows of one adapter.
+#[cfg(any(feature = "gpu", target_os = "android"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub name: String,
@@ -115,6 +126,7 @@ pub struct Candidate {
 /// change between the two ways of presenting is what blinks the window
 /// on many Intel and NVIDIA drivers (#1579). Elsewhere every API ranks
 /// alike, the order wgpu lists them in deciding.
+#[cfg(any(feature = "gpu", target_os = "android"))]
 fn backend_rank(b: eframe::wgpu::Backend, windows: bool) -> u8 {
     use eframe::wgpu::Backend;
     if !windows {
@@ -133,11 +145,13 @@ fn backend_rank(b: eframe::wgpu::Backend, windows: bool) -> u8 {
 /// the graphics card chosen in Options (empty: the fastest). Hardware
 /// mode never takes a software adapter: the start fails instead and the
 /// next renderer is tried (#616).
+#[cfg(any(feature = "gpu", target_os = "android"))]
 pub fn choose(mode: Mode, wanted: &str, list: &[Candidate]) -> (Option<usize>, Vec<&'static str>) {
     choose_on(mode, wanted, list, cfg!(target_os = "windows"))
 }
 
 /// [`choose`] on Windows (`windows`) or elsewhere.
+#[cfg(any(feature = "gpu", target_os = "android"))]
 fn choose_on(
     mode: Mode,
     wanted: &str,
@@ -565,6 +579,7 @@ pub fn note_renderer(cc: &eframe::CreationContext<'_>, mode: Mode) {
     OPENED.store(true, Ordering::SeqCst);
     let _ = MODE_IN_USE.set(mode);
     crate::startup_log::quiet_panics(false);
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     let what = match cc.wgpu_render_state.as_ref() {
         Some(rs) => {
             // Shadows may be blurred on the card (Options > General), not
@@ -577,6 +592,8 @@ pub fn note_renderer(cc: &eframe::CreationContext<'_>, mode: Mode) {
         }
         None => "OpenGL".to_string(),
     };
+    #[cfg(not(any(feature = "gpu", target_os = "android")))]
+    let what = "OpenGL".to_string();
     if let Some(gl) = cc.gl.as_ref() {
         use eframe::glow::HasContext;
         // SAFETY: plain queries on the current context eframe just made.
@@ -598,6 +615,7 @@ pub fn note_renderer(cc: &eframe::CreationContext<'_>, mode: Mode) {
 /// and the hardware acceleration hint looks on a thread of its own).
 static FOUND: OnceLock<Vec<(u8, String)>> = OnceLock::new();
 
+#[cfg(any(feature = "gpu", target_os = "android"))]
 fn found() -> &'static [(u8, String)] {
     FOUND.get_or_init(|| {
         if cfg!(test) {
@@ -620,18 +638,31 @@ fn found() -> &'static [(u8, String)] {
     })
 }
 
+/// Without wgpu there are no adapters to name; Options hides the list.
+#[cfg(not(any(feature = "gpu", target_os = "android")))]
+fn found() -> &'static [(u8, String)] {
+    &[]
+}
+
 /// The graphics adapters of this computer by name, software ones last;
 /// looked for once.
 pub fn adapters() -> &'static [String] {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     LIST.get_or_init(|| {
-        let mut names: Vec<String> = Vec::new();
-        for (_, n) in found() {
-            if !names.contains(n) {
-                names.push(n.clone());
-            }
+        #[cfg(not(any(feature = "gpu", target_os = "android")))]
+        {
+            Vec::new()
         }
-        names
+        #[cfg(any(feature = "gpu", target_os = "android"))]
+        {
+            let mut names: Vec<String> = Vec::new();
+            for (_, n) in found() {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+            names
+        }
     })
 }
 
@@ -667,10 +698,12 @@ pub fn card_found() -> Option<&'static str> {
 /// The one graphics API the Android app draws its window with: OpenGL
 /// ES (`android.rs`, `wgpu_options` says why it is never two).
 #[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", feature = "gpu"))]
 pub const ANDROID_BACKENDS: eframe::wgpu::Backends = eframe::wgpu::Backends::GL;
 
 /// The order adapters are preferred in: separate cards, built-in ones,
 /// virtual ones, others, then software.
+#[cfg(any(feature = "gpu", target_os = "android"))]
 fn rank(t: eframe::wgpu::DeviceType) -> u8 {
     use eframe::wgpu::DeviceType;
     match t {
@@ -722,11 +755,21 @@ pub fn is_software_name(name: &str) -> bool {
 
 /// Note whether the window opened on a software adapter.
 fn note_software(cc: &eframe::CreationContext<'_>) {
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     let found = if let Some(rs) = cc.wgpu_render_state.as_ref() {
         let i = rs.adapter.get_info();
         (i.device_type == eframe::wgpu::DeviceType::Cpu || is_software_name(&i.name))
             .then_some(i.name)
     } else if let Some(gl) = cc.gl.as_ref() {
+        use eframe::glow::HasContext;
+        // SAFETY: a plain query on the current context eframe just made.
+        let name = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+        is_software_name(&name).then_some(name)
+    } else {
+        None
+    };
+    #[cfg(not(any(feature = "gpu", target_os = "android")))]
+    let found = if let Some(gl) = cc.gl.as_ref() {
         use eframe::glow::HasContext;
         // SAFETY: a plain query on the current context eframe just made.
         let name = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
@@ -855,8 +898,17 @@ mod software_tests {
     }
 }
 
+/// The renderer of a start in `mode`; `wanted` names the graphics card
+/// chosen (empty: the fastest). Without wgpu it is always OpenGL.
+#[cfg(not(any(feature = "gpu", target_os = "android")))]
+pub fn options(mode: Mode, wanted: &str) -> eframe::Renderer {
+    let _ = (mode, wanted);
+    eframe::Renderer::Glow
+}
+
 /// The renderer and the wgpu set-up of a start in `mode`; `wanted` names
 /// the graphics card chosen (empty: the fastest).
+#[cfg(any(feature = "gpu", target_os = "android"))]
 pub fn options(
     mode: Mode,
     wanted: &str,
@@ -1015,6 +1067,7 @@ mod tests {
 
     /// The Android window is drawn with one graphics API, OpenGL ES, and
     /// the Android entry asks for that one only.
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn android_draws_with_one_graphics_api() {
         assert_eq!(ANDROID_BACKENDS, eframe::wgpu::Backends::GL);

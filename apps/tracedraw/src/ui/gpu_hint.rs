@@ -66,7 +66,17 @@ impl SlowFrames {
 /// which turning it on would not mend), the hint is on in Options and it
 /// has not shown this run.
 pub fn wanted(software: bool, acceleration_on: bool, hint_on: bool, shown: bool) -> bool {
-    software && !acceleration_on && hint_on && !shown
+    // Without wgpu there is no hardware window to turn on: the hint would
+    // point at an option that does nothing.
+    #[cfg(not(any(feature = "gpu", target_os = "android")))]
+    {
+        let _ = (software, acceleration_on, hint_on, shown);
+        return false;
+    }
+    #[cfg(any(feature = "gpu", target_os = "android"))]
+    {
+        software && !acceleration_on && hint_on && !shown
+    }
 }
 
 /// What a button of the hint does.

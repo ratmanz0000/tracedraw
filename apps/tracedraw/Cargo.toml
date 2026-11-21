@@ -21,6 +21,13 @@ doctest = false
 [build-dependencies]
 winresource = "0.1"
 
+[features]
+default = []
+# The window on wgpu (Direct3D 12, Vulkan, Metal) and GPU shadow blur.
+# Desktop default is OpenGL (glow): the page is CPU tiny-skia, the past
+# frame is a GPU quad. Android always draws with wgpu (the activity).
+gpu = ["eframe/wgpu", "dep:pollster"]
+
 [dependencies]
 tracedraw-core.workspace = true
 tracedraw-cdr.workspace = true
@@ -81,10 +88,10 @@ jiff = "0.2"
 rfd.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# The window drawn with wgpu (Direct3D 12, Vulkan or Metal): the graphics
-# card chosen in Options, or its software adapter (#445, #439).
-eframe = { workspace = true, features = ["wgpu"] }
-pollster = "0.4"
+# The window drawn with OpenGL (glow). wgpu is the optional `gpu`
+# feature: the graphics card chosen in Options, or its software adapter
+# (#445, #439), and GPU shadow blur.
+pollster = { version = "0.4", optional = true }
 # AI Drawing: HTTPS requests to the AI service the user sets up.
 ureq = { version = "3", features = ["platform-verifier"] }
 # Lossy WebP export (libwebp, BSD licence): the pure-Rust encoder writes
@@ -117,6 +124,7 @@ wl-clipboard-rs = "0.9"
 # the one winit was built with, and jni the one android-activity uses.
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { workspace = true, features = ["wgpu", "android-native-activity"] }
+pollster = "0.4"
 android-activity = { version = "=0.6.1", features = ["native-activity"] }
 android_logger = "=0.15.1"
 jni = "=0.22.4"
@@ -128,7 +136,7 @@ winit = { version = "0.30", default-features = false }
 # system drag sends no pointer moves (#1142).
 [target.'cfg(windows)'.dependencies]
 # The spell checker of Windows (COM, #1405).
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_System_SystemInformation"] }
 # The window's message hook: characters input methods send that the
 # windowing layer drops (#1151). The same winit eframe uses.
 winit = { version = "0.30", default-features = false }

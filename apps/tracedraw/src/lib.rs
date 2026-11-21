@@ -119,8 +119,22 @@ mod gather_pages;
 mod github;
 #[cfg(not(target_arch = "wasm32"))]
 mod gpu;
-#[cfg(not(target_arch = "wasm32"))]
+// GPU shadow blur: only in a wgpu build (`gpu` feature, always Android).
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "gpu", target_os = "android")))]
 mod gpu_fx;
+// A wgpu-less build: the stubs Options and the canvas call; shadows
+// always on the CPU.
+#[cfg(all(not(target_arch = "wasm32"), not(any(feature = "gpu", target_os = "android"))))]
+pub(crate) mod gpu_fx {
+    pub fn set_enabled(_on: bool) {}
+    pub fn available() -> bool {
+        false
+    }
+    #[allow(dead_code)]
+    pub fn install(_device: &(), _queue: &()) {}
+    #[allow(dead_code)]
+    pub fn force(_on: Option<bool>) {}
+}
 mod gradient_presets;
 mod grammar;
 mod guides;
@@ -571,11 +585,15 @@ pub fn run() -> eframe::Result<()> {
         args.clone(),
         primary.as_ref().map(|p| p.decline.clone()),
     );
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     let (renderer, wgpu_options) = gpu::options(mode, &settings.gpu_adapter);
+    #[cfg(not(any(feature = "gpu", target_os = "android")))]
+    let renderer = gpu::options(mode, &settings.gpu_adapter);
     let options = eframe::NativeOptions {
         viewport,
         centered: splash,
         renderer,
+        #[cfg(any(feature = "gpu", target_os = "android"))]
         wgpu_options,
         // Characters keyboard programs send that the windowing layer
         // would lose (#1151).
