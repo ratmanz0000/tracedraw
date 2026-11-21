@@ -3013,7 +3013,8 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         egui::TextEdit::singleline(&mut app.symbol_filter)
             .hint_text(tr("docker.symbol_search"))
             .desired_width(f32::INFINITY),
-    );
+    )
+    .rich_tip(tr("docker.symbol_search"));
     let filter = app.symbol_filter.to_lowercase();
     let syms: Vec<(usize, String)> = app
         .doc()
@@ -3177,7 +3178,9 @@ fn symbol_merge_dialog(app: &mut App, ui: &mut Ui) {
                                     ui.selectable_value(&mut to, j, s.name.clone());
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .rich_tip(tr("dialog.symbol_merge_to"));
                     dim(
                         ui,
                         trf(
@@ -3198,12 +3201,17 @@ fn symbol_merge_dialog(app: &mut App, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 if ui
                     .button(tr("dialog.symbol_merge_ok"))
+                    .rich_tip(tr("dialog.symbol_merge_ok"))
                     .clicked()
                 {
                     app.merge_symbols(from, to);
                     app.symbol_merge = None;
                 }
-                if ui.button(tr("dialog.cancel")).clicked() {
+                if ui
+                    .button(tr("dialog.cancel"))
+                    .rich_tip(tr("dialog.cancel"))
+                    .clicked()
+                {
                     app.symbol_merge = None;
                 }
             });
