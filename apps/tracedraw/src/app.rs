@@ -1576,7 +1576,7 @@ pub struct App {
     pub main_window_doc: Option<(u64, u32)>,
     /// Whether each paragraph text overflows its frame, by document
     /// revision (laying text out every frame would be slow).
-    pub overflow_cache: std::cell::RefCell<(u64, std::collections::HashMap<ShapeId, bool>)>,
+    pub overflow_cache: std::cell::RefCell<std::collections::HashMap<ShapeId, (u64, bool)>>,
     /// Paragraph texts flowed in the frames a drag gives them (#1327).
     pub live_reflow: std::cell::RefCell<crate::text_frames::LiveReflow>,
     /// The Shape Builder's parts crossed and the one under the pointer
@@ -10727,10 +10727,32 @@ impl App {
         }
     }
 
+    /// Free physical RAM in bytes; 0 when the OS will not say.
+    fn free_ram() -> u64 {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::SystemInformation::{
+                GlobalMemoryStatusEx, MEMORYSTATUSEX,
+            };
+            let mut s: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+            s.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if unsafe { GlobalMemoryStatusEx(&mut s) } != 0 {
+                s.ullAvailPhys
+            } else {
+                0
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
     /// Read a `.cdr` file through the file layer (uploads in a browser).
     pub(crate) fn open_cdr(
         path: &std::path::Path,
     ) -> std::result::Result<(tracedraw_core::Document, tracedraw_cdr::ParseReport), String> {
+        tracedraw_cdr::set_open_ram(Self::free_ram());
         let bytes = crate::files::read(path).map_err(|e| e.to_string())?;
         let title = path
             .file_stem()
