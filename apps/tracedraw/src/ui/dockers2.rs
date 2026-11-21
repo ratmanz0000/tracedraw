@@ -2978,7 +2978,7 @@ pub(crate) fn symbol_uses(doc: &tracedraw_core::Document, index: usize) -> usize
 
 fn symbols(app: &mut App, ui: &mut Ui) {
     let has = !app.selection.is_empty();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(has, egui::Button::new(tr("docker.new_symbol")))
             .rich_tip(crate::ui::tips::keyed("docker.new_symbol"))

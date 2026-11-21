@@ -6068,6 +6068,7 @@ impl App {
         };
         if graphics.is_empty() {
             self.status = crate::i18n::tr("status.symbolize_needs_group");
+            self.symbolize_report = Some(crate::i18n::tr("status.symbolize_needs_group"));
             return;
         }
         let refs: Vec<&Shape> = graphics.iter().collect();
@@ -6080,6 +6081,7 @@ impl App {
         };
         if plan.matches.is_empty() {
             self.status = crate::i18n::tr("status.symbolize_none");
+            self.symbolize_report = Some(crate::i18n::tr("status.symbolize_none"));
             return;
         }
         let cmds = tracedraw_core::symbols::commands(&plan, || self.engine.new_shape_id());

@@ -150,7 +150,7 @@ pub fn plan_graphics(
     });
     let mut matches = Vec::new();
     let mut skipped = 0usize;
-    fn walk(s: &Shape, key: &str, out: &mut Vec<Match>, skipped: &mut usize) {
+    fn walk(s: &Shape, key: &str, loose: bool, out: &mut Vec<Match>, skipped: &mut usize) {
         match &s.kind {
             ShapeKind::Group { children } => {
                 let (graphics, texts) = match split_group(s) {
@@ -171,21 +171,36 @@ pub fn plan_graphics(
                     _ => *skipped += 1,
                 }
                 for c in children {
-                    walk(c, key, out, skipped);
+                    walk(c, key, loose, out, skipped);
                 }
             }
             ShapeKind::ClipFrame { frame, contents } => {
-                walk(frame, key, out, skipped);
+                walk(frame, key, loose, out, skipped);
                 for c in contents {
-                    walk(c, key, out, skipped);
+                    walk(c, key, loose, out, skipped);
                 }
             }
-            _ => {}
+            _ => {
+                // A one-object sample also matches single congruent objects
+                // lying loose, not only groups copying it.
+                if loose && !matches!(s.kind, ShapeKind::Text { .. }) {
+                    if let Some((k, at)) = fingerprint(&[s]) {
+                        if k == key {
+                            out.push(Match {
+                                group: s.clone(),
+                                texts: Vec::new(),
+                                at,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
+    let loose = graphics.len() == 1;
     for l in doc.all_layers() {
         for s in &l.shapes {
-            walk(s, &key, &mut matches, &mut skipped);
+            walk(s, &key, loose, &mut matches, &mut skipped);
         }
     }
     let with_text = matches.iter().filter(|m| !m.texts.is_empty()).count();
@@ -326,6 +341,28 @@ mod tests {
         );
         e.run(&Command::AddShape { layer, shape: recoloured }).unwrap();
         (e, ShapeId(1))
+    }
+
+    /// A one-object sample matches single congruent objects lying loose,
+    /// not only groups: same kind, box and fill match; a recoloured copy
+    /// does not.
+    #[test]
+    fn a_one_object_sample_matches_loose_copies() {
+        let mut e = Engine::default();
+        let layer = e.document().pages[0].layers[0].id;
+        for (id, x, color) in [(1u64, 0.0, red()), (2, 40.0, red()), (3, 80.0, blue())] {
+            let mut s = rect(id, x, 0.0, color);
+            s.kind = ShapeKind::Rect {
+                rect: Rect::new(x, 0.0, x + 20.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            };
+            e.run(&Command::AddShape { layer, shape: s }).unwrap();
+        }
+        let s1 = e.document().find_shape(ShapeId(1)).expect("sample");
+        let plan = plan_graphics(e.document(), &[s1], None).expect("plan");
+        assert_eq!(plan.matches.len(), 2, "the sample and its congruent copy");
+        assert!(plan.new_symbol.is_some());
     }
 
     /// The plan matches the sample, the moved copy, the nested copy and
