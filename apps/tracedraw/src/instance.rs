@@ -638,6 +638,9 @@ mod tests {
     /// Files macOS asks the window to open (#646) go to its inbox, and a
     /// start that takes the place (another renderer) gets them on its
     /// command line, each once, after the arguments it had.
+    // Windows turns "/x.tdraw" into "D:\x.tdraw" before the inbox sees
+    // it, so the recorded paths come back absolute there.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn files_the_system_opens_reach_the_inbox_and_a_restart() {
         let (tx, rx) = channel();

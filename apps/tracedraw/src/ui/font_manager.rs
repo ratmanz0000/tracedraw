@@ -2600,6 +2600,9 @@ mod tests {
     /// where it is. Each is remembered, so the next start installs it
     /// again, and Uninstall takes the copy away. A file that is not a
     /// font is neither kept nor remembered.
+    // The content URI of an Android pick keeps its shape on Unix; Windows
+    // reads it as a path and keeps the font where it is.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_added_font_is_kept_for_the_next_start_everywhere() {
         const SELAWIK: &[u8] = include_bytes!("../../assets/fonts/Selawik-Regular.ttf");

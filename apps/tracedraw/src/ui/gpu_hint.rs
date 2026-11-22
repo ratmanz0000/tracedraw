@@ -217,6 +217,8 @@ mod tests {
         }
     }
 
+    // The hint exists only where a hardware window can be turned on.
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn the_hint_is_for_acceleration_turned_off_only() {
         // Without wgpu there is no hardware window to turn on: the hint

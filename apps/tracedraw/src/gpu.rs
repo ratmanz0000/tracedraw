@@ -1237,12 +1237,13 @@ mod tests {
         s.hardware_acceleration = false;
         assert_eq!(Mode::for_start(&args, &s, None), Mode::Software);
         assert_eq!(Mode::for_start(&[Mode::Gl.arg()], &s, None), Mode::Gl);
-        // The renderer notes are wgpu-only: without the gpu feature the
-        // options say glow alone, in one shape.
+        // The renderer of each mode exists only with wgpu in the build
+        // (the gpu feature); without it the desktop window is OpenGL.
         #[cfg(any(feature = "gpu", target_os = "android"))]
-        assert_eq!(options(Mode::Gl, "").0, eframe::Renderer::Glow);
-        #[cfg(any(feature = "gpu", target_os = "android"))]
-        assert_eq!(options(Mode::Hardware, "").0, eframe::Renderer::Wgpu);
+        {
+            assert_eq!(options(Mode::Gl, "").0, eframe::Renderer::Glow);
+            assert_eq!(options(Mode::Hardware, "").0, eframe::Renderer::Wgpu);
+        }
     }
 
     /// A start whose window never opened (the driver crashed or hung the

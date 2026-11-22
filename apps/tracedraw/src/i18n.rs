@@ -453,6 +453,17 @@ pub fn startup_language<S: AsRef<str>>(
 /// [`startup_language`] with the installer's choice and the system's
 /// languages read from this machine.
 pub fn startup_language_here(saved: &str) -> &'static str {
+    // A language pin for the tests: the suite asserts English strings,
+    // a machine running in another language needs a way to hold the
+    // interface in English without touching its real settings.
+    #[cfg(test)]
+    {
+        if let Ok(pin) = std::env::var("TRACEDRAW_TEST_LANG") {
+            if let Some(code) = supported(pin.trim()) {
+                return code;
+            }
+        }
+    }
     if supported(saved).is_some() {
         return startup_language::<&str>(saved, None, &[]);
     }
