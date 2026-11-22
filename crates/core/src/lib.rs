@@ -25,6 +25,7 @@ pub mod find;
 pub mod finite;
 pub mod fit;
 pub mod geometry;
+pub mod gk42;
 pub mod icc;
 pub mod id;
 pub mod jpeg_source;

@@ -366,6 +366,7 @@ pub(crate) fn item_name(id: &str) -> Option<String> {
         "alt" => "toolbar.mod_alt",
         "launch" => "toolbar.launch",
         "ai" => "toolbar.ai_generate",
+        "gk42" => "toolbar.gk42",
         "zoom_in" => "menu.view.zoom_in",
         "zoom_out" => "menu.view.zoom_out",
         "zoom_selected" => "toolbar.zoom_to_selected",
@@ -747,6 +748,7 @@ pub(crate) fn draw_item(app: &mut App, ui: &mut Ui, bar: &str, id: &str) {
         }
         "launch" => launch_button(app, ui, bar),
         "ai" => ai_button(app, ui),
+        "gk42" => gk42_button(app, ui),
         "zoom_in" | "zoom_out" => {
             let zoom_in = id == "zoom_in";
             let (pic, key) = if zoom_in {
@@ -1078,6 +1080,30 @@ fn ai_button(app: &mut App, ui: &mut Ui) {
                 ui.close();
             }
         });
+}
+
+/// GK-42 calibration on the standard bar: a dot in a crosshair, lit
+/// while the mode is on. With the mode on a click on the page places
+/// the markers or adds a picked point (see `map_gk42.rs`).
+fn gk42_button(app: &mut App, ui: &mut Ui) {
+    let on = app.map_gk42.on;
+    let size = Vec2::new(std_btn(), std_btn());
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    std_frame(ui, rect, resp.hovered(), on);
+    let p = ui.painter();
+    let c = rect.center();
+    let col = if on { Tokens::ACCENT } else { Tokens::icon() };
+    let s = egui::Stroke::new(1.4, col);
+    p.circle_stroke(c, 4.0, s);
+    p.circle_filled(c, 1.2, col);
+    p.line_segment([c - Vec2::new(8.0, 0.0), c - Vec2::new(5.0, 0.0)], s);
+    p.line_segment([c + Vec2::new(5.0, 0.0), c + Vec2::new(8.0, 0.0)], s);
+    p.line_segment([c - Vec2::new(0.0, 8.0), c - Vec2::new(0.0, 5.0)], s);
+    p.line_segment([c + Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 8.0)], s);
+    let resp = resp.on_hover_ui(|ui| rich_tip(ui, &tip("toolbar.gk42")));
+    if resp.clicked() {
+        crate::map_gk42::set_mode(app, !on);
+    }
 }
 
 /// Window > Toolbars > Text: font controls as a standalone bar.

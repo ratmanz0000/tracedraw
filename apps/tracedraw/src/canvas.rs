@@ -164,6 +164,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     crate::join_tool::draw_join_ends(app, painter);
     crate::shape_builder::draw(app, painter);
     crate::comments::draw_comments(app, painter);
+    crate::map_gk42::overlay(app, painter);
     crate::perspective_draw::draw_grid(app, painter, rect);
     draw_frame_links(app, painter);
     draw_content_links(app, painter);

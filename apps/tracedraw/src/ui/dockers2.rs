@@ -69,6 +69,7 @@ pub fn show(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         DockerTab::Effects => crate::ui::effects_docker::effects_docker(app, ui),
         DockerTab::Macros => crate::ui::macros_ui::manager(app, ui),
         DockerTab::PrintMerge => crate::ui::print_merge_docker::print_merge(app, ui),
+        DockerTab::Gk42 => crate::map_gk42::panel(app, ui),
         _ => {}
     }
 }

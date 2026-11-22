@@ -56,6 +56,7 @@ objects/index
   objects/light-flare
   objects/tracecut
   objects/shape-generator
+  objects/gk42
 color/index
   color/color-docker
   color/palettes

@@ -456,6 +456,39 @@ mod tests {
         assert!(s.page_path().bounding_box().width() > 0.0);
     }
 
+    /// The GK-42 calibration (a local feature) survives a .tdraw save
+    /// and load unchanged.
+    #[test]
+    fn gk42_calibration_round_trips_in_native_files() {
+        use tracedraw_core::gk42::{GkCalibration, GkPoint};
+        let mut doc = Document::default();
+        let layer = doc.pages[0].layers[0].id;
+        let cal = GkCalibration {
+            layer,
+            marker1: doc.ids_mut().shape(),
+            marker2: doc.ids_mut().shape(),
+            gk1: GkPoint {
+                x: 6_519_000.0,
+                y: 42_531_000.0,
+            },
+            gk2: GkPoint {
+                x: 6_523_200.0,
+                y: 42_536_000.0,
+            },
+        };
+        doc.gk42 = Some(cal);
+        let path = std::env::temp_dir().join(format!(
+            "tracedraw-gk42-{}-{:?}.tdraw",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        save_native(&doc, &path).unwrap();
+        let back = load_native(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back, doc);
+        assert_eq!(back.gk42.as_ref().unwrap().gk2.x, 6_523_200.0);
+    }
+
     #[test]
     fn open_curves_lose_their_fill_in_vector_exports() {
         use tracedraw_core::geometry::{BezPath, Point};

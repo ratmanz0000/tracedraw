@@ -1036,6 +1036,17 @@ pub(crate) fn tab_icon(tab: DockerTab) -> Option<TabIcon> {
         DockerTab::Effects => Some(|p, r| letters(p, r, "fx", 12.0)),
         DockerTab::Macros => Some(|p, r| glyph_pic(p, r, Glyph::Record)),
         DockerTab::PrintMerge => Some(|p, r| action_pic(p, r, crate::ui::icons::Action::Print)),
+        DockerTab::Gk42 => Some(|p, r| {
+            // A survey marker: a dot in a crosshair.
+            let c = r.center();
+            let s = egui::Stroke::new(1.3, Tokens::icon());
+            p.circle_stroke(c, 4.5, s);
+            p.line_segment([c - egui::vec2(9.0, 0.0), c - egui::vec2(5.0, 0.0)], s);
+            p.line_segment([c + egui::vec2(5.0, 0.0), c + egui::vec2(9.0, 0.0)], s);
+            p.line_segment([c - egui::vec2(0.0, 9.0), c - egui::vec2(0.0, 5.0)], s);
+            p.line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, 9.0)], s);
+            p.circle_filled(c, 1.5, Tokens::icon());
+        }),
     }
 }
 

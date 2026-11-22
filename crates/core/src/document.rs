@@ -2,6 +2,7 @@
 //! no behaviour beyond lookups and bounds. Mutation goes through commands.
 
 use crate::geometry::{self, Affine, BezPath, Point, Rect, Shape as _, Vec2};
+use crate::gk42::GkCalibration;
 use crate::id::{IdSource, LayerId, PageId, ShapeId};
 use crate::style::{Fill, Stroke};
 use crate::{Error, Result};
@@ -6534,6 +6535,10 @@ pub struct Document {
     /// Review comments pinned to the pages (never printed or exported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    /// The GK-42 map calibration (a local feature): its reference
+    /// markers and their true coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gk42: Option<GkCalibration>,
     /// Where the object found last by its id lay, so looking up the
     /// objects of a selection one after the other does not walk the
     /// whole drawing for each (never saved, never compared).
@@ -6932,6 +6937,7 @@ impl Document {
             cmyk_profile: None,
             inks: Vec::new(),
             comments: Vec::new(),
+            gk42: None,
             find_hint: FindHint::default(),
         }
     }

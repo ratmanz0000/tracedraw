@@ -2149,6 +2149,15 @@ impl App {
         {
             return;
         }
+        // The GK-42 mode takes the primary click first: while it is on,
+        // a click places the markers or adds a picked point, and a
+        // drag keeps doing the tool's work below (the box select, the
+        // pan). It goes before the click_selects branch, whose select
+        // would swallow the click otherwise.
+        if self.map_gk42.on && response.clicked_by(PointerButton::Primary) {
+            crate::map_gk42::click(self, p);
+            return;
+        }
         // A click with a tool whose click has no job of its own selects;
         // a drag goes on to the tool below.
         if self.tool.click_selects() && response.clicked_by(PointerButton::Primary) {

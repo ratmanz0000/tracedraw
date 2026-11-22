@@ -28,7 +28,7 @@ pub const SEP: &str = "sep";
 /// Prefix of a toolbox tool's button: "tool:" and the tool's id.
 pub const TOOL: &str = "tool:";
 
-const STANDARD: [&str; 35] = [
+const STANDARD: [&str; 36] = [
     "new",
     "open",
     "save",
@@ -64,6 +64,7 @@ const STANDARD: [&str; 35] = [
     "launch",
     SEP,
     "ai",
+    "gk42",
 ];
 
 const ZOOM: [&str; 10] = [

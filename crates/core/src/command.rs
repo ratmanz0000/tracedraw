@@ -7,6 +7,7 @@ use crate::document::{
     Symbol,
 };
 use crate::geometry::{Affine, BezPath, PathEl, Size};
+use crate::gk42::GkCalibration;
 use crate::id::{LayerId, PageId, ShapeId};
 use crate::style::{Fill, Stroke};
 use crate::Color;
@@ -541,6 +542,11 @@ pub enum Command {
         page: Option<PageId>,
         shown: bool,
     },
+    /// Set or clear the GK-42 map calibration (a local feature): one
+    /// change is one undo step.
+    SetGkCalibration {
+        cal: Option<GkCalibration>,
+    },
 }
 
 /// One object's change in [`Command::SetEffectsAndOpacity`].
@@ -748,6 +754,8 @@ impl Command {
             Command::SetGuides { .. } => "Guidelines",
             Command::SetMasterGuides { .. } => "Guidelines",
             Command::SetGuidesShown { .. } => "Show Guidelines",
+            Command::SetGkCalibration { cal: Some(_) } => "GK-42 Calibration",
+            Command::SetGkCalibration { .. } => "Clear GK-42 Calibration",
         }
     }
 
@@ -1931,6 +1939,7 @@ impl Command {
                     }
                 }
             },
+            Command::SetGkCalibration { cal } => doc.gk42 = cal.clone(),
             Command::Ungroup { group } => {
                 let (layer_id, idx) = doc.locate(*group)?;
                 let g = doc.layer_mut(layer_id)?.shapes.remove(idx);
@@ -2599,6 +2608,49 @@ fn take_out(
 
 #[cfg(test)]
 mod tests {
+    /// The GK-42 calibration (a local feature) sets and clears in one
+    /// undo step each; undo of a set goes back to the earlier set, not
+    /// to none, and undoing at empty history fails.
+    #[test]
+    fn gk42_calibration_sets_clears_and_undoes() {
+        use crate::gk42::{GkCalibration, GkPoint};
+        let mut e = crate::Engine::default();
+        let layer = e.document().pages[0].layers[0].id;
+        let cal = |x: f64| GkCalibration {
+            layer,
+            marker1: crate::ShapeId(1),
+            marker2: crate::ShapeId(2),
+            gk1: GkPoint {
+                x,
+                y: 42_531_000.0,
+            },
+            gk2: GkPoint {
+                x: 6_523_200.0,
+                y: 42_536_000.0,
+            },
+        };
+        assert_eq!(e.document().gk42, None);
+        let first = cal(6_519_000.0);
+        e.run(&Command::SetGkCalibration {
+            cal: Some(first.clone()),
+        })
+        .unwrap();
+        assert_eq!(e.document().gk42.as_ref(), Some(&first));
+        let second = cal(6_519_500.0);
+        e.run(&Command::SetGkCalibration {
+            cal: Some(second.clone()),
+        })
+        .unwrap();
+        assert_eq!(e.document().gk42.as_ref(), Some(&second));
+        e.undo().unwrap();
+        assert_eq!(e.document().gk42.as_ref(), Some(&first));
+        e.undo().unwrap();
+        assert_eq!(e.document().gk42, None);
+        assert!(e.undo().is_err());
+        e.run(&Command::SetGkCalibration { cal: None }).unwrap();
+        assert_eq!(e.document().gk42, None);
+    }
+
     /// The Objects docker's moves (#2672): objects go next to an object
     /// inside a group, into a group on top, change places inside one and
     /// come out of one, staying where they show on the page; a group

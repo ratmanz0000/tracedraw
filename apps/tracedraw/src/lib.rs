@@ -169,6 +169,7 @@ mod macos_package;
 mod macro_convert;
 mod macro_forms;
 mod macros;
+mod map_gk42;
 mod mcp;
 #[cfg(not(target_arch = "wasm32"))]
 mod mcp_link;

@@ -293,14 +293,25 @@ fn cursor_coordinates(app: &App) -> String {
         Some(p) => {
             let u = app.units;
             let d = app.settings.precision.min(10) as usize;
-            format!(
+            let mut s = format!(
                 "({:.*}, {:.*}) {}",
                 d,
                 u.world_from_mm(p.x),
                 d,
                 u.world_from_mm(p.y),
                 u.label()
-            )
+            );
+            // The GK-42 metres of the point (a local feature), when the
+            // document carries a working calibration.
+            if let Some((t, _)) = crate::map_gk42::transform_of(app.doc()) {
+                let g = t.to_gk(p);
+                s.push_str(&format!(
+                    "  GK-42: X {} Y {}",
+                    crate::map_gk42::fmt_m(g.x),
+                    crate::map_gk42::fmt_m(g.y)
+                ));
+            }
+            s
         }
         None => String::new(),
     }

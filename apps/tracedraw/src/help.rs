@@ -255,6 +255,7 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::Comments => "objects/comments",
         DockerTab::AiGenerate => "customize/ai#generate",
         DockerTab::Effects => "effects/effects-docker",
+        DockerTab::Gk42 => "objects/gk42",
     }
 }
 
@@ -485,9 +486,11 @@ mod tests {
     /// The topics written in `dialog_topic`, read from this file, so
     /// variants with heavy state are checked too.
     fn dialog_topics_in_source() -> Vec<String> {
-        let src =
+        let mut src =
             std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/help.rs"))
                 .unwrap();
+        // A Windows checkout keeps CRLF; match the bare brace either way.
+        src = src.replace("\r\n", "\n");
         let start = src.find("pub fn dialog_topic").unwrap();
         let end = src[start..].find("\n}\n").unwrap() + start;
         let body = &src[start..end];

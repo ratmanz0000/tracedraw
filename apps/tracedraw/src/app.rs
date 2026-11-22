@@ -1102,6 +1102,9 @@ pub struct App {
     pub engine: Engine,
     pub page: PageId,
     pub view: View,
+    /// The GK-42 map calibration module's own state (a local feature):
+    /// the mode, the placement flow, the picked points, the drafts.
+    pub map_gk42: crate::map_gk42::Gk42State,
     pub tool: Tool,
     pub previous_tool: Tool,
     /// How many times a tool was chosen (the toolbox, its flyouts, the
@@ -2625,10 +2628,11 @@ pub enum DockerTab {
     Effects,
     Macros,
     PrintMerge,
+    Gk42,
 }
 
 impl DockerTab {
-    pub const ALL: [DockerTab; 48] = [
+    pub const ALL: [DockerTab; 49] = [
         DockerTab::Properties,
         DockerTab::Objects,
         DockerTab::Hints,
@@ -2677,6 +2681,7 @@ impl DockerTab {
         DockerTab::Effects,
         DockerTab::Macros,
         DockerTab::PrintMerge,
+        DockerTab::Gk42,
     ];
 
     /// Window > Panels, in groups divided by separators (the object
@@ -2696,7 +2701,7 @@ impl DockerTab {
             DockerTab::PrintMerge,
             DockerTab::AiGenerate,
         ],
-        &[DockerTab::Transformations, DockerTab::Coordinates],
+        &[DockerTab::Transformations, DockerTab::Coordinates, DockerTab::Gk42],
         &[DockerTab::Guidelines],
         &[
             DockerTab::AlignDistribute,
@@ -2798,6 +2803,7 @@ impl DockerTab {
             DockerTab::Macros => "docker.macros",
             DockerTab::Effects => "docker.effects",
             DockerTab::PrintMerge => "docker.print_merge",
+            DockerTab::Gk42 => "docker.gk42",
         }
     }
 
@@ -3210,6 +3216,7 @@ impl App {
             engine,
             page,
             view: View::default(),
+            map_gk42: Default::default(),
             tool: Tool::Pick,
             previous_tool: Tool::Pick,
             tool_chosen: 0,
