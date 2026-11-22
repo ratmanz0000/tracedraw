@@ -81,6 +81,39 @@ pub struct TextClip {
     pub stroke: Option<Stroke>,
 }
 
+/// The last text layout made for a text of the drawing (the one being
+/// edited: the caret, a click in it, its non-printing marks) and the
+/// overflow of a paragraph frame. Keyed by the engine instance and
+/// revision, the shape, the default tab spacing, the shape's transform
+/// and the font generation, so a change of any of them lays the text out
+/// again. The layout is shared as an `Arc`: moving the caret or the
+/// pointer over the text does not copy its path and lines every frame.
+#[derive(Clone)]
+pub struct CachedTextLayout {
+    pub instance: u64,
+    pub revision: u64,
+    pub shape: ShapeId,
+    pub tab_step_bits: u64,
+    pub transform_bits: [u64; 6],
+    pub font_generation: u64,
+    pub layout: std::sync::Arc<TextLayout>,
+    pub to_page: Affine,
+}
+
+impl CachedTextLayout {
+    /// Whether this is still the layout of shape `id` as the drawing
+    /// stands now (same engine instance and revision, tab spacing, fonts
+    /// and transform).
+    pub fn matches(&self, instance: u64, revision: u64, id: ShapeId, transform: Affine) -> bool {
+        self.instance == instance
+            && self.revision == revision
+            && self.shape == id
+            && self.tab_step_bits == tracedraw_core::default_tab_step().to_bits()
+            && self.transform_bits == transform.as_coeffs().map(f64::to_bits)
+            && self.font_generation == tracedraw_text::fonts().generation()
+    }
+}
+
 /// Text from a clipboard with its line ends as `\n`.
 pub(crate) fn unify_line_ends(t: &str) -> String {
     t.replace("\r\n", "\n").replace('\r', "\n")
@@ -209,6 +242,40 @@ impl App {
     pub fn text_layout_of(&self, id: ShapeId) -> Option<(TextLayout, Affine)> {
         let s = self.doc().find_shape(id)?;
         layout_of_text_shape(s, Affine::IDENTITY)
+    }
+
+    /// The layout of a text object, shared, and the transform from layout
+    /// space to the page. The layout last made is kept in
+    /// [`App::text_layout_cache`] while the drawing, the shape, its
+    /// transform, the fonts and the default tab spacing are unchanged, so
+    /// the caret, a click in the text and the non-printing marks do not
+    /// lay the text out again on every frame and every pointer move.
+    pub fn cached_text_layout_of(
+        &self,
+        id: ShapeId,
+    ) -> Option<(std::sync::Arc<TextLayout>, Affine)> {
+        let s = self.doc().find_shape(id)?;
+        let instance = self.engine.instance();
+        let revision = self.engine.revision();
+        if let Some(c) = self.text_layout_cache.borrow().as_ref() {
+            if c.matches(instance, revision, id, s.transform) {
+                return Some((c.layout.clone(), c.to_page));
+            }
+        }
+        let (layout, to_page) = layout_of_text_shape(s, Affine::IDENTITY)?;
+        let cached = CachedTextLayout {
+            instance,
+            revision,
+            shape: id,
+            tab_step_bits: tracedraw_core::default_tab_step().to_bits(),
+            transform_bits: s.transform.as_coeffs().map(f64::to_bits),
+            font_generation: tracedraw_text::fonts().generation(),
+            layout: std::sync::Arc::new(layout),
+            to_page,
+        };
+        let shared = (cached.layout.clone(), cached.to_page);
+        *self.text_layout_cache.borrow_mut() = Some(cached);
+        Some(shared)
     }
 
     /// The text objects Vertical Text acts on: the selected ones and the
@@ -1008,25 +1075,27 @@ impl App {
             CaretMove::WordRight => word_end_after(&text, te.caret),
             CaretMove::TextStart => 0,
             CaretMove::TextEnd => len,
-            CaretMove::LineStart | CaretMove::LineEnd => match self.text_layout_of(te.shape) {
-                Some((layout, _)) => {
-                    let line = layout.line_of(te.caret).and_then(|i| layout.lines.get(i));
-                    match (line, m) {
-                        (Some(l), CaretMove::LineStart) => l.start_char,
-                        (Some(l), _) => l.end_char,
-                        (None, CaretMove::LineStart) => 0,
-                        (None, _) => len,
+            CaretMove::LineStart | CaretMove::LineEnd => {
+                match self.cached_text_layout_of(te.shape) {
+                    Some((layout, _)) => {
+                        let line = layout.line_of(te.caret).and_then(|i| layout.lines.get(i));
+                        match (line, m) {
+                            (Some(l), CaretMove::LineStart) => l.start_char,
+                            (Some(l), _) => l.end_char,
+                            (None, CaretMove::LineStart) => 0,
+                            (None, _) => len,
+                        }
+                    }
+                    None => {
+                        if m == CaretMove::LineStart {
+                            0
+                        } else {
+                            len
+                        }
                     }
                 }
-                None => {
-                    if m == CaretMove::LineStart {
-                        0
-                    } else {
-                        len
-                    }
-                }
-            },
-            CaretMove::Up | CaretMove::Down => match self.text_layout_of(te.shape) {
+            }
+            CaretMove::Up | CaretMove::Down => match self.cached_text_layout_of(te.shape) {
                 Some((layout, _)) => {
                     let Some(li) = layout.line_of(te.caret) else {
                         return;
@@ -1115,7 +1184,7 @@ impl App {
     /// Character index under the page point `p` in the text being edited.
     pub fn text_hit_char(&self, p: Point) -> Option<usize> {
         let te = self.text_edit.as_ref()?;
-        let (layout, to_page) = self.text_layout_of(te.shape)?;
+        let (layout, to_page) = self.cached_text_layout_of(te.shape)?;
         let local = to_page.inverse() * p;
         // On a path: the place along the line nearest the point (#2423).
         let local = layout
@@ -1297,12 +1366,15 @@ impl App {
     /// caret segment and one rectangle per selected line.
     pub fn text_caret_geometry(&self) -> Option<(Point, Point, Vec<[Point; 4]>)> {
         let te = self.text_edit.as_ref()?;
-        let (layout, to_page) = self.text_layout_of(te.shape)?;
-        let size_pt = self
-            .edit_spans()?
-            .first()
-            .map(|s| s.size_pt)
-            .unwrap_or(12.0);
+        let (layout, to_page) = self.cached_text_layout_of(te.shape)?;
+        // The first span's size, without copying every span of the text
+        // for it.
+        let size_pt = match self.doc().find_shape(te.shape).map(|s| &s.kind) {
+            Some(ShapeKind::Text { spans, .. }) => {
+                spans.first().map(|sp| sp.size_pt).unwrap_or(12.0)
+            }
+            _ => return None,
+        };
         caret_geometry_sized(&layout, &to_page, te.caret, te.selection(), size_pt)
     }
 }
@@ -1343,7 +1415,7 @@ impl App {
         let Some(te) = self.text_edit.as_ref() else {
             return Vec::new();
         };
-        let Some((layout, to_page)) = self.text_layout_of(te.shape) else {
+        let Some((layout, to_page)) = self.cached_text_layout_of(te.shape) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -2889,6 +2961,164 @@ mod tests {
             app.text_edit_overlay.borrow().session.is_none(),
             "covered text falls back to full-page rendering"
         );
+    }
+
+    /// Typing into a paragraph text frame keeps the already-rendered page
+    /// picture and draws the frame's text in the overlay (#3904).
+    #[test]
+    fn typing_into_a_paragraph_frame_renders_the_overlay_not_the_page() {
+        if !fonts_available() {
+            return;
+        }
+        let mut app = App::headless();
+        app.settings.autocorrect.enabled = false;
+        let bg = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(5.0, 5.0, 180.0, 180.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("backdrop shape");
+        app.run(Command::SetFill {
+            shapes: vec![bg],
+            fill: Fill::Solid(Color::rgb8(220, 230, 240)),
+        });
+        let ctx = crate::theme::ui_context();
+        let draw_frame = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+            out.textures_delta.clear();
+        };
+        app.zoom_to_page();
+        draw_frame(&mut app);
+        let page_renders_before = app.raster.borrow().render_count();
+        assert!(page_renders_before >= 1);
+
+        app.start_text(
+            Point::new(30.0, 100.0),
+            Some(tracedraw_core::geometry::Size::new(80.0, 40.0)),
+        );
+        for ch in ["H", "e", "l", "l", "o"] {
+            app.text_insert(ch);
+            draw_frame(&mut app);
+            assert_eq!(
+                app.raster.borrow().render_count(),
+                page_renders_before,
+                "typing '{ch}' must not re-render the full page"
+            );
+        }
+        let overlay_renders = app.text_edit_overlay.borrow().overlay_renders;
+        assert!(overlay_renders >= 1, "the text overlay rendered");
+
+        // Caret-only movement reuses the cached layout and the overlay.
+        let text_id = app.text_edit.as_ref().expect("editing").shape;
+        let (layout, _) = app.cached_text_layout_of(text_id).expect("layout");
+        app.text_move(CaretMove::Left, false);
+        draw_frame(&mut app);
+        assert_eq!(
+            app.text_edit_overlay.borrow().overlay_renders,
+            overlay_renders
+        );
+        let (again, _) = app.cached_text_layout_of(text_id).expect("layout");
+        assert!(
+            std::sync::Arc::ptr_eq(&layout, &again),
+            "the caret move kept the layout"
+        );
+    }
+
+    /// The layout of the text being edited is made once and then shared
+    /// (`Arc::ptr_eq`) while the drawing is unchanged: caret moves, a
+    /// click in the text, the non-printing marks and the overflow of its
+    /// paragraph frame all take it from the cache. The next character, a
+    /// transform, and a change of the default tab spacing lay it out
+    /// again.
+    #[test]
+    fn editing_a_text_reuses_its_layout_until_the_text_or_its_settings_change() {
+        let mut app = App::headless();
+        app.settings.autocorrect.enabled = false;
+        tracedraw_text::install();
+        let id = app
+            .new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new(
+                    "Some words to lay out in the frame",
+                    "Sans",
+                    12.0,
+                )],
+                origin: Point::new(20.0, 20.0),
+                frame: Some(tracedraw_core::geometry::Size::new(80.0, 40.0)),
+                align: Default::default(),
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("frame");
+        app.begin_text_edit(id);
+
+        let (first, _) = app.cached_text_layout_of(id).expect("layout");
+        let (again, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "the same shape twice is the same layout"
+        );
+
+        // Caret moves.
+        app.text_move(CaretMove::Right, false);
+        app.text_move(CaretMove::LineStart, false);
+        let (moved, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(std::sync::Arc::ptr_eq(&first, &moved), "caret moves");
+
+        // Non-printing marks (there may be none without fonts).
+        app.show_non_printing = true;
+        let _ = app.non_printing_marks();
+        let (marked, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(std::sync::Arc::ptr_eq(&first, &marked), "the marks");
+
+        // A click in the text.
+        let (_, to_page) = app.cached_text_layout_of(id).expect("layout");
+        let _ = app.text_hit_char(to_page * Point::new(10.0, 0.0));
+        let (hit, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(std::sync::Arc::ptr_eq(&first, &hit), "a click");
+
+        // The overflow of this frame is the cached layout's, and the
+        // overflow cache is not filled for it.
+        let shape = app.doc().find_shape(id).cloned().expect("shape");
+        assert_eq!(app.text_overflows(&shape), first.overflow);
+        assert!(
+            app.overflow_cache.borrow().get(&id).is_none(),
+            "the layout cache answered, not the overflow cache"
+        );
+        let (same, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(std::sync::Arc::ptr_eq(&first, &same), "after the overflow");
+
+        // The next character lays the text out again.
+        app.text_insert("x");
+        let (after, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &after),
+            "a character edit lays the text out again"
+        );
+
+        // A transform of the shape too (its revision changes with it).
+        let (before, _) = app.cached_text_layout_of(id).expect("layout");
+        app.run(Command::TransformShapes {
+            shapes: vec![id],
+            transform: Affine::translate((1.0, 0.0)),
+        });
+        let (after, _) = app.cached_text_layout_of(id).expect("layout");
+        assert!(!std::sync::Arc::ptr_eq(&before, &after), "a transform");
+
+        // Changing the default tab spacing lays the text out again at
+        // once, without a change of the drawing.
+        let (before, _) = app.cached_text_layout_of(id).expect("layout");
+        tracedraw_core::set_default_tab_step(25.4);
+        let (after, _) = app.cached_text_layout_of(id).expect("layout");
+        tracedraw_core::set_default_tab_step(tracedraw_core::DEFAULT_TAB_STEP);
+        assert!(!std::sync::Arc::ptr_eq(&before, &after), "the tab spacing");
     }
 }
 

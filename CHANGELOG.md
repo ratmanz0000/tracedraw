@@ -6,6 +6,7 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Paragraph text editing: `FontSystem` caches full `TextLayout` results with exact typed keys instead of formatting strings, `App` caches the edited text's layout across caret, non-printing marks, hit-testing and overflow checks, `text_overflows` hashes text fields without `Debug` string allocations, and frame-link lookups borrow object data without cloning (#3959, #3960).
 - Typing in a large drawing: a text change made in place updates only that text instead of walking the whole document, a render for an older state of the drawing gives up as soon as a newer one is due, and the text being edited is drawn over the page picture already made (#3902, #3903, #3904; PR #3910 by ratmanz0000).
 - Pictures: a grey picture is turned into grey levels in one pass over its pixels, and placed pictures are written with the same quick setting as the others (PR #3915 by ratmanz0000).
 - Metafiles: text a metafile stores as glyph numbers comes in as text, or as the glyphs' outlines where no character matches, instead of question marks; the character set of the metafile's fonts (Cyrillic, Central European, Greek, Turkish, Hebrew, Arabic, Baltic, Vietnamese, Thai, Japanese, Korean, Chinese) is read and written, and spreadsheets in other encodings are read right (#3920, #3921; PR #3924 by ratmanz0000).
