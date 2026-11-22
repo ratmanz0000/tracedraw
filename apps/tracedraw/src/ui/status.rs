@@ -289,8 +289,9 @@ pub(crate) fn drag_info(app: &App) -> Option<String> {
 }
 
 fn cursor_coordinates(app: &App) -> String {
-    match app.pointer_page.map(|p| app.to_ruler(p)) {
-        Some(p) => {
+    match app.pointer_page {
+        Some(raw_p) => {
+            let p = app.to_ruler(raw_p);
             let u = app.units;
             let d = app.settings.precision.min(10) as usize;
             let mut s = format!(
@@ -302,9 +303,9 @@ fn cursor_coordinates(app: &App) -> String {
                 u.label()
             );
             // The GK-42 metres of the point (a local feature), when the
-            // document carries a working calibration.
-            if let Some((t, _)) = crate::map_gk42::transform_of(app.doc()) {
-                let g = t.to_gk(p);
+            // document or panel carries a working calibration.
+            if let Some((t, _)) = crate::map_gk42::preview_transform(app) {
+                let g = t.to_gk(raw_p);
                 s.push_str(&format!(
                     "  GK-42: X {} Y {}",
                     crate::map_gk42::fmt_gk_cursor(g.x),

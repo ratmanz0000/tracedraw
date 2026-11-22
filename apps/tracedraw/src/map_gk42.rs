@@ -80,13 +80,6 @@ impl Default for Gk42State {
     }
 }
 
-impl Gk42State {
-    /// Both markers are placed.
-    fn markers_placed(&self) -> bool {
-        self.marker1.is_some() && self.marker2.is_some()
-    }
-}
-
 /// Turning the mode on picks the flow up where the markers left it:
 /// with both markers there the clicks add picked points, with one
 /// marker the next click places the other, with none the first click
@@ -94,10 +87,12 @@ impl Gk42State {
 pub fn set_mode(app: &mut App, on: bool) {
     app.map_gk42.on = on;
     if on {
+        let m1 = marker_id(app, true);
+        let m2 = marker_id(app, false);
         let st = &mut app.map_gk42;
-        if st.marker1.is_none() {
+        if m1.is_none() {
             st.step = 0;
-        } else if st.marker2.is_none() {
+        } else if m2.is_none() {
             st.step = 1;
         } else {
             st.step = 2;
@@ -173,18 +168,16 @@ fn place_marker(app: &mut App, p: Point, second: bool) -> bool {
     true
 }
 
-/// The centre of a marker shape: its ellipse's centre.
+/// The centre of a marker shape in page millimetres.
 fn marker_position(doc: &Document, id: ShapeId) -> Option<Point> {
     let shape = doc.find_shape(id)?;
+    let page = doc
+        .parent_transform(id)
+        .unwrap_or(tracedraw_core::geometry::Affine::IDENTITY)
+        * shape.transform;
     match &shape.kind {
-        ShapeKind::Ellipse { rect, .. } => {
-            // A moved marker carries its move in the shape's transform;
-            // the rect stays in the shape's own space.
-            let page = doc.parent_transform(id).unwrap_or(tracedraw_core::geometry::Affine::IDENTITY)
-                * shape.transform;
-            Some(page * rect.center())
-        }
-        _ => None,
+        ShapeKind::Ellipse { rect, .. } => Some(page * rect.center()),
+        _ => Some(page * shape.local_bounds().center()),
     }
 }
 
@@ -220,8 +213,44 @@ pub fn transform_of(doc: &Document) -> Option<(GkTransform, GkCalibration)> {
     Some((t, cal.clone()))
 }
 
-/// The transform the panel previews: the markers' positions against
-/// the typed coordinates, falling back to the saved calibration's.
+/// Resolve typed `(x1, y1)` and `(x2, y2)` into geodetic `(northing, easting)`
+/// pairs: accepts standard GK-42 `(X = northing, Y = easting)` first, and
+/// also handles `(easting, northing)` when the first pair carries multi-digit
+/// zone eastings (>= 10 500 000 m, impossible as a meridian distance from the
+/// equator) or when opposite-sign marker axes only calibrate that way.
+fn oriented_gk(
+    i1: ShapeId,
+    i2: ShapeId,
+    p1: Point,
+    p2: Point,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> (GkPoint, GkPoint) {
+    let build = |a1: f64, b1: f64, a2: f64, b2: f64| GkCalibration {
+        layer: LayerId(0),
+        marker1: i1,
+        marker2: i2,
+        gk1: GkPoint { x: a1, y: b1 },
+        gk2: GkPoint { x: a2, y: b2 },
+    };
+    let clearly_easting_first =
+        x1 >= 10_500_000.0 && x2 >= 10_500_000.0 && y1 < 10_500_000.0 && y2 < 10_500_000.0;
+    if clearly_easting_first && build(y1, x1, y2, x2).transform_at(p1, p2).is_some() {
+        return (GkPoint { x: y1, y: x1 }, GkPoint { x: y2, y: x2 });
+    }
+    if build(x1, y1, x2, y2).transform_at(p1, p2).is_some() {
+        return (GkPoint { x: x1, y: y1 }, GkPoint { x: x2, y: y2 });
+    }
+    if build(y1, x1, y2, x2).transform_at(p1, p2).is_some() {
+        return (GkPoint { x: y1, y: x1 }, GkPoint { x: y2, y: x2 });
+    }
+    (GkPoint { x: x1, y: y1 }, GkPoint { x: x2, y: y2 })
+}
+
+/// The transform the panel and cursor readout use: the markers' positions
+/// against the typed coordinates, falling back to the saved calibration's.
 /// The bool says whether the coordinates came from the saved one.
 pub fn preview_transform(app: &App) -> Option<(GkTransform, bool)> {
     let st = &app.map_gk42;
@@ -235,14 +264,17 @@ pub fn preview_transform(app: &App) -> Option<(GkTransform, bool)> {
     let g2x = parse_m(&st.gk2.0);
     let g2y = parse_m(&st.gk2.1);
     if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (g1x, g1y, g2x, g2y) {
+        let (gk1, gk2) = oriented_gk(i1, i2, p1, p2, x1, y1, x2, y2);
         let cal = GkCalibration {
             layer: LayerId(0),
             marker1: i1,
             marker2: i2,
-            gk1: GkPoint { x: x1, y: y1 },
-            gk2: GkPoint { x: x2, y: y2 },
+            gk1,
+            gk2,
         };
-        return cal.transform_at(p1, p2).map(|t| (t, false));
+        if let Some(t) = cal.transform_at(p1, p2) {
+            return Some((t, false));
+        }
     }
     let cal = doc.gk42.as_ref()?;
     let t = cal.transform_at(p1, p2)?;
@@ -279,16 +311,17 @@ pub fn apply(app: &mut App) -> bool {
 
 /// Parsing the panel's coordinate fields into the calibration data.
 fn parse_draft(app: &mut App) -> Option<(ShapeId, ShapeId, GkPoint, GkPoint)> {
+    let i1 = marker_id(app, true);
+    let i2 = marker_id(app, false);
+    let p1 = i1.and_then(|id| marker_position(app.doc(), id));
+    let p2 = i2.and_then(|id| marker_position(app.doc(), id));
     let st = &mut app.map_gk42;
     let mut bad: Option<&'static str> = None;
-    let i1 = match st.marker1 {
-        Some(i) => i,
-        None => {
-            st.error = Some(tr("gk42.need_markers"));
-            return None;
-        }
+    let Some(i1) = i1 else {
+        st.error = Some(tr("gk42.need_markers"));
+        return None;
     };
-    let Some(i2) = st.marker2 else {
+    let Some(i2) = i2 else {
         st.error = Some(tr("gk42.need_markers"));
         return None;
     };
@@ -324,8 +357,10 @@ fn parse_draft(app: &mut App) -> Option<(ShapeId, ShapeId, GkPoint, GkPoint)> {
         st.error = Some(tr(key));
         return None;
     }
-    let gk1 = GkPoint { x: g1x, y: g1y };
-    let gk2 = GkPoint { x: g2x, y: g2y };
+    let (gk1, gk2) = match (p1, p2) {
+        (Some(a), Some(b)) => oriented_gk(i1, i2, a, b, g1x, g1y, g2x, g2y),
+        _ => (GkPoint { x: g1x, y: g1y }, GkPoint { x: g2x, y: g2y }),
+    };
     if let (Some(a), Some(b)) = (zone_of(gk1.y), zone_of(gk2.y)) {
         if a != b {
             st.error = Some(tr("gk42.zone_mismatch"));
@@ -454,9 +489,13 @@ pub fn fmt_gk_plain(v: f64) -> String {
     format!("{}", v.round() as i64)
 }
 
-/// GK-42 metres at the cursor: whole metres split after the first two
-/// and the next two digits ("74 91 070", "42 53 1000").
+/// GK-42 metres at the cursor: whole metres without decimals or commas,
+/// split as 2 digits + space + 2 digits + space + the rest
+/// ("74 91 070", "54 16 374", "42 53 1000").
 pub fn fmt_gk_cursor(v: f64) -> String {
+    if !v.is_finite() {
+        return String::new();
+    }
     let n = v.round() as i64;
     let sign = if n < 0 { "-" } else { "" };
     let d = n.unsigned_abs().to_string();
@@ -537,10 +576,38 @@ fn plate(painter: &Painter, anchor: Pos2, lines: &[String]) {
     }
 }
 
+/// Lines shown in the floating readout next to the cursor: the real
+/// ruler coordinates first, then GK-42 (`XX XX X...` without commas)
+/// whenever a live or applied calibration resolves.
+pub fn cursor_lines(app: &App) -> Option<Vec<String>> {
+    let active_t = preview_transform(app).map(|(t, _)| t);
+    if !app.map_gk42.on && active_t.is_none() {
+        return None;
+    }
+    let p = app.pointer_page?;
+    let r = app.to_ruler(p);
+    let u = app.units;
+    let mut lines = vec![format!(
+        "X: {}  Y: {} {}",
+        fmt_mm(u.world_from_mm(r.x)),
+        fmt_mm(u.world_from_mm(r.y)),
+        u.label()
+    )];
+    if let Some(t) = active_t {
+        let g = t.to_gk(p);
+        lines.push(format!(
+            "GK-42: X {}  Y {}",
+            fmt_gk_cursor(g.x),
+            fmt_gk_cursor(g.y)
+        ));
+    }
+    Some(lines)
+}
+
 /// The canvas overlay: badges at the markers, the dashed line between
-/// them, the picked points with their numbers and, with the mode on,
-/// the coordinates at the cursor. Plain shapes only, so it redraws
-/// every frame for free.
+/// them, the picked points with their numbers and the coordinate plate
+/// next to the cursor (real coordinates + GK-42). Plain shapes only, so
+/// it redraws every frame for free.
 pub fn overlay(app: &App, painter: &Painter) {
     let st = &app.map_gk42;
     let doc = app.doc();
@@ -580,22 +647,9 @@ pub fn overlay(app: &App, painter: &Painter) {
             green,
         );
     }
-    if st.on {
-        if let Some(p) = app.pointer_page {
-            let at = view.to_screen(p);
-            let mut lines = vec![
-                format!("X: {} Y: {}", fmt_mm(p.x), fmt_mm(p.y)),
-            ];
-            if let Some((t, _)) = transform_of(doc) {
-                let g = t.to_gk(p);
-                lines.push(format!(
-                    "GK-42: X {}  Y {}",
-                    fmt_gk_cursor(g.x),
-                    fmt_gk_cursor(g.y)
-                ));
-            }
-            plate(painter, at + Vec2::new(14.0, -12.0), &lines);
-        }
+    if let (Some(p), Some(lines)) = (app.pointer_page, cursor_lines(app)) {
+        let at = view.to_screen(p);
+        plate(painter, at + Vec2::new(14.0, -12.0), &lines);
     }
 }
 
@@ -804,7 +858,8 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
         {
             reset(app);
         }
-        let can_apply = app.map_gk42.markers_placed();
+        let can_apply =
+            marker_id(app, true).is_some() && marker_id(app, false).is_some();
         let r = ui
             .add_enabled(can_apply, egui::Button::new(tr("gk42.apply")))
             .rich_tip_always(keyed("gk42.apply"));
@@ -1265,5 +1320,33 @@ mod tests {
         app.map_gk42.gk2 = ("6523200".into(), "42536000".into());
         assert!(apply(&mut app));
         assert!(app.map_gk42.error.is_none());
+    }
+
+    /// The floating window next to the cursor carries both the real
+    /// coordinates and the GK-42 coordinates ("XX XX X..." without
+    /// commas) as soon as the two markers have GK-42 values, before and
+    /// after Apply, and even when the pick mode is switched off.
+    #[test]
+    fn cursor_plate_shows_both_real_and_gk42_in_two_two_rest_format() {
+        let mut app = App::headless();
+        set_mode(&mut app, true);
+        click(&mut app, Point::new(50.0, 50.0));
+        click(&mut app, Point::new(150.0, 150.0));
+        app.map_gk42.gk1 = ("5416000".into(), "7490000".into());
+        app.map_gk42.gk2 = ("5416748.56".into(), "7492139.86".into());
+        app.pointer_page = Some(Point::new(100.0, 100.0));
+
+        // Before Apply: draft GK-42 coordinates already resolve on the cursor plate.
+        let before = cursor_lines(&app).expect("cursor lines");
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(before[0], "X: 100.00  Y: 100.00 mm");
+        assert_eq!(before[1], "GK-42: X 54 16 374  Y 74 91 070");
+        assert!(!before[1].contains(','));
+
+        // After Apply with pick mode turned off: the cursor plate still shows both.
+        assert!(apply(&mut app));
+        set_mode(&mut app, false);
+        let after = cursor_lines(&app).expect("cursor lines with mode off");
+        assert_eq!(after, before);
     }
 }
