@@ -10820,3 +10820,4 @@ gk42.mm_y_tip = "The marker's Y on the sheet, in millimetres; Enter moves the ma
 gk42.gk_x_tip = "The marker's true GK-42 X (northing), in metres."
 gk42.gk_y_tip = "The marker's true GK-42 Y (easting, with zone), in metres."
 toolbar.gk42_desc = "Ties the sheet's millimetres to true GK-42 metres with two reference markers; clicks on the sheet place them and pick points."
+gk42.bad_axes = "Marker 1/2 coordinates disagree in direction with the markers on the sheet (check marker order or X/Y)."

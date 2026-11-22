@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "X znacznika na arkuszu, w milimetrach; Enter przenosi znacznik 
 gk42.mm_y_tip = "Y znacznika na arkuszu, w milimetrach; Enter przenosi znacznik w to miejsce."
 gk42.gk_x_tip = "Prawdziwa współrzędna X znacznika w GK-42, w metrach."
 gk42.gk_y_tip = "Prawdziwa współrzędna Y znacznika w GK-42, w metrach."
+gk42.bad_axes = "Kierunek współrzędnych nie zgadza się z położeniem znaczników 1 i 2 na arkuszu (sprawdź kolejność znaczników lub osie X/Y)."

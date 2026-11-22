@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "La X del marcatore sul foglio, in millimetri; Invio sposta il m
 gk42.mm_y_tip = "La Y del marcatore sul foglio, in millimetri; Invio sposta il marcatore lì."
 gk42.gk_x_tip = "La coordinata est vera del marcatore in GK-42, in metri."
 gk42.gk_y_tip = "La coordinata nord vera del marcatore in GK-42, in metri."
+gk42.bad_axes = "La direzione delle coordinate non corrisponde alla posizione dei marcatori 1 e 2 sul foglio (controlla ordine o assi X/Y)."

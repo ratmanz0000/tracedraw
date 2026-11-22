@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "Das X der Marke auf dem Blatt, in Millimetern; Enter verschiebt
 gk42.mm_y_tip = "Das Y der Marke auf dem Blatt, in Millimetern; Enter verschiebt die Marke dorthin."
 gk42.gk_x_tip = "Der wahre Ostwert der Marke in GK-42, in Metern."
 gk42.gk_y_tip = "Der wahre Nordwert der Marke in GK-42, in Metern."
+gk42.bad_axes = "Die Richtung der Koordinaten stimmt nicht mit der Lage von Marke 1 und 2 auf dem Blatt überein (Markenfolge oder X/Y prüfen)."

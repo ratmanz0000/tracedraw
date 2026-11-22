@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "De X van de marker op het vel, in millimeters; Enter verplaatst
 gk42.mm_y_tip = "De Y van de marker op het vel, in millimeters; Enter verplaatst de marker daarheen."
 gk42.gk_x_tip = "De werkelijke oostwaarde van de marker in GK-42, in meters."
 gk42.gk_y_tip = "De werkelijke noordwaarde van de marker in GK-42, in meters."
+gk42.bad_axes = "De richting van de coördinaten komt niet overeen met de positie van marker 1 en 2 op het vel (controleer volgorde of X/Y)."

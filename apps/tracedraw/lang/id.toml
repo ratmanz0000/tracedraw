@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "X penanda pada lembar, dalam milimeter; Enter memindahkan penan
 gk42.mm_y_tip = "Y penanda pada lembar, dalam milimeter; Enter memindahkan penanda ke sana."
 gk42.gk_x_tip = "Koordinat timur sebenarnya dari penanda di GK-42, dalam meter."
 gk42.gk_y_tip = "Koordinat utara sebenarnya dari penanda di GK-42, dalam meter."
+gk42.bad_axes = "Arah koordinat tidak sesuai dengan posisi penanda 1 dan 2 pada lembar (periksa urutan penanda atau sumbu X/Y)."

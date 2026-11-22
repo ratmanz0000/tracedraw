@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "Le X du repère sur la feuille, en millimètres ; Entrée y dé
 gk42.mm_y_tip = "Le Y du repère sur la feuille, en millimètres ; Entrée y déplace le repère."
 gk42.gk_x_tip = "L'abscisse (est) vraie du repère en GK-42, en mètres."
 gk42.gk_y_tip = "L'ordonnée (nord) vraie du repère en GK-42, en mètres."
+gk42.bad_axes = "Le sens des coordonnées ne correspond pas à la position des repères 1 et 2 sur la feuille (vérifiez leur ordre ou les axes X/Y)."

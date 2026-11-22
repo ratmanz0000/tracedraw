@@ -13,17 +13,13 @@
 
 use crate::app::App;
 use crate::i18n::{tr, trf};
-use crate::ui::tips::{keyed, RichTip};
 use crate::theme::Tokens;
-use egui::{
-    Align2, Color32, FontId, Painter, Pos2, Rect as ERect, Stroke, TextEdit, Ui, Vec2,
-};
-use tracedraw_core::gk42::{GkCalibration, GkPoint, GkTransform, zone_of};
-use tracedraw_core::geometry::{Point, Rect};
-use tracedraw_core::{
-    Color, Command, Document, Fill, LayerId, ShapeId, Stroke as CoreStroke,
-};
+use crate::ui::tips::{keyed, RichTip};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect as ERect, Stroke, TextEdit, Ui, Vec2};
 use tracedraw_core::document::{Shape, ShapeKind};
+use tracedraw_core::geometry::{Point, Rect};
+use tracedraw_core::gk42::{zone_of, GkCalibration, GkPoint, GkTransform};
+use tracedraw_core::{Color, Command, Document, Fill, LayerId, ShapeId, Stroke as CoreStroke};
 
 /// The page coordinates of the marker rows and the picked rows go out
 /// with two decimals; the GK-42 metres with centimetre precision.
@@ -132,7 +128,10 @@ fn marker_layer(app: &mut App) -> Option<LayerId> {
             }
         }
     }
-    app.run(Command::AddLayer { page, name: name.clone() });
+    app.run(Command::AddLayer {
+        page,
+        name: name.clone(),
+    });
     app.doc()
         .page(page)
         .ok()?
@@ -158,7 +157,10 @@ fn place_marker(app: &mut App, p: Point, second: bool) -> bool {
         Color::rgb8(214, 48, 49)
     });
     shape.stroke = Some(CoreStroke::hairline(Color::BLACK));
-    shape.name = Some(trf("gk42.marker_name", &[("n", if second { "2" } else { "1" })]));
+    shape.name = Some(trf(
+        "gk42.marker_name",
+        &[("n", if second { "2" } else { "1" })],
+    ));
     app.run(Command::AddShape { layer, shape });
     if second {
         app.map_gk42.marker2 = Some(id);
@@ -214,10 +216,10 @@ pub fn transform_of(doc: &Document) -> Option<(GkTransform, GkCalibration)> {
 }
 
 /// Resolve typed `(x1, y1)` and `(x2, y2)` into geodetic `(northing, easting)`
-/// pairs: accepts standard GK-42 `(X = northing, Y = easting)` first, and
-/// also handles `(easting, northing)` when the first pair carries multi-digit
-/// zone eastings (>= 10 500 000 m, impossible as a meridian distance from the
-/// equator) or when opposite-sign marker axes only calibrate that way.
+/// pairs: checks both `(Northing, Easting)` and `(Easting, Northing)` against
+/// the markers' positions AND zone agreement, so a 7-digit northing crossing a
+/// million boundary (e.g. `5998000` -> `6002000`) when typed second does not
+/// cause a false `zone_mismatch` when the first column shares one zone.
 fn oriented_gk(
     i1: ShapeId,
     i2: ShapeId,
@@ -235,18 +237,70 @@ fn oriented_gk(
         gk1: GkPoint { x: a1, y: b1 },
         gk2: GkPoint { x: a2, y: b2 },
     };
+    let zones_ok = |cal: &GkCalibration| match (zone_of(cal.gk1.y), zone_of(cal.gk2.y)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    let direct = build(x1, y1, x2, y2);
+    let swapped = build(y1, x1, y2, x2);
+    let direct_valid = direct.transform_at(p1, p2).is_some();
+    let swapped_valid = swapped.transform_at(p1, p2).is_some();
     let clearly_easting_first =
         x1 >= 10_500_000.0 && x2 >= 10_500_000.0 && y1 < 10_500_000.0 && y2 < 10_500_000.0;
-    if clearly_easting_first && build(y1, x1, y2, x2).transform_at(p1, p2).is_some() {
-        return (GkPoint { x: y1, y: x1 }, GkPoint { x: y2, y: x2 });
+    if clearly_easting_first && swapped_valid {
+        return (swapped.gk1, swapped.gk2);
     }
-    if build(x1, y1, x2, y2).transform_at(p1, p2).is_some() {
-        return (GkPoint { x: x1, y: y1 }, GkPoint { x: x2, y: y2 });
+    if direct_valid && zones_ok(&direct) {
+        return (direct.gk1, direct.gk2);
     }
-    if build(y1, x1, y2, x2).transform_at(p1, p2).is_some() {
-        return (GkPoint { x: y1, y: x1 }, GkPoint { x: y2, y: x2 });
+    if swapped_valid && zones_ok(&swapped) {
+        return (swapped.gk1, swapped.gk2);
     }
-    (GkPoint { x: x1, y: y1 }, GkPoint { x: x2, y: y2 })
+    if direct_valid {
+        return (direct.gk1, direct.gk2);
+    }
+    if swapped_valid {
+        return (swapped.gk1, swapped.gk2);
+    }
+    (direct.gk1, direct.gk2)
+}
+
+/// Diagnose why the currently typed 4 coordinates do not resolve with `p1`/`p2`,
+/// returning `None` when the inputs are incomplete or valid.
+fn diagnose_draft(app: &App) -> Option<&'static str> {
+    let st = &app.map_gk42;
+    let i1 = marker_id(app, true)?;
+    let i2 = marker_id(app, false)?;
+    let p1 = marker_position(app.doc(), i1)?;
+    let p2 = marker_position(app.doc(), i2)?;
+    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+        parse_m(&st.gk1.0),
+        parse_m(&st.gk1.1),
+        parse_m(&st.gk2.0),
+        parse_m(&st.gk2.1),
+    ) else {
+        return None;
+    };
+    if (p2.x - p1.x).abs() < 1e-9 || (p2.y - p1.y).abs() < 1e-9 {
+        return Some("gk42.broken");
+    }
+    let (gk1, gk2) = oriented_gk(i1, i2, p1, p2, x1, y1, x2, y2);
+    if let (Some(a), Some(b)) = (zone_of(gk1.y), zone_of(gk2.y)) {
+        if a != b {
+            return Some("gk42.zone_mismatch");
+        }
+    }
+    let cal = GkCalibration {
+        layer: LayerId(0),
+        marker1: i1,
+        marker2: i2,
+        gk1,
+        gk2,
+    };
+    if cal.transform_at(p1, p2).is_none() {
+        return Some("gk42.bad_axes");
+    }
+    None
 }
 
 /// The transform the panel and cursor readout use: the markers' positions
@@ -367,6 +421,29 @@ fn parse_draft(app: &mut App) -> Option<(ShapeId, ShapeId, GkPoint, GkPoint)> {
             return None;
         }
     }
+    match (p1, p2) {
+        (Some(a), Some(b)) => {
+            if (b.x - a.x).abs() < 1e-9 || (b.y - a.y).abs() < 1e-9 {
+                st.error = Some(tr("gk42.broken"));
+                return None;
+            }
+            let check = GkCalibration {
+                layer: LayerId(0),
+                marker1: i1,
+                marker2: i2,
+                gk1,
+                gk2,
+            };
+            if check.transform_at(a, b).is_none() {
+                st.error = Some(tr("gk42.bad_axes"));
+                return None;
+            }
+        }
+        _ => {
+            st.error = Some(tr("gk42.broken"));
+            return None;
+        }
+    }
     st.error = None;
     Some((i1, i2, gk1, gk2))
 }
@@ -441,10 +518,7 @@ pub fn parse_m(s: &str) -> Option<f64> {
     if cleaned.is_empty() {
         return None;
     }
-    cleaned
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
+    cleaned.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 /// Grouping an integer part by thousands: 6519000 to "6 519 000".
@@ -559,7 +633,12 @@ fn plate(painter: &Painter, anchor: Pos2, lines: &[String]) {
     let line_h = 15.0;
     let w = lines
         .iter()
-        .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x)
+        .map(|l| {
+            painter
+                .layout_no_wrap(l.clone(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
         .fold(0.0, f32::max)
         + 10.0;
     let h = line_h * lines.len() as f32 + 8.0;
@@ -718,10 +797,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
             Some((t, _)) => {
                 ui.label(trf(
                     "gk42.scale_line",
-                    &[
-                        ("sx", &fmt_1n(t.scale_x())),
-                        ("sy", &fmt_1n(t.scale_y())),
-                    ],
+                    &[("sx", &fmt_1n(t.scale_x())), ("sy", &fmt_1n(t.scale_y()))],
                 ));
                 let zone = saved.as_ref().and_then(|c| c.zone());
                 ui.label(trf(
@@ -738,10 +814,14 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
                 ));
             }
             None => {
-                ui.label(
-                    rt(tr("gk42.none"))
-                        .color(Tokens::text_dim()),
-                );
+                ui.label(rt(tr("gk42.none")).color(Tokens::text_dim()));
+                if let Some(err_key) = diagnose_draft(app) {
+                    ui.label(
+                        rt(tr(err_key))
+                            .color(Color32::from_rgb(230, 90, 90))
+                            .size(11.0),
+                    );
+                }
             }
         }
     });
@@ -769,7 +849,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
             ui.label(dim(&tr("gk42.table_n")));
             ui.scope(|ui| {
                 ui.set_min_width(mm_w);
-                ui.label(dim(&tr("gk42.table_mm")));
+                ui.label(dim(&format!("{} X", tr("gk42.table_mm"))));
             });
             ui.scope(|ui| {
                 ui.set_min_width(mm_w);
@@ -777,7 +857,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
             });
             ui.scope(|ui| {
                 ui.set_min_width(gk_w);
-                ui.label(dim(&tr("gk42.table_gk")));
+                ui.label(dim(&format!("{} X", tr("gk42.table_gk"))));
             });
             ui.scope(|ui| {
                 ui.set_min_width(gk_w);
@@ -858,8 +938,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
         {
             reset(app);
         }
-        let can_apply =
-            marker_id(app, true).is_some() && marker_id(app, false).is_some();
+        let can_apply = marker_id(app, true).is_some() && marker_id(app, false).is_some();
         let r = ui
             .add_enabled(can_apply, egui::Button::new(tr("gk42.apply")))
             .rich_tip_always(keyed("gk42.apply"));
@@ -912,7 +991,9 @@ fn chip(ui: &mut Ui, done: bool, key: &str) {
 }
 
 fn dim(text: &str) -> egui::RichText {
-    egui::RichText::new(text).color(Tokens::text_dim()).size(11.0)
+    egui::RichText::new(text)
+        .color(Tokens::text_dim())
+        .size(11.0)
 }
 
 fn rt(text: impl Into<String>) -> egui::RichText {
@@ -1012,7 +1093,11 @@ fn picked_row(
     let g = t.to_gk(p);
     ui.label(dim(&fmt_gk_plain(g.x)));
     ui.label(dim(&fmt_gk_plain(g.y)));
-    let prev = if k == 0 { mm1 } else { st.picked.get(k - 1).copied() };
+    let prev = if k == 0 {
+        mm1
+    } else {
+        st.picked.get(k - 1).copied()
+    };
     ui.label(match prev {
         Some(prev) => dim(&fmt_gk_plain(delta_m(prev, p, t))),
         None => dim(""),
@@ -1104,7 +1189,9 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
     let t = preview_transform(app).map(|(t, _)| t);
     for (n, id) in [(1, marker_id(app, true)), (2, marker_id(app, false))] {
         let Some(id) = id else { continue };
-        let Some(p) = marker_position(doc, id) else { continue };
+        let Some(p) = marker_position(doc, id) else {
+            continue;
+        };
         let (gx, gy, d) = match &t {
             Some(t) => {
                 let g = t.to_gk(p);
@@ -1112,15 +1199,7 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
             }
             None => (String::new(), String::new(), String::new()),
         };
-        out.push_str(&[
-            n.to_string(),
-            mm(p.x),
-            mm(p.y),
-            gx,
-            gy,
-            d,
-        ]
-        .join(&sep.to_string()));
+        out.push_str(&[n.to_string(), mm(p.x), mm(p.y), gx, gy, d].join(&sep.to_string()));
         out.push('\n');
     }
     for (k, p) in st.picked.iter().enumerate() {
@@ -1132,20 +1211,14 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
                 } else {
                     st.picked.get(k - 1).copied()
                 };
-                let d = prev.map(|prev| fmt(delta_m(prev, *p, t))).unwrap_or_default();
+                let d = prev
+                    .map(|prev| fmt(delta_m(prev, *p, t)))
+                    .unwrap_or_default();
                 (fmt(g.x), fmt(g.y), d)
             }
             None => (String::new(), String::new(), String::new()),
         };
-        out.push_str(&[
-            (k + 1).to_string(),
-            mm(p.x),
-            mm(p.y),
-            gx,
-            gy,
-            d,
-        ]
-        .join(&sep.to_string()));
+        out.push_str(&[(k + 1).to_string(), mm(p.x), mm(p.y), gx, gy, d].join(&sep.to_string()));
         out.push('\n');
     }
     out
@@ -1209,12 +1282,21 @@ mod tests {
             north: 12.0,
             north_off: 0.0,
         };
-        assert_eq!(delta_m(Point::new(0.0, 0.0), Point::new(3.0, 0.0), &t), 30.0);
-        assert_eq!(delta_m(Point::new(0.0, 0.0), Point::new(0.0, 3.0), &t), 36.0);
+        assert_eq!(
+            delta_m(Point::new(0.0, 0.0), Point::new(3.0, 0.0), &t),
+            30.0
+        );
+        assert_eq!(
+            delta_m(Point::new(0.0, 0.0), Point::new(0.0, 3.0), &t),
+            36.0
+        );
         // 3 and 4 scale along their own axes (30 and 48) before the sum
         // goes under the root, so the diagonal is not a 3-4-5 any more.
         assert!(
-            (delta_m(Point::new(0.0, 0.0), Point::new(3.0, 4.0), &t) - (30.0f64 * 30.0 + 48.0 * 48.0).sqrt()).abs() < 1e-9
+            (delta_m(Point::new(0.0, 0.0), Point::new(3.0, 4.0), &t)
+                - (30.0f64 * 30.0 + 48.0 * 48.0).sqrt())
+            .abs()
+                < 1e-9
         );
     }
 
@@ -1348,5 +1430,30 @@ mod tests {
         set_mode(&mut app, false);
         let after = cursor_lines(&app).expect("cursor lines with mode off");
         assert_eq!(after, before);
+    }
+
+    /// 7-digit (Easting, Northing) pairs where Northing crosses a million
+    /// boundary resolve through the zone-consistent orientation instead of
+    /// failing with zone_mismatch, and inverted marker axes are rejected with
+    /// an explicit error rather than saved broken.
+    #[test]
+    fn seven_digit_easting_first_and_inverted_axes() {
+        let mut app = App::headless();
+        set_mode(&mut app, true);
+        click(&mut app, Point::new(50.0, 50.0));
+        click(&mut app, Point::new(150.0, 150.0));
+        // (Easting, Northing) 7-digit inputs where Northing crosses 6 000 000.
+        app.map_gk42.gk1 = ("4312000".into(), "5998000".into());
+        app.map_gk42.gk2 = ("4316000".into(), "6002000".into());
+        assert!(apply(&mut app), "error: {:?}", app.map_gk42.error);
+        let (t, cal) = transform_of(app.doc()).expect("valid calibration");
+        assert_eq!(cal.zone(), Some(4));
+        assert!((t.east - 40.0).abs() < 1e-9);
+        assert!((t.north - 40.0).abs() < 1e-9);
+        // Inverted north axis: rejected with explicit error, doc unchanged.
+        app.map_gk42.gk1 = ("6002000".into(), "4312000".into());
+        app.map_gk42.gk2 = ("5998000".into(), "4316000".into());
+        assert!(!apply(&mut app));
+        assert_eq!(app.map_gk42.error, Some(tr("gk42.bad_axes")));
     }
 }

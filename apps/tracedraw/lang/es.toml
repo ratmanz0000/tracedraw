@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "La X del marcador en la hoja, en milímetros; Enter mueve el ma
 gk42.mm_y_tip = "La Y del marcador en la hoja, en milímetros; Enter mueve el marcador ahí."
 gk42.gk_x_tip = "La coordenada este verdadera del marcador en GK-42, en metros."
 gk42.gk_y_tip = "La coordenada norte verdadera del marcador en GK-42, en metros."
+gk42.bad_axes = "La dirección de las coordenadas no coincide con la posición de los marcadores 1 y 2 en la hoja (revise el orden o los ejes X/Y)."

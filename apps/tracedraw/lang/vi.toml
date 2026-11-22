@@ -10816,3 +10816,4 @@ gk42.mm_y_tip = "The marker's Y on the sheet, in millimetres; Enter moves the ma
 gk42.gk_x_tip = "The marker's true GK-42 easting, in metres."
 gk42.gk_y_tip = "The marker's true GK-42 northing, in metres."
 toolbar.gk42_desc = "Ties the sheet's millimetres to true GK-42 metres with two reference markers; clicks on the sheet place them and pick points."
+gk42.bad_axes = "Chiều tọa độ không khớp với vị trí điểm đánh dấu 1 và 2 trên trang (kiểm tra thứ tự điểm hoặc trục X/Y)."

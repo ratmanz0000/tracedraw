@@ -10820,3 +10820,4 @@ gk42.mm_x_tip = "İşaretin sayfadaki X'i, milimetre cinsinden; Enter işareti o
 gk42.mm_y_tip = "İşaretin sayfadaki Y'si, milimetre cinsinden; Enter işareti oraya taşır."
 gk42.gk_x_tip = "İşaretin gerçek GK-42 doğu koordinatı, metre cinsinden."
 gk42.gk_y_tip = "İşaretin gerçek GK-42 kuzey koordinatı, metre cinsinden."
+gk42.bad_axes = "Koordinatların yönü sayfadaki 1 ve 2 numaralı işaretlerin konumuyla uyuşmuyor (işaret sırasını veya X/Y eksenlerini kontrol edin)."
