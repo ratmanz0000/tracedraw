@@ -4145,6 +4145,7 @@ impl App {
             hyphenate: self.text_hyphenation,
             ..Default::default()
         };
+        let clean_rev = self.engine.revision();
         if let Some(id) = self.new_shape(ShapeKind::Text {
             spans: vec![span],
             origin: Point::ZERO,
@@ -4162,6 +4163,7 @@ impl App {
             self.note_text_path_source(id, path_id);
             self.text_edit = Some(crate::app::TextEdit::at_end(id, 0));
             self.select(vec![id]);
+            self.note_fresh_text_edit(id, clean_rev);
         }
     }
 

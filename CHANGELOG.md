@@ -6,6 +6,7 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Text tool: typing on a heavy page keeps the page picture cached and draws only the edited text as an overlay in the same frame as the caret, `Engine::amend` mutates isolated text edits in place without cloning the drawing or walking every object, and obsolete main-canvas render jobs cancel as soon as a newer revision arrives (#3902, #3903, #3904).
 - Welcome screen: drawings on a network share or a USB drive show their folder as typed, without the `\\?\UNC\` or `\\?\` in front (#3812).
 - Colour Eyedropper: with Treat All Objects as Filled, an unfilled object lying over others no longer keeps the colour beneath it from being read; inside it the object beneath is read, on its outline its outline colour (#3856).
 - Text tool: over the outline of a curve inside a group (or a clip frame) the tool offers to type along it, as on a loose curve, and a click starts the text on it (#3864).
