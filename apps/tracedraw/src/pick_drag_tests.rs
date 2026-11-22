@@ -14924,6 +14924,67 @@ fn a_fast_wheel_turn_glides_shorter() {
     assert!((total - 1.15f32.powi(3)).abs() < 0.01, "{total}");
 }
 
+/// The wheel's glide: the picture on the way is drawn for the view the
+/// glide lands at, and the view is put at that view when the glide ends,
+/// so the landing is sharp on the render the glide asked for, and no
+/// render starts for the landing after it.
+#[test]
+fn the_wheel_glide_lands_sharp_without_a_render_after_it() {
+    let (ctx, mut app, _) = setup();
+    assert!(app.settings.smooth_zoom);
+    let at = Pos2::new(700.0, 500.0);
+    let mut t = 10.0;
+    let mut step = |app: &mut App, events: Vec<Event>| {
+        t += 1.0 / 60.0;
+        wheel_frame(&ctx, app, t, events);
+    };
+    step(&mut app, vec![Event::PointerMoved(at)]);
+    step(&mut app, vec![Event::PointerMoved(at)]);
+    // The first picture drawn, the view at rest.
+    for _ in 0..30 {
+        step(&mut app, Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let z0 = app.view.zoom;
+    step(&mut app, vec![notch()]);
+    // The glide is aimed a step ahead of the frames, and the canvas asks
+    // for the picture of that landing.
+    let aim = app.zoom_glide.target_view().expect("the glide aims at a view");
+    assert!((aim.zoom / z0 - 1.15).abs() < 1e-3, "{}", aim.zoom / z0);
+    // The glide ends: the view lands on the aim.
+    for _ in 0..120 {
+        step(&mut app, Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if !app.zoom_glide.active() {
+            break;
+        }
+    }
+    assert!(!app.zoom_glide.active(), "the glide ends");
+    // The landing is sharp on the picture drawn for it, to the bit.
+    for _ in 0..200 {
+        if app.raster.borrow().picture_zoom() == Some(app.view.zoom) {
+            break;
+        }
+        step(&mut app, Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(app.raster.borrow().picture_zoom(), Some(app.view.zoom));
+    assert_eq!(app.view.zoom, aim.zoom, "the landing zoom, to the bit");
+    assert_eq!(app.view.origin, aim.origin, "the landing place, to the bit");
+    // And nothing is drawn for the landing after it: the render the
+    // glide asked for is the one the landing shows.
+    let settled = app.raster.borrow().render_count();
+    for _ in 0..15 {
+        step(&mut app, Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        app.raster.borrow().render_count(),
+        settled,
+        "a render after the landing"
+    );
+}
+
 /// Options > Zoom/Pan: Smooth zoom off zooms a notch at once, and the
 /// zoom step sets how much (#1648, #895).
 #[test]
@@ -14976,8 +15037,9 @@ fn smooth_zoom_off_zooms_the_fixed_step_at_once() {
 /// Light zoom (Options > Tools > Zoom/Pan, turned on by Help >
 /// Benchmark on slow computers): a notch zooms at once, without the
 /// glide, and a turn of three notches draws the drawing anew once, after
-/// the zoom stops; with the glide every frame of it starts a new render
-/// (each giving up the last one).
+/// the zoom stops; with the glide the picture is drawn for the view the
+/// glide lands at, and the steps of the turn wait for the render on its
+/// way instead of starting one each.
 #[test]
 fn light_zoom_draws_once_per_wheel_turn() {
     let renders_of_a_turn = |light: bool| {
@@ -16854,6 +16916,35 @@ fn alignment_keys_while_typing() {
     }
 }
 
+/// A page of `n` wavy paths spread over the page, for the burst benches.
+fn burst_page(app: &mut App, n: usize) {
+    let mut s = 7u64;
+    let mut r = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f64) / (1u64 << 31) as f64
+    };
+    for _ in 0..n {
+        let (x, y) = (r() * 200.0, r() * 280.0);
+        let mut p = tracedraw_core::geometry::BezPath::new();
+        p.move_to((x, y));
+        for _ in 0..6 {
+            p.curve_to(
+                (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
+                (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
+                (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
+            );
+        }
+        p.close_path();
+        app.new_shape(ShapeKind::Path {
+            path: p,
+            closed: true,
+        });
+    }
+    app.select(Vec::new());
+}
+
 /// Bursts of wheel zoom on a medium (1000 objects) and a heavy (5000
 /// objects) page, at 60 frames a second in real time: five notches in a
 /// row, each a glide of four frames (as the smoothed wheel zooms), about
@@ -16868,31 +16959,7 @@ fn alignment_keys_while_typing() {
 fn frame_times_of_a_zoom_burst() {
     for (label, n) in [("medium", 1000usize), ("heavy", 5000)] {
         let (ctx, mut app, _) = setup();
-        let mut s = 7u64;
-        let mut r = || {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((s >> 33) as f64) / (1u64 << 31) as f64
-        };
-        for _ in 0..n {
-            let (x, y) = (r() * 200.0, r() * 280.0);
-            let mut p = tracedraw_core::geometry::BezPath::new();
-            p.move_to((x, y));
-            for _ in 0..6 {
-                p.curve_to(
-                    (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
-                    (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
-                    (x + r() * 20.0 - 10.0, y + r() * 20.0 - 10.0),
-                );
-            }
-            p.close_path();
-            app.new_shape(ShapeKind::Path {
-                path: p,
-                closed: true,
-            });
-        }
-        app.select(Vec::new());
+        burst_page(&mut app, n);
         let start = std::time::Instant::now();
         let tick = std::time::Duration::from_secs_f64(1.0 / 60.0);
         let mut next = start;
@@ -16979,6 +17046,300 @@ fn frame_times_of_a_zoom_burst() {
             blur_worst
         );
     }
+}
+
+/// The same bursts as `frame_times_of_a_zoom_burst`, zoomed by the wheel
+/// itself: five notches a beat apart, each smoothed wheel notch a glide
+/// (`ui::root`), so the picture on the way is drawn for the view the
+/// glide lands at. Reports the frame times over the whole turn (the
+/// notches and the glide to its end), the blowup, and the time from the
+/// last notch to the sharp picture. Run with
+/// `cargo test --release -p tracedraw --lib -- --ignored frame_times_of_a_wheel_turn --nocapture`.
+#[test]
+#[ignore]
+fn frame_times_of_a_wheel_turn() {
+    for (label, n) in [("medium", 1000usize), ("heavy", 5000)] {
+        let (ctx, mut app, _) = setup();
+        burst_page(&mut app, n);
+        let start = std::time::Instant::now();
+        let tick = std::time::Duration::from_secs_f64(1.0 / 60.0);
+        let mut next = start;
+        let mut timed = |app: &mut App, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(1600.0, 1000.0),
+                )),
+                events,
+                time: Some(start.elapsed().as_secs_f64()),
+                ..Default::default()
+            };
+            let t = std::time::Instant::now();
+            let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+            out.textures_delta.clear();
+            let d = t.elapsed();
+            next += tick;
+            let now = std::time::Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            } else {
+                next = now;
+            }
+            d
+        };
+        let sharp = |app: &App| {
+            let r = app.raster.borrow();
+            !r.drawing() && r.picture_zoom() == Some(app.view.zoom)
+        };
+        let blowup = |app: &App| {
+            let z = app.raster.borrow().picture_zoom().unwrap_or(app.view.zoom);
+            app.view.zoom / z
+        };
+        app.zoom_to_page();
+        timed(&mut app, vec![Event::PointerMoved(Pos2::new(800.0, 500.0))]);
+        for _ in 0..600 {
+            timed(&mut app, Vec::new());
+            if sharp(&app) {
+                break;
+            }
+        }
+        let at = app.canvas_rect.center();
+        let turn = vec![Event::PointerMoved(at), notch()];
+        let (mut frames, mut sum, mut worst) =
+            (0u32, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut blur_sum, mut blur_worst) = (0.0f32, 1.0f32);
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            // Five notches, one every four frames: a turn of about four
+            // notches a second.
+            let mut last_notch = std::time::Instant::now();
+            for i in 0..20 {
+                let notch_frame = i % 4 == 0;
+                if notch_frame {
+                    last_notch = std::time::Instant::now();
+                }
+                let d = timed(&mut app, if notch_frame { turn.clone() } else { Vec::new() });
+                frames += 1;
+                sum += d;
+                worst = worst.max(d);
+                let b = blowup(&app);
+                blur_sum += b;
+                blur_worst = blur_worst.max(b);
+            }
+            // The glide runs out; the picture drawn for its landing comes.
+            for _ in 0..600 {
+                let d = timed(&mut app, Vec::new());
+                frames += 1;
+                sum += d;
+                worst = worst.max(d);
+                let b = blowup(&app);
+                blur_sum += b;
+                blur_worst = blur_worst.max(b);
+                if sharp(&app) {
+                    break;
+                }
+            }
+            waits.push(last_notch.elapsed().as_millis());
+            // Back out to where the turn started, drawn and at rest.
+            app.view.zoom_at(at, 1.0 / 1.15f32.powi(5));
+            for _ in 0..600 {
+                timed(&mut app, Vec::new());
+                if sharp(&app) {
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "wheel turn, {label} page ({n} objects): {:?} per frame, worst {:?}; \
+             picture blown up {:.2}x on average, {:.2}x at worst; \
+             last notch to sharp, ms: {waits:?}",
+            sum / frames,
+            worst,
+            blur_sum / frames as f32,
+            blur_worst
+        );
+    }
+}
+
+/// A dark design zoomed in, then zoomed out by the wheel (#2048): the
+/// picture covers the canvas only, so until the new one is ready the old
+/// one shows scaled into place over a small part of the page. The rest of
+/// the page showed as blank white paper meanwhile, a flash at every
+/// step; it shows the whole page drawn small, kept from when the view
+/// rested. At rest the backdrop is not painted at all.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn zooming_out_shows_the_whole_page_small_where_the_picture_does_not_reach() {
+    let (ctx, mut app, _) = setup();
+    let size = app.page_size();
+    let id = app
+        .new_shape(ShapeKind::Rect {
+            rect: Rect::new(0.0, 0.0, size.width, size.height),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![id]);
+    app.apply_fill(tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(
+        0, 0, 0,
+    )));
+    app.select(Vec::new());
+    app.zoom_to_page();
+    until_the_page_is_drawn(&ctx, &mut app);
+    let fitted = app.view.zoom;
+    let at = app.canvas_rect.center();
+    app.view.zoom_at(at, 8.0);
+    // One frame at the real time; what it painted with `texture`, as
+    // (clip, rectangle) pairs.
+    let start = std::time::Instant::now();
+    let painted = |app: &mut App, texture: Option<egui::TextureId>| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            time: Some(start.elapsed().as_secs_f64()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter(|c| texture.is_some() && Some(c.shape.texture_id()) == texture)
+            .map(|c| c.clip_rect.intersect(c.shape.visual_bounding_rect()))
+            .collect::<Vec<_>>()
+    };
+    let revision = app.engine.revision();
+    let mut ready = false;
+    for _ in 0..600 {
+        painted(&mut app, None);
+        if app.raster.borrow().has_backdrop(revision) && !app.raster.borrow().drawing() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready, "the backdrop came once the view rested");
+    let back = app.raster.borrow().backdrop_texture();
+    assert!(back.is_some());
+    // At rest the picture covers the canvas: no backdrop painted.
+    assert!(painted(&mut app, back).is_empty());
+    // A wheel step out: the page now shows whole, the old picture on a
+    // small part of it.
+    assert!(
+        (app.view.zoom / fitted - 8.0).abs() < 0.01,
+        "still zoomed in"
+    );
+    let renders = app.raster.borrow().render_count();
+    app.view.zoom_at(at, 1.0 / 8.0);
+    let parts = painted(&mut app, back);
+    assert!(
+        app.raster.borrow().drawing(),
+        "the new picture is on its way"
+    );
+    assert_eq!(app.raster.borrow().render_count(), renders + 1);
+    let paper = app
+        .view
+        .rect_to_screen(app.page_rect())
+        .intersect(app.canvas_rect);
+    let covered: f32 = parts.iter().map(|r| r.intersect(paper).area()).sum();
+    let old = app
+        .view
+        .rect_to_screen(app.raster.borrow().shown_part().expect("picture"))
+        .intersect(paper);
+    assert!(old.area() < paper.area() / 10.0, "{old:?} of {paper:?}");
+    assert!(
+        covered + old.area() > paper.area() * 0.98,
+        "the backdrop covers {covered} and the old picture {} of {}",
+        old.area(),
+        paper.area()
+    );
+    // The two never overlap (see-through objects would show twice).
+    for r in &parts {
+        assert!(
+            r.intersect(old.shrink(1.0)).area() < 1.0,
+            "{r:?} over {old:?}"
+        );
+    }
+}
+
+/// A drawing laid out beside a small page (#2354): zoomed out, what is
+/// drawn off the page shows from the backdrop at once, not only once the
+/// new picture comes piece by piece.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn zooming_out_shows_what_is_drawn_beside_the_page_at_once() {
+    let (ctx, mut app, _) = setup();
+    let size = app.page_size();
+    let beside = Rect::new(size.width * 1.2, 0.0, size.width * 1.8, size.height);
+    let id = app
+        .new_shape(ShapeKind::Rect {
+            rect: beside,
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![id]);
+    app.apply_fill(tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(
+        0, 0, 0,
+    )));
+    app.select(Vec::new());
+    // The backdrop reaches what is drawn beside the page, and no farther
+    // than its reach.
+    let revision = app.engine.revision();
+    let area = app.backdrop_area(revision);
+    assert!(
+        area.contains(beside.origin()) && area.x1 >= beside.x1 - 1e-6,
+        "{area:?}"
+    );
+    app.zoom_to_page();
+    app.view.zoom_at(app.canvas_rect.center(), 0.5);
+    until_the_page_is_drawn(&ctx, &mut app);
+    let at = app.canvas_rect.center();
+    app.view.zoom_at(at, 8.0);
+    let start = std::time::Instant::now();
+    let painted = |app: &mut App, texture: Option<egui::TextureId>| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            time: Some(start.elapsed().as_secs_f64()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter(|c| texture.is_some() && Some(c.shape.texture_id()) == texture)
+            .map(|c| c.clip_rect.intersect(c.shape.visual_bounding_rect()))
+            .collect::<Vec<_>>()
+    };
+    let mut ready = false;
+    for _ in 0..600 {
+        painted(&mut app, None);
+        if app.raster.borrow().has_backdrop(revision) && !app.raster.borrow().drawing() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready, "the backdrop came once the view rested");
+    let back = app.raster.borrow().backdrop_texture();
+    app.view.zoom_at(at, 1.0 / 8.0);
+    let parts = painted(&mut app, back);
+    assert!(
+        app.raster.borrow().drawing(),
+        "the new picture is on its way"
+    );
+    let off_page = app.view.rect_to_screen(beside).intersect(app.canvas_rect);
+    assert!(off_page.area() > 100.0, "{off_page:?} on screen");
+    let covered: f32 = parts.iter().map(|r| r.intersect(off_page).area()).sum();
+    assert!(
+        covered > off_page.area() * 0.98,
+        "the backdrop covers {covered} of {} beside the page",
+        off_page.area()
+    );
 }
 
 /// Frame times while the whole page is drawn small for the backdrop

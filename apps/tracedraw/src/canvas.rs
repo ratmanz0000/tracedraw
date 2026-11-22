@@ -775,18 +775,16 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // pixels as on the CPU, so nothing drawn needs drawing again).
     #[cfg(not(target_arch = "wasm32"))]
     crate::gpu_fx::set_enabled(app.settings.gpu_effects);
+    let glide_target = app.zoom_glide.target_view();
     {
         let mut raster = app.raster.borrow_mut();
         raster.light_zoom = app.settings.light_zoom;
+        raster.zoom_target = glide_target;
         // A fill or an outline colour dragged in a colour picker: the
         // part of the page the selection covers, so each move renders
         // only it anew, not the whole page (#3559).
         let was = raster.live_region.is_some();
         raster.live_region = live_colour_region(app, preview);
-        // The drag is over: the fast path patched only what it could
-        // prove the colour changes. Forget the key, keep the picture,
-        // so the next frame renders the whole page once and nothing the
-        // patch could have missed stays stale (#3559).
         if was && raster.live_region.is_none() {
             raster.end_live_colour_drag();
         }
