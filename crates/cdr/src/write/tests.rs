@@ -10422,6 +10422,196 @@ fn symbols_are_saved_as_symbols_and_their_instances() {
     }
 }
 
+/// Symbols made the way Symbolize Similar and New Symbol make them are
+/// saved as symbols (#3250): the definition is a group (its children
+/// shifted so a corner sits at the origin), an instance may carry a
+/// label in a group, and an instance may lie inside a clip frame. The
+/// definition's objects are the `sytr` group's own (not a group around
+/// them), and the definition keeps its `usdn` even when the first
+/// instance written is the one in the clip. Opened again, the symbol
+/// and every instance are there where they stood.
+#[test]
+fn symbolize_similar_symbols_are_saved_with_their_instances() {
+    use tracedraw_core::{Command, symbols};
+    fn part(ids: &mut tracedraw_core::id::IdSource, x: f64, y: f64) -> Shape {
+        let mut r = Shape::new(
+            ids.shape(),
+            ShapeKind::Rect {
+                rect: Rect::new(x, y, x + 20.0, y + 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        r.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+        r.stroke = None;
+        r
+    }
+    fn group(
+        ids: &mut tracedraw_core::id::IdSource,
+        x: f64,
+        y: f64,
+        extra: Vec<Shape>,
+    ) -> Shape {
+        let mut children = vec![part(ids, x, y), part(ids, x, y + 20.0)];
+        children.extend(extra);
+        Shape::new(ids.shape(), ShapeKind::Group { children })
+    }
+    let mut doc = Document::new("w", Size::new(200.0, 100.0));
+    let mut ids = doc.ids().clone();
+    let mut label = Shape::new(
+        ids.shape(),
+        ShapeKind::Text {
+            spans: vec![TextSpan::new("Label", "Arial", 12.0)],
+            origin: Point::new(140.0, 42.0),
+            frame: None,
+            align: TextAlign::Left,
+            para: ParagraphStyle::default(),
+            on_path: None,
+        },
+    );
+    label.fill = Fill::Solid(Color::BLACK);
+    label.stroke = None;
+    let mut frame = Shape::new(
+        ids.shape(),
+        ShapeKind::Rect {
+            rect: Rect::new(35.0, 55.0, 85.0, 95.0),
+            radius: 0.0,
+            corners: None,
+        },
+    );
+    frame.fill = Fill::None;
+    frame.stroke = None;
+    let in_clip = Shape::new(
+        ids.shape(),
+        ShapeKind::ClipFrame {
+            frame: Box::new(frame),
+            contents: vec![group(&mut ids, 40.0, 60.0, Vec::new())],
+        },
+    );
+    doc.pages[0].layers[0].shapes = vec![
+        group(&mut ids, 10.0, 10.0, Vec::new()),
+        group(&mut ids, 80.0, 10.0, Vec::new()),
+        group(&mut ids, 140.0, 10.0, vec![label]),
+        in_clip,
+    ];
+    // The plan and the shapes the app's Symbolize Similar runs.
+    let sample = doc.pages[0].layers[0].shapes[0].clone();
+    let (graphics, _) = symbols::split_group(&sample).expect("a group");
+    let graphics: Vec<Shape> = graphics.into_iter().cloned().collect();
+    let refs: Vec<&Shape> = graphics.iter().collect();
+    let plan = symbols::plan_graphics(&doc, &refs, Some("Logo")).expect("a plan");
+    assert_eq!(plan.matches.len(), 4, "every copy, the clip's included");
+    assert!(plan.new_symbol.is_some(), "a new definition");
+    assert!(matches!(
+        plan.new_symbol.as_ref().expect("the definition").shape.kind,
+        ShapeKind::Group { .. }
+    ));
+    let cmds = symbols::commands(&plan, || ids.shape());
+    for c in &cmds {
+        match c {
+            Command::AddSymbol { symbol } => doc.symbols.push(symbol.clone()),
+            Command::ReplaceShapes { replacements } => {
+                for (id, shape) in replacements {
+                    let slot = doc.find_shape_mut(*id).expect("the group still there");
+                    *slot = shape.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    doc.set_ids(ids);
+    assert_eq!(doc.symbols.len(), 1);
+    let before = instances_boxes(&doc);
+    assert_eq!(before.len(), 4, "an instance where each group stood");
+    for v in [14, 27] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, rep) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
+        assert_eq!(rep.skipped_objects, 0, "version {v}: {:?}", rep.warnings);
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
+        assert!(
+            matches!(
+                back.symbols[0].shape.kind,
+                ShapeKind::Group { .. }
+            ),
+            "version {v}: the definition is the group of its objects"
+        );
+        let after = instances_boxes(&back);
+        assert_eq!(after.len(), 4, "version {v}: every instance is back");
+        for b in &before {
+            assert!(
+                after.iter().any(|a| (a.x0 - b.x0).abs() < 0.05
+                    && (a.y0 - b.y0).abs() < 0.05
+                    && (a.x1 - b.x1).abs() < 0.05
+                    && (a.y1 - b.y1).abs() < 0.05),
+                "version {v}: {b:?} not among {after:?}"
+            );
+        }
+        // The definition's objects are the sytr group's own, as the
+        // version 15 file holds them, and the definition keeps its
+        // static id even when the clip's instance was written first.
+        let (_, tree, _) = chunk_ids(&bytes);
+        let mut saw_objects = false;
+        let mut saw_usdn = false;
+        tree.root.walk(&mut |c, _| {
+            if c.is(b"sytr") {
+                if let Some(def) = c.children.iter().find(|g| g.is(b"grp ")) {
+                    saw_objects = def.children.iter().any(|k| k.is(b"obj "));
+                    saw_usdn = def.find(b"usdn").is_some();
+                }
+            }
+        });
+        assert!(
+            saw_objects,
+            "version {v}: the sytr group holds the definition's objects"
+        );
+        assert!(saw_usdn, "version {v}: the sytr group has its usdn");
+    }
+}
+
+/// The box of every symbol instance of a drawing, in the drawing's
+/// pages, groups and clip frames, with the definition's own box placed
+/// as the instance places it.
+fn instances_boxes(doc: &Document) -> Vec<Rect> {
+    fn walk(s: &Shape, symbols: &[tracedraw_core::Symbol], out: &mut Vec<Rect>) {
+        if let ShapeKind::SymbolInstance { .. } = s.kind {
+            if let Some(b) = s
+                .expand(symbols)
+                .into_iter()
+                .map(|c| {
+                    let mut c = c;
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+            {
+                out.push(b);
+            }
+        }
+        match &s.kind {
+            ShapeKind::Group { children } => {
+                for c in children {
+                    walk(c, symbols, out);
+                }
+            }
+            ShapeKind::ClipFrame { frame, contents } => {
+                walk(frame, symbols, out);
+                for c in contents {
+                    walk(c, symbols, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for l in doc.all_layers() {
+        for s in &l.shapes {
+            walk(s, &doc.symbols, &mut out);
+        }
+    }
+    out
+}
+
 /// The document palette with its names, the spot inks, the colour styles
 /// and the object styles open again from a package, and an object keeps
 /// the object style it follows; they have no record written yet, so they

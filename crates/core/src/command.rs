@@ -202,6 +202,13 @@ pub enum Command {
     /// shift down. One undo step. A symbol cannot merge into itself, nor
     /// into one whose definition draws it.
     MergeSymbols { from: usize, to: usize },
+    /// Delete symbol `index` (the Symbols panel's X): every instance of
+    /// it, on any page or master layer, in groups and clip frames too,
+    /// goes, and so do instances of it inside other symbols' definitions.
+    /// The indices after it shift down. One undo step.
+    DeleteSymbol {
+        index: usize,
+    },
     /// Move a page to another index (Page Sorter drag).
     MovePage {
         page: PageId,
@@ -693,6 +700,7 @@ impl Command {
             Command::SetSymbolName { .. } => "Rename Symbol",
             Command::ReplaceShapes { .. } => "Replace Objects",
             Command::MergeSymbols { .. } => "Replace Symbol",
+            Command::DeleteSymbol { .. } => "Delete Symbol",
             Command::MovePage { .. } => "Move Page",
             Command::DeleteLayer { .. } => "Delete Layer",
             Command::SetLayerVisible { .. } => "Layer Visibility",
@@ -1069,6 +1077,94 @@ impl Command {
                 }
                 for sym in &mut doc.symbols {
                     shift(&mut sym.shape, from);
+                }
+            }
+            Command::DeleteSymbol { index } => {
+                if *index >= doc.symbols.len() {
+                    return Err(Error::SymbolNotFound(*index));
+                }
+                let index = *index;
+                // Every instance of the symbol, on any page or master
+                // layer, in groups and clip frames too.
+                let mut ids = Vec::new();
+                fn gather(s: &Shape, index: usize, ids: &mut Vec<ShapeId>) {
+                    match &s.kind {
+                        ShapeKind::SymbolInstance { index: i } if *i == index => ids.push(s.id),
+                        ShapeKind::Group { children } => {
+                            children.iter().for_each(|c| gather(c, index, ids));
+                        }
+                        ShapeKind::ClipFrame { frame, contents } => {
+                            gather(frame, index, ids);
+                            contents.iter().for_each(|c| gather(c, index, ids));
+                        }
+                        _ => {}
+                    }
+                }
+                for l in doc.all_layers() {
+                    for s in &l.shapes {
+                        gather(s, index, &mut ids);
+                    }
+                }
+                for layer in doc.all_layers_mut() {
+                    remove_shapes(&mut layer.shapes, &ids);
+                }
+                // A copy of it inside another symbol's definition goes
+                // too: left there it would draw a symbol that is not
+                // there. A definition that was only that instance draws
+                // nothing from then on.
+                fn strip(s: &mut Shape, index: usize) {
+                    if matches!(&s.kind, ShapeKind::SymbolInstance { index: i } if *i == index) {
+                        s.kind = ShapeKind::Group {
+                            children: Vec::new(),
+                        };
+                        return;
+                    }
+                    match &mut s.kind {
+                        ShapeKind::Group { children } => {
+                            children.retain(|c| {
+                                !matches!(&c.kind, ShapeKind::SymbolInstance { index: i } if *i == index)
+                            });
+                            for c in children.iter_mut() {
+                                strip(c, index);
+                            }
+                        }
+                        ShapeKind::ClipFrame { frame, contents } => {
+                            strip(frame, index);
+                            contents.retain(|c| {
+                                !matches!(&c.kind, ShapeKind::SymbolInstance { index: i } if *i == index)
+                            });
+                            for c in contents.iter_mut() {
+                                strip(c, index);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for sym in &mut doc.symbols {
+                    strip(&mut sym.shape, index);
+                }
+                doc.symbols.remove(index);
+                // The indices after the removed one shift down a place.
+                fn shift(s: &mut Shape, from: usize) {
+                    match &mut s.kind {
+                        ShapeKind::SymbolInstance { index } if *index > from => *index -= 1,
+                        ShapeKind::Group { children } => {
+                            children.iter_mut().for_each(|c| shift(c, from));
+                        }
+                        ShapeKind::ClipFrame { frame, contents } => {
+                            shift(frame, from);
+                            contents.iter_mut().for_each(|c| shift(c, from));
+                        }
+                        _ => {}
+                    }
+                }
+                for l in doc.all_layers_mut() {
+                    for s in &mut l.shapes {
+                        shift(s, index);
+                    }
+                }
+                for sym in &mut doc.symbols {
+                    shift(&mut sym.shape, index);
                 }
             }
             Command::MovePage { page, to } => {
@@ -5844,6 +5940,112 @@ mod tests {
         assert_eq!(index_of(&e, 1), 0);
         assert_eq!(index_of(&e, 2), 2);
         assert_eq!(index_of(&e, 4), 0);
+    }
+
+    /// Delete Symbol takes the definition and every instance with it,
+    /// nested in a group or on a master layer too; the indices after it
+    /// shift; one undo brings it all back. A symbol that is not there is
+    /// refused.
+    #[test]
+    fn deleting_a_symbol_removes_its_instances_and_shifts_indices() {
+        use crate::document::{ShapeKind, Symbol};
+        let rect = |w: f64| {
+            Shape::new(
+                ShapeId(0),
+                ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, w, 5.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            )
+        };
+        let instance =
+            |id: u64, index: usize| Shape::new(ShapeId(id), ShapeKind::SymbolInstance { index });
+        let mut e = crate::Engine::default();
+        let layer = e.document().pages[0].layers[0].id;
+        for (name, w) in [("A", 10.0), ("B", 20.0)] {
+            e.run(&Command::AddSymbol {
+                symbol: Symbol {
+                    name: name.into(),
+                    shape: rect(w),
+                },
+            })
+            .unwrap();
+        }
+        // B's definition draws an instance of A: that copy goes too.
+        e.run(&Command::SetSymbolShape {
+            index: 1,
+            shape: Shape::new(
+                ShapeId(0),
+                ShapeKind::Group {
+                    children: vec![rect(20.0), instance(0, 0)],
+                },
+            ),
+        })
+        .unwrap();
+        e.run(&Command::AddShape {
+            layer,
+            shape: instance(1, 0),
+        })
+        .unwrap();
+        let nested = Shape::new(
+            ShapeId(2),
+            ShapeKind::Group {
+                children: vec![instance(3, 0), instance(4, 1)],
+            },
+        );
+        e.run(&Command::AddShape {
+            layer,
+            shape: nested,
+        })
+        .unwrap();
+        e.run(&Command::AddMasterLayer {
+            name: "Master".into(),
+            scope: MasterScope::All,
+        })
+        .unwrap();
+        let master = e.document().master[0].id;
+        e.run(&Command::AddShape {
+            layer: master,
+            shape: instance(5, 0),
+        })
+        .unwrap();
+        assert!(e.run(&Command::DeleteSymbol { index: 7 }).is_err());
+        e.run(&Command::DeleteSymbol { index: 0 }).unwrap();
+        assert!(e.document().symbols.iter().all(|s| s.name != "A"));
+        // No instance of A (index 0) is left; B's instance, nested in the
+        // group, became B's index 0.
+        fn instances(s: &Shape, out: &mut Vec<usize>) {
+            match &s.kind {
+                ShapeKind::SymbolInstance { index } => out.push(*index),
+                ShapeKind::Group { children } => {
+                    children.iter().for_each(|c| instances(c, out));
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    instances(frame, out);
+                    contents.iter().for_each(|c| instances(c, out));
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for l in e.document().all_layers() {
+            for s in &l.shapes {
+                instances(s, &mut found);
+            }
+        }
+        assert_eq!(found, vec![0], "only B's instance is left");
+        let b = &e.document().symbols[0].shape;
+        let ShapeKind::Group { children } = &b.kind else {
+            panic!("B's definition");
+        };
+        assert_eq!(children.len(), 1, "the instance of A left B's definition");
+        e.undo();
+        assert_eq!(e.document().symbols.len(), 2);
+        assert_eq!(e.document().symbols[0].name, "A");
+        assert!(e.document().find_shape(ShapeId(1)).is_some());
+        assert!(e.document().find_shape(ShapeId(3)).is_some());
+        assert!(e.document().find_shape(ShapeId(5)).is_some());
     }
 
     /// Edit Symbol (#1980): a new definition shows in every instance at

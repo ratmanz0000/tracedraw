@@ -6,6 +6,7 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Symbols panel: each symbol's row has Revert, which turns every copy of that symbol back into ordinary objects where each copy stands (in groups, clip frames and on master layers too) and takes the unused symbol out of the panel, and an X at the right of the row, which deletes the symbol and every copy of it; both in one undo step. The panel's Revert to objects button still works on the copies selected on the canvas, and now reaches copies sitting inside a group or a clip frame as well.
 - Print Merged Document: the merged drawing is made only to be printed, so once the Print dialog and Print Preview are closed it is gone again and the drawing you merged is back in front, instead of an extra merged drawing staying open after every print or preview. Create Merged Document is the command that keeps the merged drawing (discussion #1610).
 - Cross hair to the window edges: the lines also follow the Shape tool's pointer, crossing at its tip (discussion #3268).
 - Paragraph text editing: `FontSystem` caches full `TextLayout` results with exact typed keys instead of formatting strings, `App` caches the edited text's layout across caret, non-printing marks, hit-testing and overflow checks, `text_overflows` hashes text fields without `Debug` string allocations, and frame-link lookups borrow object data without cloning (#3959, #3960).

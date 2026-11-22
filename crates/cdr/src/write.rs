@@ -5432,9 +5432,39 @@ impl<'a> Writer<'a> {
         let symbol = self.symbols.get(index)?;
         let (shape, name) = (symbol.shape.clone(), symbol.name.clone());
         self.symbols_writing.push(index);
-        let inner = self.objects(std::slice::from_ref(&shape), centre, depth + 1);
+        // The definition stands on its own, whoever names it first: an
+        // instance inside a clip container must not take the `usdn` and
+        // the zero 12000 off the definition's group and objects, which
+        // the version 15 file's definitions have.
+        let saved_clip = self.clip_depth;
+        self.clip_depth = 0;
+        // A Group definition's objects are the `sytr` group's own, as the
+        // version 15 file holds them (the objects, not a group around
+        // them): a definition made by Symbolize Similar or New Symbol is
+        // a group, and wrapped in another one the other program read a
+        // group of one group, not the symbol's objects.
+        let kids: Vec<Shape> = match &shape.kind {
+            ShapeKind::Group { children } => {
+                let t = shape.transform;
+                let opacity = shape.opacity;
+                children
+                    .iter()
+                    .map(|c| {
+                        let mut c = c.clone();
+                        c.absorb(t);
+                        c.absorb_opacity(opacity);
+                        c
+                    })
+                    .collect()
+            }
+            _ => vec![shape.clone()],
+        };
+        let inner = self.objects(&kids, centre, depth + 1);
         self.symbols_writing.pop();
-        let b = inner.bounds?;
+        let Some(b) = inner.bounds else {
+            self.clip_depth = saved_clip;
+            return None;
+        };
         let number = self.next_spnd;
         self.next_spnd += 1;
         let mut record = vec![0u8; 548];
@@ -5453,6 +5483,7 @@ impl<'a> Writer<'a> {
             )],
         ));
         body.extend(inner.nodes);
+        self.clip_depth = saved_clip;
         self.symbol_groups.push(list(b"grp ", body));
         self.symbol_numbers.insert(index, (number, b));
         Some((number, b))
