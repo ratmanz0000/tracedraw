@@ -472,6 +472,11 @@ pub enum Command {
     BreakApart {
         shape: ShapeId,
     },
+    /// Break Apart that keeps each hole with the part around it: a
+    /// letter's counter stays in the letter (#3700).
+    BreakApartKeepHoles {
+        shape: ShapeId,
+    },
     SetShadow {
         shapes: Vec<ShapeId>,
         shadow: Option<Shadow>,
@@ -737,7 +742,7 @@ impl Command {
             Command::PlaceInGroup { .. } => "Add to Group",
             Command::ReverseOrder { .. } => "Reverse Order",
             Command::Combine { .. } => "Combine",
-            Command::BreakApart { .. } => "Break Apart",
+            Command::BreakApart { .. } | Command::BreakApartKeepHoles { .. } => "Break Apart",
             Command::PlaceInside { .. } => "Place Inside Frame",
             Command::ExtractContents { .. } => "Extract Contents",
             Command::RenamePage { .. } => "Rename Page",
@@ -1658,7 +1663,8 @@ impl Command {
                 let target = &mut doc.layer_mut(layer_id)?.shapes;
                 target.insert(insert_at.min(target.len()), combined);
             }
-            Command::BreakApart { shape } => {
+            Command::BreakApart { shape } | Command::BreakApartKeepHoles { shape } => {
+                let keep_holes = matches!(self, Command::BreakApartKeepHoles { .. });
                 let (layer_id, idx) = doc.locate(*shape)?;
                 let s = doc.shape(*shape)?.1.clone();
                 // A brush stroke: its band becomes a group of plain filled
@@ -1720,6 +1726,9 @@ impl Command {
                 }
                 if !cur.elements().is_empty() {
                     parts.push(cur);
+                }
+                if keep_holes {
+                    parts = crate::shaping::islands_with_holes(parts);
                 }
                 if parts.len() < 2 {
                     return Ok(());

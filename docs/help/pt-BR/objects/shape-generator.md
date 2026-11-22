@@ -141,6 +141,9 @@ quadrados ou hexágonos formados pelo [[shapegen.tile_angle]].
   [Preencher uma forma](#fills).
 - [[shapegen.kind_slice]]: corta a seleção em faixas ou numa grade e move
   cada pedaço, veja [Fatiar uma seleção](#slice).
+- [[shapegen.kind_layer_waves]], [[shapegen.kind_blobs]] e
+  [[shapegen.kind_soft_gradient]]: fundos preenchidos nas cores que
+  você escolher, veja [Fundos](#backgrounds).
 
 Os geradores que fazem escolhas aleatórias têm uma [[shapegen.seed]]: a
 mesma semente sempre dá o mesmo resultado, e [[shapegen.new_seed]] escolhe
@@ -287,3 +290,62 @@ continua editável e as imagens mantêm os pixels; os pedaços vêm num grupo, e
 [[shapegen.slice_keep]] deixa o original no lugar.
 
 ![Um selo cortado em faixas, cada uma movida ao acaso](../../img/objects-shape-generator-slice.png)
+
+## Crescimento diferencial {#growth}
+
+Uma linha que cresce e se dobra dentro da caixa, ou dentro do contorno da
+seleção depois de [[shapegen.use_selection]]. Escolha com o que
+[[shapegen.growth_start]] (um círculo, uma linha aberta ou vários círculos),
+o [[shapegen.growth_spacing]], o quanto os pontos se afastam
+([[shapegen.growth_repel]]) e se alinham ([[shapegen.growth_align]]), e o
+[[shapegen.growth_rate]].
+
+Clique em [[shapegen.growth_run]] para ver crescer na pré-visualização, ou
+pressione Espaço com o ponteiro sobre o painel; pressione de novo para
+pausar. Ele para sozinho quando o espaço enche ou o
+[[shapegen.growth_max_nodes]] é atingido. [[shapegen.growth_stop]]
+(Shift+Espaço) coloca o resultado na página como curvas.
+[[shapegen.growth_steps]] acompanha o crescimento, e os mesmos passos
+sempre fazem a mesma linha, então um crescimento pausado pode ser avançado
+à mão e Atualizar refaz o grupo exatamente igual.
+
+## Deformar e dividir por uma forma {#deform}
+
+Abra [[shapegen.deform]] e arraste na pré-visualização para criar um pino e
+puxar o desenho com ele: as linhas perto do pino acompanham, diminuindo ao
+longo do [[shapegen.warp_reach]], então anéis e ondas se curvam suavemente
+como uma impressão digital. Arraste a ponta de um pino para mudar a força ou
+o início para movê-lo, clique com o botão direito para removê-lo, e
+[[shapegen.warp_clear]] remove todos.
+
+[[shapegen.split_mode]] corta as linhas onde elas cruzam uma forma ou um
+texto: selecione-o, clique em [[shapegen.split_pick]] e escolha desenhar as
+partes de dentro com a [[shapegen.split_color]] e a [[shapegen.split_width]],
+ou manter só as partes de dentro ou de fora. Criar centraliza o desenho na
+forma escolhida, e os pedaços continuam linhas abertas.
+
+## Fundos {#backgrounds}
+
+Três geradores fazem fundos preenchidos do tamanho da caixa, nas
+[[shapegen.bg_colors]] que você escolher (adicione cores com +, remova a
+última com o botão de menos). Cada [[shapegen.seed]] dá outra variação.
+
+- [[shapegen.kind_layer_waves]]: [[shapegen.bg_layers]] faixas preenchidas
+  empilhadas de trás para a frente; a de trás, na primeira cor, preenche a
+  caixa. As bordas são ondas suaves: [[shapegen.bg_amplitude]] define a
+  altura, [[shapegen.bg_frequency]] quantas passam pela largura,
+  [[shapegen.bg_complexity]] o quanto as bordas são vivas, e
+  [[shapegen.bg_side]] se as faixas sobem da base ou descem do topo.
+- [[shapegen.kind_blobs]]: formas orgânicas suaves. Um blob fica no meio;
+  com mais [[shapegen.bg_blob_count]] eles se espalham pela caixa nas cores
+  da paleta. [[shapegen.bg_blob_points]] e [[shapegen.bg_randomness]]
+  definem o quanto são irregulares.
+- [[shapegen.kind_soft_gradient]]: um retângulo com um preenchimento de
+  malha suave cujos pontos recebem as cores da paleta ao acaso, para as
+  cores se fundirem. [[shapegen.bg_mesh_size]] define quantas manchas de cor
+  há e [[shapegen.bg_jitter]] o quanto elas fluem livremente.
+
+As ondas e os blobs são curvas preenchidas comuns e o degradê é um
+preenchimento de malha comum, então podem ser editados, recoloridos e
+exportados como qualquer outro objeto; adicione grão ou desfoque com os
+efeitos, se quiser.

@@ -118,6 +118,8 @@ pub struct ExportState {
     /// DXF: the drawing unit, an index into
     /// [`tracedraw_io::dxf::DxfUnits::ALL`] (#3583).
     pub dxf_units: usize,
+    /// WMF: dashed outlines written as solid lines (#3819).
+    pub wmf_solid_dashes: bool,
 }
 
 impl Default for ExportState {
@@ -160,6 +162,7 @@ impl Default for ExportState {
             plt_one_pen: false,
             plt_resolution: 0.02,
             dxf_units: 0,
+            wmf_solid_dashes: false,
         }
     }
 }
@@ -346,6 +349,13 @@ impl ExportState {
                 .get(self.dxf_units)
                 .copied()
                 .unwrap_or_default(),
+        }
+    }
+
+    /// The WMF export's choices (#3819).
+    pub fn wmf_options(&self) -> tracedraw_io::emf::WmfOptions {
+        tracedraw_io::emf::WmfOptions {
+            solid_dashes: self.wmf_solid_dashes,
         }
     }
 
@@ -1452,6 +1462,11 @@ pub enum Dialog {
     /// Reset every preference to the defaults? (F8 while TraceDraw
     /// starts, Options > Global.)
     ConfirmResetSettings,
+    /// TraceDraw stopped responding (this run, or the last one, which was
+    /// ended) or the last run ended with an error: send the report?
+    /// (hang_watch.rs)
+    #[cfg(not(target_arch = "wasm32"))]
+    ProblemReport(crate::hang_watch::Offer),
     /// At start-up: drawings a session that ended without closing left in
     /// the auto-backup folder (see `recovery.rs`).
     Recover(Vec<crate::recovery::Found>),
@@ -2986,6 +3001,44 @@ pub fn show(app: &mut App, ctx: &Context) {
                 None => {}
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        Dialog::ProblemReport(offer) => {
+            use crate::hang_watch::Problem;
+            let what = match offer.problem {
+                Problem::HangNow(s) => trf("report.hang_now", &[("seconds", &s.to_string())]),
+                Problem::HangLast => tr("report.hang_last"),
+                Problem::CrashLast => tr("report.crash_last"),
+            };
+            let text = format!("{what}\n\n{}", tr("report.body"));
+            let (send, show, later) = (tr("report.send"), tr("report.show"), tr("report.not_now"));
+            match crate::ui::chrome::message_box_closing_with(
+                ctx,
+                crate::ui::chrome::MessageIcon::Info,
+                &text,
+                &[&send, &show, &later],
+                2,
+            ) {
+                Some(0) => {
+                    let url = crate::hang_watch::issue_url(offer);
+                    let folder = offer.path.parent().map(std::path::Path::to_path_buf);
+                    app.open_url(&url);
+                    if let Some(folder) = folder {
+                        if let Err(e) = crate::export::open_with_system(&folder) {
+                            app.status = e;
+                        }
+                    }
+                    close = true;
+                }
+                Some(1) => {
+                    let path = offer.path.clone();
+                    if let Err(e) = crate::export::open_with_system(&path) {
+                        app.status = e;
+                    }
+                }
+                Some(_) => close = true,
+                None => {}
+            }
+        }
         Dialog::ConfirmResetSettings => {
             let (reset, cancel) = (tr("dialog.reset"), tr("dialog.cancel"));
             match crate::ui::chrome::message_box(
@@ -3331,6 +3384,9 @@ pub fn show(app: &mut App, ctx: &Context) {
                 ui.checkbox(&mut c.outline_color, tr("dialog.copy_outline_color"));
                 ui.checkbox(&mut c.fill, tr("dialog.copy_fill"));
                 ui.checkbox(&mut c.text, tr("dialog.copy_text_properties"));
+                // The size of the object clicked (#3825).
+                ui.checkbox(&mut c.width, tr("dialog.copy_width"));
+                ui.checkbox(&mut c.height, tr("dialog.copy_height"));
                 ui.add_space(6.0);
                 if ok_cancel(ui, &mut close) {
                     app.start_copy_properties(*c);
@@ -5487,6 +5543,11 @@ fn export_dialog(app: &mut App, ctx: &Context, st: &mut ExportState, close: &mut
                 }
                 if !scripted && EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)].1 == "dxf" {
                     dxf_export_fields(ui, st);
+                }
+                // WMF: dashes as solid lines (#3819).
+                if !scripted && EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)].1 == "wmf" {
+                    ui.checkbox(&mut st.wmf_solid_dashes, tr("dialog.wmf_solid_dashes"))
+                        .rich_tip(crate::ui::tips::keyed("dialog.wmf_solid_dashes"));
                 }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut st.selection_only, tr("dialog.selected_only"))

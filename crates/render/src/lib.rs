@@ -368,6 +368,9 @@ pub fn render_page_progressive(
         return None;
     }
     let cancelled = || cancel.load(Ordering::Relaxed);
+    if cancelled() {
+        return None;
+    }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -389,7 +392,11 @@ pub fn render_page_progressive(
     // once here instead of once per band (#3559).
     let boxes = page_bounds_cache(doc, page);
     let next = AtomicUsize::new(0);
-    let done: std::sync::Mutex<Vec<(u32, Pixmap)>> = std::sync::Mutex::new(Vec::new());
+    // Assemble each band as it finishes instead of keeping a whole
+    // picture of bands beside a second whole picture at the end. Only
+    // the workers' current bands and their blur margins stay live.
+    let out = std::sync::Mutex::new(Pixmap::new(w, h)?);
+    let done = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         for _ in 0..cores.min(bands.len() as u32) {
             sc.spawn(|| loop {
@@ -420,24 +427,28 @@ pub fn render_page_progressive(
                     return;
                 };
                 rows.data_mut().copy_from_slice(src);
-                band(y0, &rows);
-                if let Ok(mut d) = done.lock() {
-                    d.push((y0, rows));
+                drop(part);
+                {
+                    let Ok(mut out) = out.lock() else {
+                        return;
+                    };
+                    let start = y0 as usize * row;
+                    let Some(dst) = out.data_mut().get_mut(start..start + len) else {
+                        return;
+                    };
+                    dst.copy_from_slice(rows.data());
                 }
+                // The callback may wait for its consumer. It must never
+                // hold the assembly lock while it does so.
+                band(y0, &rows);
+                done.fetch_add(1, Ordering::Relaxed);
             });
         }
     });
-    let done = done.into_inner().ok()?;
-    if cancelled() || done.len() != bands.len() {
+    if cancelled() || done.load(Ordering::Relaxed) != bands.len() {
         return None;
     }
-    let mut out = Pixmap::new(w, h)?;
-    let row = w as usize * 4;
-    for (y0, rows) in done {
-        let d = y0 as usize * row;
-        out.data_mut()[d..d + rows.data().len()].copy_from_slice(rows.data());
-    }
-    Some(out)
+    out.into_inner().ok()
 }
 
 /// How many bands for each core a picture handed over a band at a time
@@ -3262,11 +3273,23 @@ impl Renderer<'_> {
                 None => mask_px.get(i).map_or(255, lum),
             }
         };
+        // A uniform transparency (a solid mask) is one value over the whole
+        // box: read once, not once a pixel, and a wholly opaque one leaves
+        // the layer as it is (#3761).
+        let constant = match (mask_fill, inside) {
+            (Fill::Solid(_), Some(((x0, _), (y0, _)))) => {
+                Some(mask_px.get(y0 * w as usize + x0).map_or(255, lum))
+            }
+            _ => None,
+        };
         for (i, px) in layer.pixels_mut().iter_mut().enumerate() {
+            if constant == Some(255) {
+                break;
+            }
             if px.alpha() == 0 {
                 continue;
             }
-            let m = mask_at(i);
+            let m = constant.unwrap_or_else(|| mask_at(i));
             let d = px.demultiply();
             let a = (d.alpha() as u32 * m as u32 / 255) as u8;
             if let Some(np) = tiny_skia::ColorU8::from_rgba(d.red(), d.green(), d.blue(), a)

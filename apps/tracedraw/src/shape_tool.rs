@@ -339,17 +339,28 @@ impl App {
         }
     }
 
-    fn set_path(&mut self, id: ShapeId, path: BezPath, closed: bool, label: &'static str) {
-        if self.engine.undo_label() == Some(label) {
-            let _ = self.engine.undo();
-        }
-        let _ = self.engine.run_with_label(
-            &Command::SetShapeKind {
-                shape: id,
-                kind: ShapeKind::Path { path, closed },
-            },
-            label,
-        );
+    /// Give curve `id` the path `path`: the first step of a drag is a new
+    /// undo step named `label`, later steps of the same drag join it.
+    /// Only the drag's own step is joined: an earlier step of the same
+    /// name, another curve's handle drag among them, stays as it was
+    /// (#3689).
+    fn set_path(
+        &mut self,
+        id: ShapeId,
+        path: BezPath,
+        closed: bool,
+        label: &'static str,
+        begun: bool,
+    ) {
+        let cmd = Command::SetShapeKind {
+            shape: id,
+            kind: ShapeKind::Path { path, closed },
+        };
+        let _ = if begun {
+            self.engine.amend(&cmd)
+        } else {
+            self.engine.run_with_label(&cmd, label)
+        };
     }
 
     fn set_path_new_step(&mut self, id: ShapeId, path: BezPath, closed: bool) {
@@ -920,7 +931,28 @@ impl App {
                     // without a drag chooses it for the arrow keys
                     // (#2819, #3041, #3042).
                     self.chosen_handle = None;
-                    if let Some((path, closed, t)) = self.path_of(shape) {
+                    // Alt held: the node is dragged by its handle, the
+                    // handle keeping its place about it (#3719).
+                    let by_handle = mods.alt
+                        && self.path_of(shape).is_some_and(|(path, closed, t)| {
+                            let Some(n) = nodes::nodes(&path).into_iter().find(|n| n.index == index)
+                            else {
+                                return false;
+                            };
+                            let tip = match which {
+                                nodes::Which::In => n.ctrl_in,
+                                nodes::Which::Out => n.ctrl_out,
+                            };
+                            let Some(tip) = tip else { return false };
+                            let q = t.inverse() * self.snap_point_excluding(p, &[shape]);
+                            let np = nodes::move_node(&path, index, q - tip);
+                            let begun = self.node_drag_shown.is_some();
+                            self.note_node_drag_step(begun);
+                            self.set_path(shape, np, closed, "Edit Handle", begun);
+                            true
+                        });
+                    let plain = if by_handle { None } else { self.path_of(shape) };
+                    if let Some((path, closed, t)) = plain {
                         // The handle snaps like a node does; Ctrl or Shift
                         // keeps it to the constrain angle about its node,
                         // on the page, and a smooth node's other handle
@@ -938,8 +970,11 @@ impl App {
                         let lp = t.inverse() * q;
                         let ty = self.node_type_of(shape, index);
                         let np = nodes::move_handle(&path, index, which, lp, ty);
-                        self.note_node_drag_step(self.node_drag_shown.is_some());
-                        self.set_path(shape, np, closed, "Edit Handle");
+                        // The press cleared the page's kept picture: it is
+                        // there from the drag's first step on.
+                        let begun = self.node_drag_shown.is_some();
+                        self.note_node_drag_step(begun);
+                        self.set_path(shape, np, closed, "Edit Handle", begun);
                     }
                 }
                 Drag::NodeMarquee { start, .. } => {

@@ -170,6 +170,10 @@ pub struct CopyProperties {
     pub outline_color: bool,
     pub fill: bool,
     pub text: bool,
+    /// The width and the height of the object clicked, each target
+    /// stretched about its centre to them (#3825); off at first.
+    pub width: bool,
+    pub height: bool,
 }
 
 impl Default for CopyProperties {
@@ -179,6 +183,8 @@ impl Default for CopyProperties {
             outline_color: true,
             fill: true,
             text: true,
+            width: false,
+            height: false,
         }
     }
 }
@@ -186,7 +192,7 @@ impl Default for CopyProperties {
 impl CopyProperties {
     /// Something is ticked.
     pub fn any(self) -> bool {
-        self.outline_pen || self.outline_color || self.fill || self.text
+        self.outline_pen || self.outline_color || self.fill || self.text || self.width || self.height
     }
 }
 
@@ -2288,6 +2294,43 @@ impl App {
                 }
             }
         }
+        // The size: each target stretched about the centre of its box to
+        // the width and/or height of the object clicked (#3825).
+        if c.width || c.height {
+            let from = self
+                .doc()
+                .find_shape(source)
+                .map(|s| s.page_path().bounding_box())
+                .filter(|b| b.is_finite());
+            if let Some(from) = from {
+                for t in &targets {
+                    let b = t.page_path().bounding_box();
+                    if !b.is_finite() {
+                        continue;
+                    }
+                    let sx = if c.width && b.width() > 1e-9 {
+                        from.width() / b.width()
+                    } else {
+                        1.0
+                    };
+                    let sy = if c.height && b.height() > 1e-9 {
+                        from.height() / b.height()
+                    } else {
+                        1.0
+                    };
+                    if (sx - 1.0).abs() < 1e-12 && (sy - 1.0).abs() < 1e-12 {
+                        continue;
+                    }
+                    let mid = b.center();
+                    cmds.push(Command::TransformShapes {
+                        shapes: vec![t.id],
+                        transform: Affine::translate(mid.to_vec2())
+                            * Affine::scale_non_uniform(sx, sy)
+                            * Affine::translate(-mid.to_vec2()),
+                    });
+                }
+            }
+        }
         if cmds.is_empty() {
             return;
         }
@@ -3939,6 +3982,9 @@ impl App {
     /// of the first paragraph text in a frame among the text being edited
     /// or the selected texts; `None` with no such text.
     pub fn frame_text_vertical_align(&self) -> Option<tracedraw_core::VerticalAlign> {
+        if self.table_edit.is_some() {
+            return self.active_cell_vertical_align();
+        }
         self.hyphenation_targets().iter().find_map(|id| {
             match &self.doc().find_shape(*id)?.kind {
                 ShapeKind::Text {
@@ -3955,6 +4001,11 @@ impl App {
     /// or of every selected paragraph text, from the text property bar
     /// (#3543), as the Text docker does for one text. One undo step.
     pub fn set_frame_text_vertical_align(&mut self, v: tracedraw_core::VerticalAlign) {
+        // Table cells being edited: theirs (#3859).
+        if self.table_edit.is_some() {
+            self.set_cells_vertical_align(v);
+            return;
+        }
         let mut cmds = Vec::new();
         for id in self.hyphenation_targets() {
             let Some(s) = self.doc().find_shape(id) else {
@@ -4167,7 +4218,8 @@ impl App {
     /// closed path begins at `at` instead of being centred there (the
     /// Text tool clicked on the path).
     fn text_onto_path(&mut self, path_id: ShapeId, at: Option<Point>, begin: bool) {
-        let Ok(curve) = self.doc().shape(path_id).map(|(_, s)| s.clone()) else {
+        // Nested paths too (#3864), in page space.
+        let Some(curve) = self.doc().shape_on_page(path_id) else {
             return;
         };
         if matches!(curve.kind, ShapeKind::Text { .. }) {
@@ -4202,6 +4254,7 @@ impl App {
             hyphenate: self.text_hyphenation,
             ..Default::default()
         };
+        let clean_rev = self.engine.revision();
         if let Some(id) = self.new_shape(ShapeKind::Text {
             spans: vec![span],
             origin: Point::ZERO,
@@ -4219,6 +4272,7 @@ impl App {
             self.note_text_path_source(id, path_id);
             self.text_edit = Some(crate::app::TextEdit::at_end(id, 0));
             self.select(vec![id]);
+            self.note_fresh_text_edit(id, clean_rev);
         }
     }
 
@@ -4283,10 +4337,23 @@ impl App {
     pub fn text_tool_path_at(&self, p: Point) -> Option<ShapeId> {
         let tolerance = 4.0 / f64::from(self.view.zoom).max(1e-6);
         let id = self.hit_test(p)?;
-        let (_, s) = self.doc().shape(id).ok()?;
+        let (_, top) = self.doc().shape(id).ok()?;
+        // A path inside a group or a clip frame is reached as it is drawn
+        // (#3864): the group itself is not a path.
+        let s = if matches!(
+            top.kind,
+            ShapeKind::Group { .. } | ShapeKind::ClipFrame { .. }
+        ) {
+            self.leaf_of(id, p)?
+        } else {
+            top.clone()
+        };
         if matches!(
             s.kind,
-            ShapeKind::Text { .. } | ShapeKind::Bitmap { .. } | ShapeKind::Group { .. }
+            ShapeKind::Text { .. }
+                | ShapeKind::Bitmap { .. }
+                | ShapeKind::Group { .. }
+                | ShapeKind::ClipFrame { .. }
         ) {
             return None;
         }
@@ -4294,7 +4361,7 @@ impl App {
         let near = path.segments().any(|seg| {
             kurbo::ParamCurveNearest::nearest(&seg, p, 1e-3).distance_sq <= tolerance * tolerance
         });
-        near.then_some(id)
+        near.then_some(s.id)
     }
 
     /// The Text tool clicked on the outline of a path (not a text): a new
@@ -8129,6 +8196,39 @@ mod tests {
         assert!((b.x0 - 10.0).abs() < 1.5, "{b:?}");
         assert!(b.y0 > 49.0 && b.y0 < 51.0, "{b:?}");
         assert!(b.height() < 8.0 && b.width() > b.height(), "{b:?}");
+    }
+
+    /// #3864: the Text tool over the outline of a path inside a group
+    /// offered nothing; it starts a text on that path as on a loose one.
+    #[test]
+    fn the_text_tool_starts_text_on_a_path_inside_a_group() {
+        let mut app = App::headless();
+        let e = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: tracedraw_core::geometry::Rect::new(40.0, 100.0, 140.0, 160.0),
+                arc: None,
+            })
+            .expect("ellipse");
+        let r = app
+            .new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(200.0, 100.0, 260.0, 160.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![e, r]);
+        app.group_selection();
+        assert!(app.doc().shape(e).is_err(), "grouped");
+        app.selection.clear();
+        app.set_tool(crate::tools::Tool::Text);
+        assert_eq!(app.text_tool_path_at(Point::new(90.0, 160.0)), Some(e));
+        assert_eq!(app.text_tool_path_at(Point::new(90.0, 130.0)), None);
+        assert!(app.start_text_on_path_at(Point::new(90.0, 160.0)));
+        let t = app.selection[0];
+        assert!(app.text_edit.is_some());
+        let tp = fitted(&app, t);
+        let start = tp.path.segments().next().expect("segment").start();
+        assert!((start.y - 160.0).abs() < 0.05, "{start:?}");
     }
 
     #[test]

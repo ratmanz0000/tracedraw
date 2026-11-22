@@ -106,12 +106,19 @@ fn xml_declared_encoding(head: &str) -> Option<&str> {
 }
 
 fn strip_xml_encoding(xml: &str) -> String {
-    if let Some(end) = xml.find("?>") {
-        if xml[..end].starts_with("<?xml") {
-            return format!("<?xml version=\"1.0\"?>{}", &xml[end + 2..]);
-        }
+    match xml.find("?>").filter(|&end| xml[..end].starts_with("<?xml")) {
+        Some(end) => format!("<?xml version=\"1.0\"?>{}", &xml[end + 2..]),
+        None => xml.to_string(),
     }
-    xml.to_string()
+}
+
+fn ooxml_escape_at(bytes: &[u8], i: usize) -> Option<u16> {
+    let slice = bytes.get(i..i.checked_add(7)?)?;
+    if slice[0] != b'_' || !matches!(slice[1], b'x' | b'X') || slice[6] != b'_' {
+        return None;
+    }
+    let hex = std::str::from_utf8(&slice[2..6]).ok()?;
+    u16::from_str_radix(hex, 16).ok()
 }
 
 /// Unescape OOXML `_xHHHH_` hex escapes (`ECMA-376` 22.4.2.4), including
@@ -124,19 +131,10 @@ fn unescape_ooxml(s: &str) -> String {
     let mut units: Vec<u16> = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        if i + 7 <= bytes.len()
-            && bytes[i] == b'_'
-            && matches!(bytes[i + 1], b'x' | b'X')
-            && bytes[i + 6] == b'_'
-            && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
-        {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
-                if let Ok(u) = u16::from_str_radix(hex, 16) {
-                    units.push(u);
-                    i += 7;
-                    continue;
-                }
-            }
+        if let Some(u) = ooxml_escape_at(bytes, i) {
+            units.push(u);
+            i += 7;
+            continue;
         }
         let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
         let mut buf = [0u16; 2];

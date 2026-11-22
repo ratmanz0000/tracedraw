@@ -27,6 +27,12 @@ pub(crate) const HISTORY_LEN: usize = 10;
 /// version being built.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.50.3",
+        date: "2026-11-22",
+        title: "welcome.news.v0_50_3_title",
+        body: "welcome.news.v0_50_3_body",
+    },
+    Release {
         version: "0.50.2",
         date: "2026-11-21",
         title: "welcome.news.v0_50_2_title",
@@ -79,12 +85,6 @@ pub(crate) const RELEASES: &[Release] = &[
         date: "2026-11-13",
         title: "welcome.news.v0_45_1_title",
         body: "welcome.news.v0_45_1_body",
-    },
-    Release {
-        version: "0.45.0",
-        date: "2026-11-12",
-        title: "welcome.news.v0_45_0_title",
-        body: "welcome.news.v0_45_0_body",
     },
 ];
 
@@ -505,10 +505,11 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // A document the Android picker returned has a URI, not a folder.
+    // Without the `\\?\` prefix of a canonical Windows path (#3812).
     let folder = path
         .parent()
         .filter(|_| !crate::files::is_document_path(path))
-        .map(|d| d.display().to_string())
+        .map(|d| crate::files::plain_path(d).display().to_string())
         .unwrap_or_default();
     let text_x = frame.right() + 10.0;
     let color = if exists {
@@ -614,7 +615,7 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
             ui.close();
         }
     });
-    let resp = resp.rich_tip(path.display().to_string());
+    let resp = resp.rich_tip(crate::files::plain_path(path).display().to_string());
     if action == RecentAction::None && exists && resp.clicked() {
         action = RecentAction::Open;
     }

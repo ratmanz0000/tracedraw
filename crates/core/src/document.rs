@@ -205,8 +205,18 @@ pub mod text_outline {
         Path(BezPath),
     }
 
-    type GlyphRunResolver =
-        fn(&str, bool, bool, f64, &[u16], &[f64]) -> Option<ResolvedGlyphRun>;
+    /// Request to resolve a run of raw glyph indices (`ETO_GLYPH_INDEX`).
+    #[derive(Clone, Copy, Debug)]
+    pub struct GlyphRunRequest<'a> {
+        pub family: &'a str,
+        pub bold: bool,
+        pub italic: bool,
+        pub em_mm: f64,
+        pub gids: &'a [u16],
+        pub advances_mm: &'a [f64],
+    }
+
+    type GlyphRunResolver = fn(&GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun>;
     static GLYPH_RUN_RESOLVER: OnceLock<GlyphRunResolver> = OnceLock::new();
 
     /// Register the font database's glyph-index resolver.
@@ -214,19 +224,9 @@ pub mod text_outline {
         let _ = GLYPH_RUN_RESOLVER.set(f);
     }
 
-    /// Resolve `gids` in `(family, bold, italic)` at `em_mm` height with
-    /// optional per-glyph horizontal advances `advances_mm`.
-    pub fn resolve_glyph_indices(
-        family: &str,
-        bold: bool,
-        italic: bool,
-        em_mm: f64,
-        gids: &[u16],
-        advances_mm: &[f64],
-    ) -> Option<ResolvedGlyphRun> {
-        GLYPH_RUN_RESOLVER
-            .get()
-            .and_then(|f| f(family, bold, italic, em_mm, gids, advances_mm))
+    /// Resolve `req.gids` against `(req.family, req.bold, req.italic)`.
+    pub fn resolve_glyph_indices(req: &GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun> {
+        GLYPH_RUN_RESOLVER.get().and_then(|f| f(req))
     }
 }
 
@@ -2805,6 +2805,9 @@ pub struct TableCell {
     /// Border of each side; the table's border where unset.
     #[serde(default, skip_serializing_if = "crate::table::CellBorders::is_default")]
     pub borders: crate::table::CellBorders,
+    /// Where the text sits in the cell from top to bottom (#3859).
+    #[serde(default, skip_serializing_if = "crate::table::is_top")]
+    pub valign: VerticalAlign,
 }
 
 fn one_u32() -> u32 {
@@ -4614,7 +4617,10 @@ impl Shape {
                                     inner.height().max(0.1),
                                 )),
                                 align: cell.align,
-                                para: ParagraphStyle::default(),
+                                para: ParagraphStyle {
+                                    vertical_align: cell.valign,
+                                    ..ParagraphStyle::default()
+                                },
                                 on_path: None,
                             },
                         );
@@ -6429,6 +6435,10 @@ pub struct RulerSettings {
     /// or "m"), kept for the dialog; empty for millimetres.
     pub scale_page_units: String,
     pub scale_world_units: String,
+    /// The vertical ruler counts from the top of the page downwards, its
+    /// origin mirrored within the page (#3872); off: from the bottom up.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vertical_from_top: bool,
 }
 
 impl Default for RulerSettings {
@@ -6441,11 +6451,24 @@ impl Default for RulerSettings {
             scale_world: 1.0,
             scale_page_units: String::new(),
             scale_world_units: String::new(),
+            vertical_from_top: false,
         }
     }
 }
 
 impl RulerSettings {
+    /// The page y (mm) the vertical ruler counts from on a page whose
+    /// bottom and top are `bottom` and `top`: the origin, or with the
+    /// ruler counting from the top the origin mirrored within the page,
+    /// so the default origin lies at the top edge (#3872).
+    pub fn vertical_zero(&self, bottom: f64, top: f64) -> f64 {
+        if self.vertical_from_top {
+            top + bottom - self.origin_y
+        } else {
+            self.origin_y
+        }
+    }
+
     /// World millimetres per page millimetre: 1 for a 1:1 drawing, 100 for
     /// 1:100. Never zero, negative or infinite (1 then).
     pub fn world_per_page(&self) -> f64 {
@@ -6929,6 +6952,19 @@ fn find_in(s: &Shape, id: ShapeId) -> Option<&Shape> {
     }
 }
 
+fn wraps_along_path(s: &Shape, id: ShapeId) -> Option<bool> {
+    if s.id == id {
+        return Some(s.wrap_text);
+    }
+    let child = match &s.kind {
+        ShapeKind::Group { children } => children.iter().find_map(|c| wraps_along_path(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => wraps_along_path(frame, id)
+            .or_else(|| contents.iter().find_map(|c| wraps_along_path(c, id))),
+        _ => None,
+    }?;
+    Some(s.wrap_text || child)
+}
+
 impl Default for Document {
     fn default() -> Self {
         Document::new("Untitled", paper::A4)
@@ -7271,6 +7307,18 @@ impl Document {
         let (k, i) = self.locate_top(id)?;
         let top = self.all_layers().nth(k)?.shapes.get(i)?;
         find_in(top, id)
+    }
+
+    /// True when `id` or an enclosing group or clip frame has `wrap_text` on.
+    pub fn shape_or_ancestor_wraps_text(&self, id: ShapeId) -> bool {
+        let Some((k, i)) = self.locate_top(id) else {
+            return false;
+        };
+        self.all_layers()
+            .nth(k)
+            .and_then(|l| l.shapes.get(i))
+            .and_then(|top| wraps_along_path(top, id))
+            .unwrap_or(false)
     }
 
     /// The layer number and the place on it of the object on a layer

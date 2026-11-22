@@ -1399,6 +1399,8 @@ pub struct App {
     pub action_lines: crate::action_lines::ActionLines,
     /// The Shape Generator panel's settings (#3412, #3413).
     pub shape_gen: crate::shape_gen::ShapeGenSettings,
+    /// The Shape Generator's live differential growth.
+    pub shape_gen_growth: Option<crate::shape_gen_growth::GrowthLive>,
     /// Speech Balloon tool (#2179): the style, the tail's width (percent
     /// of the body's smaller side) and bend for new balloons, and the
     /// balloon whose tail tip is being dragged.
@@ -1832,6 +1834,10 @@ pub struct App {
     /// The drawing at a revision, shared by the other pages' renders on
     /// their threads (one copy a change, not one a page) (#903).
     pub page_snapshot: std::cell::RefCell<Option<(u64, std::sync::Arc<tracedraw_core::Document>)>>,
+    /// Small transparent overlay texture of the text shape currently being
+    /// typed into, so the page beneath stays cached without re-rendering
+    /// on each keystroke (#3904).
+    pub text_edit_overlay: std::cell::RefCell<crate::text_editing::TextEditOverlay>,
     /// What the backdrop covers (see [`Self::backdrop_area`]), with the
     /// revision, page and page box it was worked out for.
     backdrop_area: std::cell::Cell<Option<(u64, PageId, Rect, Rect)>>,
@@ -2021,13 +2027,13 @@ pub struct App {
     /// The last Symbolize Similar / Replace Symbol result, shown under
     /// the Symbols list.
     pub symbolize_report: Option<String>,
-    /// The Symbols list's search text.
-    pub symbol_filter: String,
     /// The Replace Symbol pick: the source symbol whose instances will
     /// move; the next press on another symbol's Replace button merges.
     pub symbol_replace_source: Option<usize>,
     /// The symbol name being edited inline: (index, draft text).
     pub symbol_rename: Option<(usize, String)>,
+    /// The Symbols list's search text.
+    pub symbol_filter: String,
     /// When `autosave_settings` last wrote the preferences, and the
     /// preferences as last saved or looked at (JSON), to save them only
     /// when they changed.
@@ -2390,6 +2396,9 @@ pub struct App {
     /// group close off as a live fill of the group, which follows its
     /// lines when they move ([`tracedraw_core::live_paint`]).
     pub area_fill_live: bool,
+    /// Smart Fill with Use Guidelines on: the guidelines the page shows
+    /// close off areas too, as in the Shape Builder (#3863).
+    pub area_fill_guides: bool,
     pub mesh_rows: u32,
     pub mesh_cols: u32,
     /// Mesh Fill bar: the colours Shuffle draws from (an index into
@@ -3335,6 +3344,7 @@ impl App {
             graph_spokes: 8,
             action_lines: Default::default(),
             shape_gen: Default::default(),
+            shape_gen_growth: None,
             balloon_style: Default::default(),
             balloon_width: 30.0,
             balloon_bend: 0.0,
@@ -3519,6 +3529,7 @@ impl App {
             vo: Default::default(),
             page_rasters: Default::default(),
             page_snapshot: Default::default(),
+            text_edit_overlay: Default::default(),
             backdrop_area: Default::default(),
             view_mode: ViewMode::Enhanced,
             proof_colors: false,
@@ -3611,9 +3622,9 @@ impl App {
             object_thumbs: Default::default(),
             symbol_thumbs: Default::default(),
             symbolize_report: None,
-            symbol_filter: String::new(),
             symbol_replace_source: None,
             symbol_rename: None,
+            symbol_filter: String::new(),
             objects_master_closed: false,
             picked_layer: None,
             navigator_tex: None,
@@ -3766,6 +3777,7 @@ impl App {
             area_outline_color: Color::BLACK,
             area_fill_outline_edges: false,
             area_fill_live: false,
+            area_fill_guides: false,
             mesh_rows: 2,
             mesh_cols: 2,
             mesh_palette: 0,
@@ -7116,6 +7128,7 @@ impl App {
         };
         let mut para = tracedraw_core::ParagraphStyle::default();
         para.hyphenate = self.text_hyphenation;
+        let clean_rev = self.engine.revision();
         let before = self.engine.last_step_id();
         if let Some(id) = self.new_shape(ShapeKind::Text {
             spans: vec![span],
@@ -7135,6 +7148,7 @@ impl App {
                 ..TextEdit::at_end(id, 0)
             });
             self.select(vec![id]);
+            self.note_fresh_text_edit(id, clean_rev);
         }
     }
 
@@ -7166,7 +7180,9 @@ impl App {
 
     /// Property bar defaults follow the text object being edited.
     pub fn sync_text_defaults_from(&mut self, id: ShapeId) {
-        let kind = self.doc().shape(id).map(|(_, s)| s.kind.clone());
+        // Found inside groups too: a text in a group chosen on its own
+        // showed the font of the text read before it (#3896).
+        let kind = self.doc().find_shape(id).map(|s| s.kind.clone()).ok_or(());
         if let Ok(ShapeKind::Text { spans, align, .. }) = &kind {
             // While editing, the style at the caret (of the character
             // before it); with the Shape tool, of the first chosen
@@ -7361,6 +7377,10 @@ impl App {
     }
 
     pub fn select_all(&mut self) {
+        // With facing pages the whole spread shown is taken (#3744).
+        if self.focus_shape_on_page().is_none() {
+            self.adopt_whole_spread();
+        }
         let ids = self.selectable_ids();
         self.select(ids);
     }
@@ -8313,6 +8333,75 @@ impl App {
             return;
         }
         self.run(Command::SwapColors { shapes });
+    }
+
+    /// Swap Fills (Colour panel, #3770): two selected objects exchange
+    /// the fills they show (a colour, a gradient, a pattern; a mesh is
+    /// fitted to its new object), one undo step. Nothing with another
+    /// number of objects selected.
+    pub fn swap_fills(&mut self) {
+        let shapes = self.selected_shapes();
+        let [a, b] = shapes.as_slice() else {
+            return;
+        };
+        let (sa, sb) = (
+            crate::copy_props::properties_source(a),
+            crate::copy_props::properties_source(b),
+        );
+        let (fa, fb) = (
+            crate::copy_props::shown_fill(&sa),
+            crate::copy_props::shown_fill(&sb),
+        );
+        let mut cmds = crate::copy_props::fill_commands(&fb, &sb, std::slice::from_ref(a));
+        cmds.extend(crate::copy_props::fill_commands(&fa, &sa, std::slice::from_ref(b)));
+        if let Err(e) = self.engine.run_batch("Swap Fills", &cmds) {
+            self.status = e.to_string();
+        }
+    }
+
+    /// Outline From Fill (Colour panel, #3770): each selected object's
+    /// outline takes the colour of its own fill (the first colour of a
+    /// gradient), objects inside groups each on their own, the outline's
+    /// width and style kept; an object without an outline gets the
+    /// default outline in that colour. Objects without a fill are left
+    /// alone. One undo step.
+    pub fn outline_from_fill(&mut self) {
+        fn leaves(s: &Shape, out: &mut Vec<(ShapeId, Color)>) {
+            if let ShapeKind::Group { children } = &s.kind {
+                children.iter().for_each(|c| leaves(c, out));
+                return;
+            }
+            let src = crate::copy_props::properties_source(s);
+            if let Some(c) = crate::copy_props::shown_fill(&src).preview_color() {
+                out.push((s.id, c));
+            }
+        }
+        let mut found = Vec::new();
+        for s in self.selected_shapes() {
+            leaves(&s, &mut found);
+        }
+        let base = self
+            .default_stroke()
+            .unwrap_or_else(|| Stroke::new(Color::BLACK, 0.2));
+        let cmds: Vec<Command> = found
+            .into_iter()
+            .map(|(id, c)| {
+                let mut stroke = base.clone();
+                stroke.color = c;
+                stroke.fill = None;
+                Command::PatchStroke {
+                    shapes: vec![id],
+                    stroke,
+                    fields: vec![tracedraw_core::patch::StrokeField::Paint],
+                }
+            })
+            .collect();
+        if cmds.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.run_batch("Outline From Fill", &cmds) {
+            self.status = e.to_string();
+        }
     }
 
     /// Object > Thicker Outline and Thinner Outline (#2905): the
@@ -11164,6 +11253,13 @@ impl App {
     // ----- view --------------------------------------------------------------
 
     pub fn zoom_to_page(&mut self) {
+        // In the Multipage View the page in use fills the window, not
+        // every page shown (#3780); a new view still fits them all.
+        if self.multipage && self.canvas_rect.is_positive() {
+            let page = self.page_rect();
+            self.view.fit(page, self.canvas_rect);
+            return;
+        }
         self.fit_pending = true;
     }
 
@@ -11281,8 +11377,9 @@ impl App {
     }
 
     pub fn zoom_to_fit(&mut self) {
-        if self.multipage {
-            self.fit_pending = true;
+        // In the Multipage View, the objects of the page in use (#3780).
+        if self.multipage && self.drawn_bounds().is_none() {
+            self.zoom_to_page();
             return;
         }
         let Some(b) = self.drawn_bounds() else {
@@ -12984,6 +13081,41 @@ mod tests {
         });
         assert_eq!(third.open_dockers, [DockerTab::Objects]);
         assert!(third.show_dockers && third.inner_dockers.tabs.is_empty());
+    }
+
+    /// Two texts in other fonts grouped, each chosen on its own inside
+    /// the group: the bar shows the font of the one chosen, not of the
+    /// one read before it (#3896).
+    #[test]
+    fn a_text_chosen_inside_a_group_shows_its_own_font() {
+        use tracedraw_core::Command;
+        let mut app = App::headless();
+        let mut ids = Vec::new();
+        for (n, family) in ["Selawik", "Quicksand"].into_iter().enumerate() {
+            ids.push(
+                app.new_shape(ShapeKind::Text {
+                    spans: vec![TextSpan::new("Hello", family, 24.0)],
+                    origin: Point::new(10.0, 20.0 + 30.0 * n as f64),
+                    frame: None,
+                    align: tracedraw_core::TextAlign::Left,
+                    para: Default::default(),
+                    on_path: None,
+                })
+                .expect("text"),
+            );
+        }
+        app.run(Command::Group {
+            shapes: ids.clone(),
+        });
+        for (id, family) in [
+            (ids[0], "Selawik"),
+            (ids[1], "Quicksand"),
+            (ids[0], "Selawik"),
+        ] {
+            app.select(vec![id]);
+            app.sync_text_defaults_from(id);
+            assert_eq!(app.text_settings_shown().0, family);
+        }
     }
 
     /// Many selected objects (Select All) are gathered in one pass and

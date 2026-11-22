@@ -94,11 +94,9 @@ pub fn install() {
     tracedraw_core::document::text_outline::set(|req| fonts().outline_cached(req).as_ref().clone());
     tracedraw_core::document::text_outline::set_bounds(|req| fonts().bounds_cached(req));
     tracedraw_core::document::text_outline::set_glyphs(|req| fonts().glyph_layout(req));
-    tracedraw_core::document::text_outline::set_glyph_indices(
-        |family, bold, italic, em_mm, gids, adv_mm| {
-            fonts().resolve_glyph_indices(family, bold, italic, em_mm, gids, adv_mm)
-        },
-    );
+    tracedraw_core::document::text_outline::set_glyph_indices(|req| {
+        fonts().resolve_glyph_indices(req)
+    });
     tracedraw_core::document::text_outline::set_lines(|req| {
         let layout = fonts().layout(req);
         // Lines past what fits the frame flow on (to a linked frame);
@@ -3471,24 +3469,20 @@ impl FontSystem {
     }
 
     /// Resolve a metafile `ETO_GLYPH_INDEX` run against the installed face
-    /// of `family`: back to Unicode text when every glyph has a Unicode
-    /// `cmap` entry, else to exact vector outlines placed with `advances_mm`.
+    /// of `req.family`: back to Unicode text when every glyph has a Unicode
+    /// `cmap` entry, else to exact vector outlines placed with
+    /// `req.advances_mm`.
     pub fn resolve_glyph_indices(
         &self,
-        family: &str,
-        bold: bool,
-        italic: bool,
-        em_mm: f64,
-        gids: &[u16],
-        advances_mm: &[f64],
+        req: &tracedraw_core::document::text_outline::GlyphRunRequest<'_>,
     ) -> Option<tracedraw_core::document::text_outline::ResolvedGlyphRun> {
         use tracedraw_core::document::text_outline::ResolvedGlyphRun;
-        if gids.is_empty() {
+        if req.gids.is_empty() {
             return None;
         }
-        self.ask_for(family);
+        self.ask_for(req.family);
         let db = self.db();
-        let (id, _) = self.own_face(&db, family, bold, italic)?;
+        let (id, _) = self.own_face(&db, req.family, req.bold, req.italic)?;
         db.with_face_data(id, |data, index| {
             let face = ttf_parser::Face::parse(data, index).ok()?;
             let mut chars: HashMap<u16, char> = HashMap::new();
@@ -3498,22 +3492,27 @@ impl FontSystem {
                         continue;
                     }
                     st.codepoints(|cp| {
-                        if let (Some(c), Some(g)) = (char::from_u32(cp), st.glyph_index(cp)) {
-                            if g.0 != 0 && !c.is_control() {
-                                chars.entry(g.0).or_insert(c);
-                            }
+                        if let (Some(c), Some(g)) = (
+                            char::from_u32(cp).filter(|c| !c.is_control()),
+                            st.glyph_index(cp).filter(|g| g.0 != 0),
+                        ) {
+                            chars.entry(g.0).or_insert(c);
                         }
                     });
                 }
             }
-            if gids.iter().all(|g| chars.contains_key(g)) {
-                let s: String = gids.iter().filter_map(|g| chars.get(g).copied()).collect();
+            if req.gids.iter().all(|g| chars.contains_key(g)) {
+                let s: String = req
+                    .gids
+                    .iter()
+                    .filter_map(|g| chars.get(g).copied())
+                    .collect();
                 if !s.is_empty() {
                     return Some(ResolvedGlyphRun::Text(s));
                 }
             }
             let upm = f64::from(face.units_per_em().max(1));
-            let scale = em_mm / upm;
+            let scale = req.em_mm / upm;
             if !scale.is_finite() || scale <= 0.0 {
                 return None;
             }
@@ -3524,10 +3523,11 @@ impl FontSystem {
                 y: 0.0,
             };
             let mut pen_x = 0.0;
-            for (i, &gid) in gids.iter().enumerate() {
+            for (i, &gid) in req.gids.iter().enumerate() {
                 sink.x = pen_x;
                 let _ = face.outline_glyph(ttf_parser::GlyphId(gid), &mut sink);
-                let adv = advances_mm
+                let adv = req
+                    .advances_mm
                     .get(i)
                     .copied()
                     .filter(|v| v.is_finite())

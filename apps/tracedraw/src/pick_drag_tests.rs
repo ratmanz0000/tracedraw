@@ -10914,6 +10914,8 @@ fn ctrl_shift_a_copies_the_ticked_properties_from_the_object_clicked() {
         outline_pen: false,
         fill: false,
         text: false,
+        width: false,
+        height: false,
     };
     app.copy_properties_from(src);
     let got = app
@@ -10924,6 +10926,93 @@ fn ctrl_shift_a_copies_the_ticked_properties_from_the_object_clicked() {
     assert_eq!(got.color, pen.color);
     // Align and Distribute keeps its menu and button, no longer the key.
     assert_eq!(crate::app::DockerTab::AlignDistribute.shortcut(), "");
+}
+
+/// Copy Properties From with Width and Height ticked: the target is
+/// stretched about its centre to the size of the object clicked; with
+/// Width alone only its width changes (#3825).
+#[test]
+fn copy_properties_from_copies_the_size() {
+    use crate::ops2::CopyProperties;
+    let mut app = App::headless();
+    let rect = |app: &mut App, x0, y0, x1, y1| {
+        app.new_shape(ShapeKind::Rect {
+            rect: tracedraw_core::geometry::Rect::new(x0, y0, x1, y1),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect")
+    };
+    let src = rect(&mut app, 100.0, 0.0, 140.0, 30.0);
+    let t = rect(&mut app, 0.0, 0.0, 10.0, 10.0);
+    app.select(vec![t]);
+    let only = |width, height| CopyProperties {
+        outline_pen: false,
+        outline_color: false,
+        fill: false,
+        text: false,
+        width,
+        height,
+    };
+    app.copy_properties_choice = only(true, false);
+    app.copy_properties_from(src);
+    let b = |app: &App| {
+        let s = app.doc().find_shape(t).expect("target").clone();
+        kurbo::Shape::bounding_box(&s.page_path())
+    };
+    let one = b(&app);
+    assert!((one.width() - 40.0).abs() < 1e-6, "{one:?}");
+    assert!((one.height() - 10.0).abs() < 1e-6, "{one:?}");
+    assert!((one.center().x - 5.0).abs() < 1e-6, "about its centre: {one:?}");
+    app.copy_properties_choice = only(true, true);
+    app.copy_properties_from(src);
+    let two = b(&app);
+    assert!((two.height() - 30.0).abs() < 1e-6, "{two:?}");
+    assert!((two.width() - 40.0).abs() < 1e-6, "{two:?}");
+}
+
+/// Object > Break Apart Keeping Holes: a curve of a ring and a square
+/// beside it breaks into two objects, the ring keeping its hole (#3700).
+#[test]
+fn break_apart_keeping_holes_keeps_the_ring_whole() {
+    use tracedraw_core::geometry::{BezPath, PathEl};
+    let mut app = App::headless();
+    let mut path = BezPath::new();
+    for (x0, y0, x1, y1) in [
+        (0.0, 0.0, 10.0, 10.0),
+        (2.0, 2.0, 8.0, 8.0),
+        (20.0, 0.0, 30.0, 10.0),
+    ] {
+        path.move_to((x0, y0));
+        path.line_to((x1, y0));
+        path.line_to((x1, y1));
+        path.line_to((x0, y1));
+        path.close_path();
+    }
+    let id = app
+        .new_shape(ShapeKind::Path { path, closed: true })
+        .expect("curve");
+    app.select(vec![id]);
+    app.break_apart_keep_holes();
+    assert_eq!(app.selection.len(), 2, "{:?}", app.selection);
+    let subpaths: Vec<usize> = app
+        .selection
+        .iter()
+        .map(|s| {
+            app.doc()
+                .find_shape(*s)
+                .map(|s| {
+                    s.local_path()
+                        .elements()
+                        .iter()
+                        .filter(|e| matches!(e, PathEl::MoveTo(_)))
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+        .collect();
+    assert!(subpaths.contains(&2) && subpaths.contains(&1), "{subpaths:?}");
+    assert_eq!(app.engine.undo_label(), Some("Break Apart"));
 }
 
 /// Print Merge's Place Inside Frame with nothing selected waits for a
@@ -15648,6 +15737,22 @@ fn shift_f3_while_typing_opens_change_case_for_the_edited_text() {
         "{:?}",
         app.dialog
     );
+}
+
+/// The right-click menu's Change Case, while typing, ends the editing,
+/// selects the text and opens Text > Change Case for it (#3826).
+#[test]
+fn right_click_change_case_opens_the_dialog_for_the_typed_text() {
+    use crate::ui::dialogs::Dialog;
+    let (_ctx, mut app, _rect) = setup();
+    tracedraw_text::install();
+    app.start_text(Point::new(20.0, 100.0), None);
+    app.text_insert("hello world");
+    let id = app.text_edit.as_ref().expect("editing").shape;
+    crate::ui::context::open_change_case(&mut app);
+    assert!(app.text_edit.is_none(), "the editing ended");
+    assert_eq!(app.selection, vec![id]);
+    assert!(matches!(app.dialog, Dialog::ChangeCase(_)), "{:?}", app.dialog);
 }
 
 /// Edit Fill's eyedropper: a click on the drawing gives the dialog the
@@ -20595,6 +20700,38 @@ fn the_color_panel_menu_swaps_fill_and_outline() {
     let shape = app.doc().find_shape(id).expect("shape").clone();
     assert_eq!(shape.fill, tracedraw_core::Fill::None);
     assert_eq!(shape.stroke.as_ref().map(|s| s.color), Some(red));
+}
+
+/// The Colour panel's "..." menu, Swap Fills: two objects exchange their
+/// fills in one undo step; Outline From Fill gives each outline its own
+/// fill's colour (#3770).
+#[test]
+fn the_color_panel_menu_swaps_fills_and_sets_outline_from_fill() {
+    use tracedraw_core::{Color, Fill};
+    let (ctx, mut app, id) = setup();
+    let red = Color::rgb8(200, 30, 30);
+    let blue = Color::rgb8(20, 40, 210);
+    app.select(vec![id]);
+    app.duplicate();
+    let other = app.selection[0];
+    app.apply_fill(Fill::Solid(blue));
+    app.select(vec![id, other]);
+    let steps = app.engine.history_labels().0.len();
+    color_panel_action(&ctx, &mut app, "docker.swap_fills");
+    let fill = |app: &App, s| app.doc().find_shape(s).expect("shape").fill.clone();
+    assert_eq!(fill(&app, id), Fill::Solid(blue));
+    assert_eq!(fill(&app, other), Fill::Solid(red));
+    assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+    color_panel_action(&ctx, &mut app, "docker.outline_from_fill");
+    let outline = |app: &App, s| {
+        app.doc()
+            .find_shape(s)
+            .and_then(|s| s.stroke.as_ref().map(|st| st.color))
+    };
+    assert_eq!(outline(&app, id), Some(blue));
+    assert_eq!(outline(&app, other), Some(red));
+    app.undo();
+    assert_ne!(outline(&app, id), Some(blue));
 }
 
 /// The Colour panel's "..." menu, No Fill and No Outline take the
@@ -28152,6 +28289,63 @@ fn an_object_dropped_on_another_page_of_the_multipage_view_becomes_that_page_s()
 }
 
 #[test]
+fn with_facing_pages_an_object_dropped_on_another_page_becomes_that_page_s() {
+    // #3847: with facing pages the Multipage View kept an object on its
+    // page wherever it was let go, on the facing page of its spread or
+    // on a page of another spread: since objects selected across the
+    // spine go back to their page (#3817) it could not be given to
+    // another page at all.
+    let (ctx, mut app, id) = setup();
+    app.add_page();
+    app.add_page();
+    let pages: Vec<tracedraw_core::PageId> = app.doc().pages.iter().map(|p| p.id).collect();
+    app.page = pages[0];
+    app.select(vec![id]);
+    app.set_facing_pages(true, tracedraw_core::spreads::PageSide::Right);
+    app.set_multipage(true);
+    for _ in 0..3 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let rect_of = |app: &App, page: tracedraw_core::PageId| {
+        app.multipage_layout()
+            .into_iter()
+            .find(|(p, _)| *p == page)
+            .map(|(_, r)| r)
+            .expect("shown")
+    };
+    let page_of = |app: &App, id: ShapeId| {
+        app.doc()
+            .pages
+            .iter()
+            .find(|p| p.layers.iter().any(|l| l.shapes.iter().any(|s| s.id == id)))
+            .map(|p| p.id)
+    };
+    // To page 2, the left page of the next spread.
+    let r2 = rect_of(&app, pages[1]);
+    let from = app.view.to_screen(Point::new(35.0, 25.0));
+    let to = app.view.to_screen(Point::new(r2.x0 + 35.0, r2.y0 + 25.0));
+    drag(&ctx, &mut app, from, to, Modifiers::NONE, Vec::new());
+    assert_eq!(page_of(&app, id), Some(pages[1]));
+    assert_eq!(app.page, pages[1]);
+    // Across the spine onto page 3, the facing page: page 3's.
+    let r2 = rect_of(&app, pages[1]);
+    let r3 = rect_of(&app, pages[2]);
+    let from = app.view.to_screen(Point::new(r2.x0 + 35.0, r2.y0 + 25.0));
+    let to = app.view.to_screen(Point::new(r3.x0 + 60.0, r3.y0 + 25.0));
+    drag(&ctx, &mut app, from, to, Modifiers::NONE, Vec::new());
+    assert_eq!(page_of(&app, id), Some(pages[2]));
+    assert_eq!(app.page, pages[2]);
+    // Deselected, it stays there.
+    app.select(Vec::new());
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    assert_eq!(page_of(&app, id), Some(pages[2]));
+    let b = bounds(&app, id);
+    assert!((b.center().x - 60.0).abs() < 3.0, "{b:?}");
+}
+
+#[test]
 fn objects_put_beside_the_page_go_on_the_desktop_when_it_takes_them() {
     // #3100: an object moved or pasted wholly beside the page goes onto
     // the desktop layer, shown from every page, while the desktop takes
@@ -30731,6 +30925,165 @@ fn shift_scales_while_rotating() {
     // The centre stays put.
     let c = t * Point::new(10.0, 10.0);
     assert!((c.x - 10.0).abs() < 1e-9 && (c.y - 10.0).abs() < 1e-9, "{c:?}");
+}
+
+#[test]
+fn the_middle_button_pans_while_a_picture_is_edited_inside() {
+    // #3855: with a picture open in Edit Inside, a middle-button drag did
+    // not pan the view; it pans as everywhere else.
+    let (ctx, mut app, _) = setup();
+    let img = image::RgbaImage::from_pixel(20, 10, image::Rgba([255, 255, 255, 255]));
+    let png = crate::bitmap_fx::encode(&img).expect("png");
+    let id = app
+        .new_shape(ShapeKind::Bitmap {
+            rect: Rect::new(10.0, 10.0, 90.0, 50.0),
+            width_px: 20,
+            height_px: 10,
+            png: png.into(),
+            fx: None,
+        })
+        .expect("picture");
+    assert!(app.edit_bitmap_inside(id));
+    let none = Modifiers::NONE;
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    let mid = app.view.to_screen(Point::new(50.0, 30.0));
+    let before = app.view.to_screen(Point::new(0.0, 0.0));
+    frame(&ctx, &mut app, vec![Event::PointerMoved(mid)], none);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(mid, true, PointerButton::Middle, none)],
+        none,
+    );
+    let panned = mid + egui::vec2(-60.0, -40.0);
+    for i in 1..=3 {
+        let p = mid + (panned - mid) * (i as f32 / 3.0);
+        frame(&ctx, &mut app, vec![Event::PointerMoved(p)], none);
+    }
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(panned, false, PointerButton::Middle, none)],
+        none,
+    );
+    let after = app.view.to_screen(Point::new(0.0, 0.0));
+    assert!(app.pixel_edit.is_some(), "still editing");
+    assert!(
+        (after - before).length() > 30.0,
+        "the middle drag pans: {before:?} {after:?}"
+    );
+}
+
+/// #3689: a handle of one curve dragged with the Shape tool, then a
+/// handle of another curve, then the first curve's handle again: the
+/// other curve keeps its edit. The third drag undid the second, being
+/// of the same name ("Edit Handle"), as if it were its own earlier step.
+#[test]
+fn a_handle_drag_on_one_curve_keeps_the_handle_drag_on_another() {
+    let (ctx, mut app, id) = setup();
+    app.select(vec![id]);
+    app.delete_selection();
+    let curve = |app: &mut App, y: f64| {
+        let mut path = tracedraw_core::BezPath::new();
+        path.move_to((20.0, y));
+        path.curve_to((40.0, y - 20.0), (80.0, y - 20.0), (100.0, y));
+        app.new_shape(ShapeKind::Path {
+            path,
+            closed: false,
+        })
+        .expect("curve")
+    };
+    let a = curve(&mut app, 60.0);
+    let c = curve(&mut app, 140.0);
+    app.set_tool(Tool::Shape);
+    let view = app.view.clone();
+    let at = |p: Point| view.to_screen(p);
+    let path_of = |app: &App, s: ShapeId| app.doc().find_shape(s).expect("curve").page_path();
+    // The handle into the end node, dragged by (dx, dy).
+    let drag_handle = |app: &mut App, s: ShapeId, y: f64, d: (f64, f64)| {
+        app.select(vec![s]);
+        app.node_selection = vec![(s, 1)];
+        for _ in 0..2 {
+            frame(&ctx, app, Vec::new(), Modifiers::NONE);
+        }
+        let tip = path_of(app, s)
+            .elements()
+            .iter()
+            .find_map(|e| match e {
+                tracedraw_core::geometry::PathEl::CurveTo(_, c2, _) => Some(*c2),
+                _ => None,
+            })
+            .expect("handle");
+        assert!((tip.y - (y - 20.0)).abs() < 30.0);
+        let to = Point::new(tip.x + d.0, tip.y + d.1);
+        drag(&ctx, app, at(tip), at(to), Modifiers::NONE, Vec::new());
+    };
+    drag_handle(&mut app, c, 140.0, (0.0, -15.0));
+    let c_once = path_of(&app, c);
+    drag_handle(&mut app, a, 60.0, (10.0, 30.0));
+    let a_edited = path_of(&app, a);
+    assert_ne!(a_edited.elements(), handled_curve(60.0).elements(), "the drag took");
+    drag_handle(&mut app, c, 140.0, (-10.0, -10.0));
+    assert_ne!(path_of(&app, c).elements(), c_once.elements(), "the drag took");
+    assert_eq!(
+        path_of(&app, a).elements(),
+        a_edited.elements(),
+        "the other curve keeps its edit"
+    );
+    // Each drag is a step of its own: Undo takes back the last one only.
+    app.undo();
+    assert_eq!(path_of(&app, c).elements(), c_once.elements());
+    assert_eq!(path_of(&app, a).elements(), a_edited.elements());
+}
+
+fn handled_curve(y: f64) -> tracedraw_core::BezPath {
+    let mut path = tracedraw_core::BezPath::new();
+    path.move_to((20.0, y));
+    path.curve_to((40.0, y - 20.0), (80.0, y - 20.0), (100.0, y));
+    path
+}
+
+/// #3719: with Alt held, dragging a node's handle with the Shape tool
+/// drags the node; the handle keeps its place about the node.
+#[test]
+fn alt_drags_the_node_by_its_handle() {
+    let (ctx, mut app, id) = setup();
+    app.select(vec![id]);
+    app.delete_selection();
+    let c = app
+        .new_shape(ShapeKind::Path {
+            path: handled_curve(100.0),
+            closed: false,
+        })
+        .expect("curve");
+    app.set_tool(Tool::Shape);
+    app.select(vec![c]);
+    app.node_selection = vec![(c, 1)];
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let path_of = |app: &App| app.doc().find_shape(c).expect("curve").page_path();
+    let ends = |app: &App| {
+        path_of(app)
+            .elements()
+            .iter()
+            .find_map(|e| match e {
+                tracedraw_core::geometry::PathEl::CurveTo(c1, c2, end) => Some((*c1, *c2, *end)),
+                _ => None,
+            })
+            .expect("curve")
+    };
+    let (c1, c2, end) = ends(&app);
+    let at = |p: Point| app.view.to_screen(p);
+    let (from, to) = (at(c2), at(Point::new(c2.x + 10.0, c2.y + 20.0)));
+    drag(&ctx, &mut app, from, to, Modifiers::ALT, Vec::new());
+    let (n1, n2, nend) = ends(&app);
+    let moved = nend - end;
+    assert!(moved.hypot() > 15.0, "the node moved: {moved:?}");
+    assert!(((n2 - nend) - (c2 - end)).hypot() < 1e-6, "the handle kept its place about it");
+    assert!((n1 - c1).hypot() < 1e-6, "the other segment's start handle stays");
 }
 
 /// Symbols docker > By similarity (#2343): the sample group, a moved

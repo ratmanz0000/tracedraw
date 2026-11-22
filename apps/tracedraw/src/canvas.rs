@@ -155,6 +155,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
 
     // Selection.
     match preview {
+        Some(_) if !shows_transform_outline(app, live.is_some()) => {}
         Some(t) => draw_transform_outline(app, painter, t),
         None => draw_selection(app, painter, None),
     }
@@ -722,15 +723,32 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     let without_picture = app.pixel_edit_doc();
     // View > Separations: the page as one ink prints it.
     let one_ink = app.separation_view_doc();
-    let doc: &Document = without_picture
-        .as_deref()
+    // Text being typed in place (#3904): the page beneath it stays at its
+    // clean revision while the edited text shape draws as a small overlay.
+    let text_bg = if without_picture.is_none()
+        && without_copies.is_none()
+        && one_ink.is_none()
+        && preview.is_none()
+        && app.node_drag_revision().is_none()
+    {
+        app.prepare_edited_text_bg(painter.ctx(), rect)
+    } else {
+        app.text_edit_overlay.borrow_mut().suspend();
+        None
+    };
+    let doc: &Document = text_bg
+        .as_ref()
+        .and_then(|(d, _)| d.as_deref())
+        .or(without_picture.as_deref())
         .or(without_copies.as_deref())
         .or(one_ink.as_deref())
         .unwrap_or(app.doc());
     // Nodes being dragged: the drawing as it was before the drag, its
     // picture already made, until the button is released (#1259).
-    let revision = app
-        .node_drag_revision()
+    let revision = text_bg
+        .as_ref()
+        .map(|(_, r)| *r)
+        .or_else(|| app.node_drag_revision())
         .unwrap_or_else(|| app.engine.revision())
         ^ if without_copies.is_some() {
             1u64 << 62
@@ -778,26 +796,35 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // The drawing as it stands is shared with the render for nothing:
     // no copy of it on the window's thread at each change (#3440).
     #[cfg(not(target_arch = "wasm32"))]
-    if revision == app.engine.revision() && std::ptr::eq(doc, app.engine.document()) {
+    if let Some((Some(hidden), _)) = &text_bg {
+        app.raster.borrow_mut().snapshot = Some(hidden.clone());
+    } else if revision == app.engine.revision() && std::ptr::eq(doc, app.engine.document()) {
         app.raster.borrow_mut().snapshot = Some(app.engine.shared_document());
     }
     // Shadows blurred on the graphics card when Options asks (the same
     // pixels as on the CPU, so nothing drawn needs drawing again).
     #[cfg(not(target_arch = "wasm32"))]
     crate::gpu_fx::set_enabled(app.settings.gpu_effects);
-    let glide_target = app.zoom_glide.target_view();
     {
         let mut raster = app.raster.borrow_mut();
         raster.light_zoom = app.settings.light_zoom;
-        raster.zoom_target = glide_target;
         // A fill or an outline colour dragged in a colour picker: the
         // part of the page the selection covers, so each move renders
         // only it anew, not the whole page (#3559).
         let was = raster.live_region.is_some();
         raster.live_region = live_colour_region(app, preview);
+        // The drag is over: the fast path patched only what it could
+        // prove the colour changes. Forget the key, keep the picture,
+        // so the next frame renders the whole page once and nothing the
+        // patch could have missed stays stale (#3559).
         if was && raster.live_region.is_none() {
             raster.end_live_colour_drag();
         }
+        // While the wheel's glide is on its way, the picture is drawn for the
+        // view it lands at: the turn's render is not spent on a zoom the
+        // glide has already passed, and when the glide ends the view is put
+        // at the same view the picture was drawn for.
+        raster.zoom_target = app.zoom_glide.target_view();
     }
     let main = app.raster.borrow_mut().texture(
         painter.ctx(),
@@ -975,6 +1002,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         if let Some((bands, bands_at, _)) = incoming {
             painter.image(bands, bands_at, full, Color32::WHITE);
         }
+        app.paint_edited_text_overlay(painter, rect);
     }
 
     if !clean_sheet {
@@ -2126,6 +2154,13 @@ fn draw_anchors(app: &App, painter: &Painter) {
                 shown.push((to, false));
             }
         }
+        // Before the drag, the anchors of the object under the pointer, so
+        // the connector can start on the one wanted (#3860).
+        (Tool::Connector | Tool::RightAngleConnector | Tool::RoundedConnector, Drag::None) => {
+            if let Some(id) = app.pointer_page.and_then(|p| app.hit_test(p)) {
+                shown.push((id, false));
+            }
+        }
         _ => {}
     }
     for (id, editing) in shown {
@@ -2316,6 +2351,13 @@ fn symmetry_copy_paths(
             symmetry_copy_paths(&c, edited, out);
         }
     }
+}
+
+/// Whether the drag outline shows while the selection is transformed:
+/// always, unless the objects are drawn where they go (`live`) and
+/// Options > Display has the outline over them off (#3704).
+fn shows_transform_outline(app: &App, live: bool) -> bool {
+    !live || app.settings.transform_outline_over_objects
 }
 
 pub fn draw_transform_outline(app: &App, painter: &Painter, t: Affine) {
@@ -4947,6 +4989,21 @@ mod tests {
                 && !bottom.is_empty(),
             "the bottom drawn in, scaled: {bottom:?}"
         );
+    }
+
+    /// #3704: the drag outline over the objects shown while transforming
+    /// is on by default and can be turned off; without the objects shown
+    /// the outline always shows.
+    #[test]
+    fn the_outline_over_objects_while_transforming_can_be_hidden() {
+        let mut app = App::headless();
+        assert!(app.settings.transform_outline_over_objects);
+        assert!(shows_transform_outline(&app, true));
+        app.settings.transform_outline_over_objects = false;
+        assert!(!shows_transform_outline(&app, true));
+        assert!(shows_transform_outline(&app, false));
+        let old: crate::settings::Settings = serde_json::from_str("{}").expect("old settings");
+        assert!(old.transform_outline_over_objects, "on for settings saved before");
     }
 
     /// Show objects while transforming is off by default (#3569).

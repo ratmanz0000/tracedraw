@@ -6,8 +6,63 @@ full, row-by-row status.
 
 ## Unreleased
 
-- Pictures: a decoded picture stays in the cache while it fits the whole picture budget, where it used to be dropped once it took more than half of it, so a picture whose level takes most of the budget was decoded again on every draw of the view. The budget follows the machine, read again at every decode: half of the scarcer of the free physical memory and the free commit limit (physical plus what the page file may still take), counting back the bytes the cache holds, at least 64 MiB and at most a quarter of the memory of the machine (a 32-bit process: a quarter of its address space). On a nearly full machine (a pagefile on a full disk) the budget stops at 64 MiB instead of running the process out of memory, and where free memory cannot be read (the browser, macOS, Android) the fixed budget stands (512 MB, 256 MB in the browser).
-- Large drawings: dragging a fill or an outline colour in a picker repaints only the part of the page the selection covers, and paint commands skip the two text passes they cannot change, so a live colour drag stays quick on heavy pages (#3559; PR #3627 by ratmanz0000).
+- Typing in a large drawing: a text change made in place updates only that text instead of walking the whole document, a render for an older state of the drawing gives up as soon as a newer one is due, and the text being edited is drawn over the page picture already made (#3902, #3903, #3904; PR #3910 by ratmanz0000).
+- Pictures: a grey picture is turned into grey levels in one pass over its pixels, and placed pictures are written with the same quick setting as the others (PR #3915 by ratmanz0000).
+- Metafiles: text a metafile stores as glyph numbers comes in as text, or as the glyphs' outlines where no character matches, instead of question marks; the character set of the metafile's fonts (Cyrillic, Central European, Greek, Turkish, Hebrew, Arabic, Baltic, Vietnamese, Thai, Japanese, Korean, Chinese) is read and written, and spreadsheets in other encodings are read right (#3920, #3921; PR #3924 by ratmanz0000).
+- Symbols panel: By similarity turns every group that copies the selected one into an instance of one symbol where it stands, labels staying text; Replace merges one symbol into another with every instance following, in one undo step; a double click on a symbol's name renames it (#2343; PR #3801 by ratmanz0000).
+- Benchmark: Test Without the Graphics Card no longer turns Light zoom on for everyday use; a run with another renderer than a normal start only compares, and says so (#3664).
+- PDF, EPS and EMF import: a shape drawn as one outline that loops over itself, such as the 9 and the 6 of a bold font converted to curves, fills solid again instead of showing slivers of holes where the loop overlaps (#3868, #3224).
+- Text in a group: choosing one text inside a group, then another, shows each one's own font, size and style in the property bar instead of keeping those of the text chosen before (#3896).
+- .cdr import: a radial fountain fill or transparency from version 16 files on runs from its centre out to the object's own edges, as the file sets it, instead of reaching past them to the corners of the box; a radial transparency on an ellipse now fades out at the ellipse's edge (#3805).
+- Object Data docker: a Data Sheet button opens a small spreadsheet of the selected objects (or every object on the page) with their data fields as columns, nested group members under a Show levels setting, cells you can edit in place, and a total of the Cost column (#3084).
+- PDF import: text in an embedded Type 1 font shows its accented letters (ě, ř, š and the like) as the file does, read through the font's own encoding instead of the Windows code page, and comes in as curves from the font's outlines when text is imported as curves (#3810).
+- Contours, blends and extrusions: the worked-out steps of up to 32 objects are kept instead of 8, and found by the object first, so a page with several of them no longer works them out again at each move of the pointer (#3765).
+- Windows setup: it always writes a log in the Temp folder, also when an older TraceDraw starts it for an update, so an update that is undone can be looked into (#3816).
+- Break Apart (Ctrl+K) on a text frame gives one artistic text per line, where the line was; Combine (Ctrl+L) on texts makes one text that stays editable, read from the top line down, instead of curves (#3763).
+- Connector: the anchors of the object under the pointer show before the drag, and an end of a connector dragged with the Shape tool onto another anchor joins it there instead of letting the connector go (#3860).
+- Objects docker: while a PowerClip's contents are edited they stay listed inside it, and a content's row dragged onto the layer or beside an object outside takes it out of the PowerClip (#3846).
+- Canvas: a picture drawn in bands is put together as each band finishes, without a second whole picture of finished bands beside it, so large views take less memory for a moment (#3883; PR #3884 by Anton Karpov).
+- Typing in a large text: the shaping and outline caches let go of one entry at a time instead of emptying, and a paragraph frame keeps whether it overflows until its own text changes, so a keystroke no longer lays every frame out again (#3876; PR #3828 by ratmanz0000).
+- Zoom with the wheel on a large drawing: the render under way keeps going while the wheel turns, and the picture is drawn for the view the glide lands at, so the drawing comes back sharp sooner after a turn (#3878; PR #3882 by ratmanz0000).
+- Pictures: a decoded picture stays in the cache while it fits the whole budget (it was dropped past half of it and decoded again at every draw), and the budget follows the free memory of the machine, read at most once a second (#3874; PR #3838 by ratmanz0000).
+- Large drawings: dragging a fill or an outline colour in a picker repaints only the part of the page the selection covers, and paint commands skip the text passes they cannot change (#3875; PR #3836 by ratmanz0000).
+- Pick tool: an object with only effects the renderer draws (transparency, lens, shadows, glow, blur, halftone, Blend If) is picked without working its effects out at every move of the pointer (#3756).
+- A uniform transparency reads its one mask value once instead of once a pixel (#3761).
+- Export: a picture wider than JPEG, GIF or WebP can hold says so at once and points to PNG or TIFF, which are written a strip at a time at any size, instead of first drawing the whole page in memory (#3803).
+- Edit Inside: the Layers panel keeps its size when Edit Inside is entered again after Finish or Cancel; it came back a few pixels high (#3852).
+- Multipage View: Zoom to Page (Shift+F4) and Zoom to Fit (F4) take the page in use instead of every page shown, and a double click on "1 of N" in the page bar opens Go to Page (#3780).
+- Right-click menu: Change Case is offered on a selected text and while typing one (#3826).
+- Smart Fill: Use Guidelines on its bar lets the guidelines shown close off the area too, as in the Shape Builder (#3863).
+- Colour panel "..." menu: Swap Fills exchanges the fills of two selected objects, and Outline From Fill gives each selected object's outline the colour of its own fill (#3770).
+- Align and Distribute: two more Distribute to choices, the page with even margins and inside the largest selected object, keep the same gap at the edges as between the objects (#3768).
+- Copy Properties From: Width and Height boxes stretch the selected objects to the size of the object clicked (#3825).
+- Symbols: the panel's previews frame each symbol on what it draws, nested strokes included, and a symbol is edited upright on a clean white sheet with Cancel beside Finish; editing from the Symbols panel no longer adds an instance to the page (#3899, #3900; thanks ratmanz0000).
+- Property bar: a drag left or right on the outline width box's arrow, or on the pen picture before it, slides the width through the list as on the number fields (#3862).
+- Document Options, Rulers: the vertical ruler can count from the top of the page down (#3872).
+- Object menu: Break Apart Keeping Holes splits a curve into its parts with each hole kept in the part around it, so the inside of an O stays in the O (#3700).
+- WMF export: a Dashed lines as solid lines box writes dashed and dotted outlines as solid lines; in tracedraw-cli, TRACEDRAW_WMF_SOLID_DASHES=1 does the same (#3819).
+- Welcome screen: drawings on a network share or a USB drive show their folder as typed, without the `\\?\UNC\` or `\\?\` in front (#3812).
+- Colour Eyedropper: with Treat All Objects as Filled, an unfilled object lying over others no longer keeps the colour beneath it from being read; inside it the object beneath is read, on its outline its outline colour (#3856).
+- Text tool: over the outline of a curve inside a group (or a clip frame) the tool offers to type along it, as on a loose curve, and a click starts the text on it (#3864).
+- Edit Inside: the middle button pans the view while a picture is edited, as everywhere else (#3855).
+- Objects panel: a Ctrl+click (or Shift+click) on a row keeps the list where it is scrolled; it jumped back to the first selected object (#3822).
+- A drawing sent zipped (`name.cdr.zip`, as messaging apps save it) opens when the .zip is dropped on the window: the drawings inside open, its other files are left (#3853).
+- Shape tool: dragging a handle of one curve no longer undoes the handle drag just made on another curve (#3689).
+- New Document: a name in Hebrew or Arabic reads right to left in the Name field, as in Save Drawing (#3885).
+- Properties docker: dragging the outline width slider changes the outline as it moves, in one undo step; it changed only when let go (#3823).
+- Select All with facing pages takes the objects of both pages of the spread shown, a text frame continued on the facing page among them; they stay on their own page (#3744).
+- Shape tool: with Alt held, dragging a node's handle drags the node, the handle keeping its place about it (#3719).
+- Tables: the text of a cell aligns from top to bottom (top, centre, bottom) with Align within Frame in the Text docker or the text bar; it did nothing in a cell (#3859).
+- Save Drawing: a click on a column title of the folder list sorts it, and a second click sorts it the other way round (#3858).
+- Shape Builder: selected open curves cut objects into parts, and the cells a grid of lines closes in become parts of their own (#3814).
+- Options > Display: Outline over the objects while transforming; turned off, with Show objects while transforming on, only the objects are drawn while they are moved, scaled or turned (#3704).
+- Insert Formula: a formula fills as text does, so overlapping letter contours no longer leave holes, and a space typed between words (`\text{...}`) and the formula is kept (#3793).
+
+## 0.50.3 (2026-11-22)
+
+- A window that stops responding for more than 10 seconds says so once it comes through and offers to send a report of what TraceDraw was doing (the version, the system, the renderer, the tool, the last command, the size of the drawing, never its name or contents, and the end of the log); a hang the program was ended in, or a crash, is offered at the next start. Send Report opens a new GitHub issue with a summary filled in and the folder holding the report; nothing is sent by itself. System file dialogs held open do not count (#3665, #3687, #3883).
+- Facing pages: in the Multipage View an object let go with its middle on another page, the facing page included, becomes that page's; since 0.50.1 it went back to its own page (#3847).
+
 ## 0.50.2 (2026-11-21)
 
 - PDF/X: the output condition follows the drawing's CMYK profile (the one loaded in Colour Management, else the one the drawing carries or was made with), shown greyed in the field while none is typed; it was "FOGRA39" whatever the drawing's profile, so a drawing for U.S. Web Coated (SWOP) v2 went out labelled for another press. A well-known profile goes by the ICC registry's name ("CGATS TR 001" for SWOP v2) as the output condition identifier (#3829).

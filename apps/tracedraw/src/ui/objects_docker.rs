@@ -589,12 +589,15 @@ fn zoom_thumbs(app: &mut App, steps: i32) {
     );
 }
 
+/// The selection the list last showed (see [`scroll_target`]).
+const SEEN_SELECTION: &str = "objects_seen_selection";
+
 /// The object whose row the list scrolls to this frame: the first
 /// selected one, when the selection is not the one the list last showed
 /// (a pick on the page, a Select All, an undo), so a selection far down a
 /// long list comes into view (#1044).
 fn scroll_target(app: &App, ui: &Ui) -> Option<ShapeId> {
-    let seen = egui::Id::new("objects_seen_selection");
+    let seen = egui::Id::new(SEEN_SELECTION);
     let changed = ui.data_mut(|d| {
         let last = d.get_temp::<Vec<ShapeId>>(seen);
         d.insert_temp(seen, app.selection.clone());
@@ -1010,8 +1013,26 @@ fn layer_rows(
         }
     });
     if open {
+        // While a PowerClip's contents are edited they stay listed inside
+        // it (#3846: the frame showed as an object of its own beside
+        // them), so a content can still be dragged out of it.
+        let contents = app.clip_edit_contents();
+        let frame = app.clip_frame_edit.as_ref().map(|(f, _)| *f);
         for s in layer.shapes.iter().rev() {
+            if contents.contains(&s.id) {
+                continue;
+            }
             object_rows(app, ui, s, LAYER_OBJECT_DEPTH, act);
+            if Some(s.id) == frame {
+                for c in app
+                    .page_layers()
+                    .iter()
+                    .flat_map(|l| l.shapes.iter().rev())
+                    .filter(|c| contents.contains(&c.id))
+                {
+                    object_rows(app, ui, c, LAYER_OBJECT_DEPTH + 1, act);
+                }
+            }
         }
     }
 }
@@ -2710,7 +2731,13 @@ fn drop_rows(app: &mut App, ids: &[ShapeId], drop: RowDrop) {
         }
         RowDrop::Layer(l) => Some(l),
     };
+    let frees = frees_clip_contents(app, ids, drop);
     let cmds = drop_commands(app, ids, drop);
+    if cmds.is_empty() && frees {
+        // Already on that layer: only out of the PowerClip.
+        free_clip_contents(app, ids);
+        return;
+    }
     let Some(layer) = layer.filter(|_| !cmds.is_empty()) else {
         return;
     };
@@ -2732,6 +2759,43 @@ fn drop_rows(app: &mut App, ids: &[ShapeId], drop: RowDrop) {
     }
     app.picked_layer = Some(layer);
     app.select(ids.to_vec());
+    if frees {
+        free_clip_contents(app, ids);
+    }
+}
+
+/// `ids`, contents of the PowerClip being edited, stay out of it when the
+/// edit ends (#3846); with nothing left inside, the edit ends now.
+fn free_clip_contents(app: &mut App, ids: &[ShapeId]) {
+    if let Some((_, outside)) = app.clip_frame_edit.as_mut() {
+        outside.extend(ids.iter().copied());
+    }
+    if app.clip_edit_contents().is_empty() {
+        app.finish_clip_frame_edit();
+    }
+    app.select(ids.to_vec());
+}
+
+/// Whether dropping the rows of `ids` where `drop` says takes them out
+/// of the PowerClip whose contents are being edited (#3846): they are all
+/// contents, and they go onto a layer, or beside the frame or an object
+/// outside it. They then stay out when the edit ends.
+fn frees_clip_contents(app: &App, ids: &[ShapeId], drop: RowDrop) -> bool {
+    let Some((frame, outside)) = &app.clip_frame_edit else {
+        return false;
+    };
+    let contents = app.clip_edit_contents();
+    if ids.is_empty() || !ids.iter().all(|id| contents.contains(id)) {
+        return false;
+    }
+    let out = |id: ShapeId| id == *frame || outside.contains(&id);
+    match drop {
+        RowDrop::Layer(_) => true,
+        RowDrop::Object { reference, .. } => {
+            out(reference) || app.doc().ancestors(reference).into_iter().any(out)
+        }
+        RowDrop::Into(_) | RowDrop::Clip(_) => false,
+    }
 }
 
 /// Whether rows carrying `ids` can be dropped into `target` as a
@@ -3104,6 +3168,10 @@ fn apply(app: &mut App, ui: &Ui, mut act: Actions) {
         let anchor: Option<ShapeId> = ui.data(|d| d.get_temp(key));
         let anchor = select_row(app, id, &act.row_order, anchor, shift, ctrl);
         ui.data_mut(|d| d.insert_temp(key, anchor));
+        // A selection made in the list itself is in view already: the list
+        // stays where it is scrolled, not jumping back to the first
+        // selected row on a Ctrl+click (#3822).
+        ui.data_mut(|d| d.insert_temp(egui::Id::new(SEEN_SELECTION), app.selection.clone()));
         if let Some(layer) = layer_holding(app, id) {
             app.picked_layer = Some(layer);
         }
@@ -4145,6 +4213,86 @@ pub(crate) mod tests {
         assert!(!shown(row_of(far)), "{:?}", row_of(far));
     }
 
+    /// #3822: with an object far down the list selected, the list
+    /// scrolled up by hand and a row there Ctrl+clicked, the list jumped
+    /// back down to the first selected object; it stays where it is.
+    #[test]
+    fn a_ctrl_click_in_the_list_keeps_its_scroll() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let ids: Vec<ShapeId> = (0..80)
+            .map(|_| app.new_shape(rect_kind()).expect("shape"))
+            .collect();
+        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let run = |app: &mut App, events: Vec<egui::Event>, ctrl: bool| {
+            let mut all = vec![egui::Event::ModifiersChanged(if ctrl {
+                egui::Modifiers::COMMAND
+            } else {
+                egui::Modifiers::NONE
+            })];
+            all.extend(events);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 300.0),
+                )),
+                events: all,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| objects_docker(app, ui));
+            out.textures_delta.clear();
+        };
+        let row_of = |id: ShapeId| {
+            ctx.read_response(egui::Id::new(("objects_object", id.raw())).with("eye"))
+                .map(|r| r.rect)
+        };
+        let shown =
+            |r: Option<egui::Rect>| r.is_some_and(|r| r.top() >= 0.0 && r.bottom() <= 300.0);
+        let far = ids[0];
+        app.select(vec![far]);
+        for _ in 0..4 {
+            run(&mut app, Vec::new(), false);
+        }
+        assert!(shown(row_of(far)), "{:?}", row_of(far));
+        // Back up to the top of the list by hand.
+        for _ in 0..4 {
+            run(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(Pos2::new(150.0, 150.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, 5000.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                false,
+            );
+        }
+        let top = *ids.last().expect("ids");
+        let r = row_of(top)
+            .filter(|r| shown(Some(*r)))
+            .expect("top row in view");
+        // Ctrl+click on its name, left of its eye.
+        let at = Pos2::new(r.left() - 100.0, r.center().y);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        run(&mut app, vec![egui::Event::PointerMoved(at)], true);
+        run(&mut app, vec![press(true)], true);
+        run(&mut app, vec![press(false)], true);
+        for _ in 0..3 {
+            run(&mut app, Vec::new(), false);
+        }
+        assert!(app.selection.contains(&top), "{:?}", app.selection);
+        assert!(app.selection.contains(&far), "{:?}", app.selection);
+        assert!(shown(row_of(top)), "jumped away: {:?}", row_of(top));
+    }
+
     #[test]
     fn the_docker_draws_layers_groups_and_selection() {
         let mut app = App::headless();
@@ -4982,6 +5130,38 @@ mod drag_tests {
         );
         assert_eq!(order(&app, 0), [c, a, g]);
         assert_eq!(children(&app, g), [b]);
+    }
+
+    /// #3846: while a PowerClip's contents are edited (after a click on a
+    /// content's row) they stay listed inside the frame's row, and a
+    /// content's row dragged onto the layer's row takes it out of the
+    /// PowerClip for good; the others go back in when the edit ends.
+    #[test]
+    fn a_content_row_dragged_out_of_a_powerclip_frees_it() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let a = app.new_shape(rect_kind()).expect("a");
+        let b = app.new_shape(rect_kind()).expect("b");
+        let c = app.new_shape(rect_kind()).expect("c");
+        clip_rows(&mut app, &[b, c], a);
+        app.select(vec![a]);
+        app.edit_clip_frame();
+        assert!(app.clip_frame_edit.is_some());
+        frame(&ctx, &mut app, Vec::new());
+        let (ra, rb, rc) = (object_row(&ctx, a), object_row(&ctx, b), object_row(&ctx, c));
+        // Listed under the frame, one step in.
+        assert!(rb.top() >= ra.bottom() - 0.5 && rc.top() >= ra.bottom() - 0.5, "{ra:?} {rb:?} {rc:?}");
+        let layer = app.active_layer().expect("layer");
+        let rl = layer_row(&ctx, layer);
+        app.select(vec![c]);
+        drag(&ctx, &mut app, rc.center(), rl.center());
+        app.finish_clip_frame_edit();
+        let contents = match &app.doc().find_shape(a).expect("a").kind {
+            ShapeKind::ClipFrame { contents, .. } => contents.iter().map(|s| s.id).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(contents, [b]);
+        assert!(app.doc().shape(c).is_ok(), "c on the layer, free");
     }
 
     /// PowerClips in the list (#3053): a row let go in the middle of

@@ -404,6 +404,44 @@ impl App {
         Some(self.leaf_at(s, p, tol).unwrap_or_else(|| s.clone()))
     }
 
+    /// The part a colour is read from at `p`: as [`Self::leaf_to_read`],
+    /// but an unfilled object hit only because Treat All Objects as Filled
+    /// counts its inside lets the objects beneath be read: its inside
+    /// shows them, not a colour of its own (#3856).
+    pub fn leaf_to_read_color(&self, p: Point) -> Option<tracedraw_core::Shape> {
+        if self.focus_shape_on_page().is_some() || !self.settings.treat_all_filled {
+            return self.leaf_to_read(p);
+        }
+        let tol = self.object_pick_tol();
+        let fill_open = self.doc().metadata.fill_open_curves;
+        self.page_layers()
+            .into_iter()
+            .rev()
+            .filter(|l| l.visible)
+            .flat_map(|l| l.shapes.iter().rev())
+            .filter(|s| s.visible && self.shape_hit(s, p, tol))
+            .map(|s| self.leaf_at(s, p, tol).unwrap_or_else(|| s.clone()))
+            .find(|leaf| {
+                let plain = leaf.effects.is_empty()
+                    && !matches!(
+                        leaf.kind,
+                        ShapeKind::Text { .. }
+                            | ShapeKind::Table(_)
+                            | ShapeKind::Bitmap { .. }
+                            | ShapeKind::Group { .. }
+                            | ShapeKind::ClipFrame { .. }
+                            | ShapeKind::SymbolInstance { .. }
+                    );
+                let unfilled =
+                    matches!(leaf.fill, Fill::None) || (leaf.kind.is_open_curve() && !fill_open);
+                if !(plain && unfilled) {
+                    return true;
+                }
+                let half = outline_reach(leaf, leaf.transform);
+                crate::canvas::distance_to_path(&leaf.page_path(), p) <= (tol * 1.5).max(half + tol)
+            })
+    }
+
     /// The innermost part of the object `id` under `p` (see
     /// [`Self::leaf_to_read`]), its transforms composed; `None` when
     /// `p` is on no part of it.
@@ -756,55 +794,41 @@ impl App {
         {
             return false;
         }
-        if !s.effects.is_empty() {
-            // Effects the renderer draws from the object as it is (a
-            // transparency, a lens, shadows, a blur) add no objects and
-            // warp no outline: evaluate would only clone the shape and
-            // hand the same geometry back, on every pointer move. Pick
-            // the object itself then, without that clone. Containers keep
-            // the evaluated path: the box their pick re-reads spans the
-            // members' own effects and the symbols they hold.
-            let renderer_only = s.effects.iter().all(|e| e.drawn_by_renderer());
-            let container = matches!(
+        // Effects the renderer draws (a lens, a transparency, shadows, a
+        // glow, a blur, a halftone, Blend If) leave the object's outline
+        // as it is: it is picked as it stands, without working the effects
+        // out and copying the object at every move of the pointer (#3756).
+        // Groups, clip frames and symbols keep the full path below.
+        let renderer_only = !s.effects.is_empty()
+            && s.effects.iter().all(|e| e.drawn_by_renderer())
+            && !matches!(
                 s.kind,
                 ShapeKind::Group { .. }
                     | ShapeKind::ClipFrame { .. }
                     | ShapeKind::SymbolInstance { .. }
             );
-            if renderer_only && !container {
-                // A lens shows over its whole inside, filled or not
-                // (#2549); its outline is the object's own.
-                if s.effects
-                    .iter()
-                    .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
-                    && tracedraw_core::command::close_subpaths(&s.page_path()).contains(p)
-                {
-                    return true;
-                }
-                // The plain pick below reads the same geometry the
-                // evaluated part carried, within the same box.
-            } else {
-                // What the object draws: its warped outline and the objects
-                // its effects add.
-                let ev = tracedraw_core::live::evaluate(s);
-                // A lens shows over its whole inside, filled or not: a closed
-                // shape with a Transparency lens lying over other objects is
-                // picked (and its colour read) there, not the objects beneath
-                // (#2549).
-                if s.effects
-                    .iter()
-                    .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
-                    && tracedraw_core::command::close_subpaths(&ev.main.page_path()).contains(p)
-                {
-                    return true;
-                }
-                return std::iter::once(ev.main)
-                    .chain(ev.below)
-                    .chain(ev.above)
-                    .any(|mut part| {
-                        part.effects.clear();
-                        self.shape_hit_in(&part, p, tol, depth)
-                    });
+        if renderer_only
+            && s.effects
+                .iter()
+                .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
+            && tracedraw_core::command::close_subpaths(&s.page_path()).contains(p)
+        {
+            return true;
+        }
+        if !s.effects.is_empty() && !renderer_only {
+            // What the object draws: its warped outline and the objects
+            // its effects add.
+            let ev = tracedraw_core::live::evaluate(s);
+            // A lens shows over its whole inside, filled or not: a closed
+            // shape with a Transparency lens lying over other objects is
+            // picked (and its colour read) there, not the objects beneath
+            // (#2549).
+            if s.effects
+                .iter()
+                .any(|e| matches!(e, tracedraw_core::live::Effect::Lens(_)))
+                && tracedraw_core::command::close_subpaths(&ev.main.page_path()).contains(p)
+            {
+                return true;
             }
         }
         // A dimension is picked on its lines, arrowheads and label only,
@@ -1921,8 +1945,13 @@ impl App {
             }
             return;
         }
-        // A picture edited in place takes the pointer.
+        // A picture edited in place takes the pointer; the middle button
+        // still pans there, as everywhere (#3855).
         if self.pixel_edit.is_some() {
+            if response.dragged_by(PointerButton::Middle) {
+                self.pan_drag(response.drag_delta(), &response.ctx);
+                return;
+            }
             self.pixel_edit_input(response, pointer, mods);
             return;
         }
@@ -5050,6 +5079,10 @@ impl App {
         // An import waiting for its place: Space or Enter centres it on
         // the page, Esc calls it off (#1936).
         if self.import_placement_keys(ctx) {
+            return;
+        }
+        // Space over the Shape Generator's growth starts or pauses it.
+        if crate::ui::shape_gen_docker::growth_keys(self, ctx) {
             return;
         }
         // Esc during a move, scale, rotation or skew cancels it: nothing
