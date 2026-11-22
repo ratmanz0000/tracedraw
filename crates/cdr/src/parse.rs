@@ -104,9 +104,10 @@ fn plan_bitmap_scale(datas: &[&[u8]], v: u16, free_ram: u64) -> f64 {
     } else {
         1.0
     };
-    // The pixels view's texture is 8192 on a side.
-    if max_side as f64 * k > 8192.0 {
-        k = 8192.0 / max_side as f64;
+    // The renderer's pixmap limit is 32768 on a side (8192 is only the
+    // screen window of the Pixels view, not the stored bitmap).
+    if max_side as f64 * k > 32_768.0 {
+        k = 32_768.0 / max_side as f64;
     }
     let k = k.clamp(0.02, 1.0);
     if k < 1.0 {
@@ -6353,55 +6354,147 @@ fn decode_bitmap(
     let out_h = if full { height } else { ((height as f64 * scale).ceil() as u32).clamp(1, height) };
     let step_x = width as f64 / out_w as f64;
     let step_y = height as f64 / out_h as f64;
-    let mut rgba = Vec::with_capacity(out_w as usize * out_h as usize * 4);
+    let (w_out, h_out) = (out_w as usize, out_h as usize);
+    let total_px = w_out.checked_mul(h_out)?;
+    let mut rgba = vec![0u8; total_px.checked_mul(4)?];
     // A CMYK image's inks, plane after plane (cyan, magenta, yellow,
     // black), for separations (#1659). Sampled pictures skip the planes.
-    let plane = width as usize * height as usize;
+    let plane = (width as usize).checked_mul(height as usize)?;
     let mut planes = if cmyk && full {
-        vec![0u8; plane * 4]
+        vec![0u8; plane.checked_mul(4)?]
     } else {
         Vec::new()
     };
-    for oy in 0..out_h as usize {
-        let sy = if full { oy } else { (oy as f64 * step_y) as usize };
-        // Bottom-up rows.
-        let src = &pixels[(height as usize - 1 - sy) * stride..][..stride];
-        for ox in 0..out_w as usize {
-            let x = if full { ox } else { (ox as f64 * step_x) as usize };
-            let px: [u8; 4] = match bpp {
-                32 if cmyk => {
-                    let ink = [src[x * 4], src[x * 4 + 1], src[x * 4 + 2], src[x * 4 + 3]];
-                    if full {
-                        let at = oy * width as usize + ox;
-                        for (i, v) in ink.iter().enumerate() {
-                            if let Some(p) = planes.get_mut(i * plane + at) {
-                                *p = *v;
+    let xs: Vec<usize> = (0..w_out)
+        .map(|ox| if full { ox } else { (ox as f64 * step_x) as usize })
+        .collect();
+    let palette_ref = &palette[..];
+    let xs_ref = &xs[..];
+    let fill_band = |y_start: usize,
+                     band_rgba: &mut [u8],
+                     mut band_planes: Option<(&mut [u8], &mut [u8], &mut [u8], &mut [u8])>| {
+        let row_bytes = w_out * 4;
+        let rows = band_rgba.len() / row_bytes;
+        let w_src = width as usize;
+        for local_y in 0..rows {
+            let oy = y_start + local_y;
+            let sy = if full { oy } else { (oy as f64 * step_y) as usize };
+            // Bottom-up rows.
+            let src = &pixels[(height as usize - 1 - sy) * stride..][..stride];
+            let dst_row = &mut band_rgba[local_y * row_bytes..(local_y + 1) * row_bytes];
+            for (ox, (&x, dst)) in xs_ref
+                .iter()
+                .zip(dst_row.chunks_exact_mut(4))
+                .enumerate()
+            {
+                let px: [u8; 4] = match bpp {
+                    32 if cmyk => {
+                        let ink = [src[x * 4], src[x * 4 + 1], src[x * 4 + 2], src[x * 4 + 3]];
+                        if let Some((cp, mp, yp, kp)) = band_planes.as_mut() {
+                            let at = local_y * w_src + ox;
+                            if let Some(p) = cp.get_mut(at) {
+                                *p = ink[0];
+                            }
+                            if let Some(p) = mp.get_mut(at) {
+                                *p = ink[1];
+                            }
+                            if let Some(p) = yp.get_mut(at) {
+                                *p = ink[2];
+                            }
+                            if let Some(p) = kp.get_mut(at) {
+                                *p = ink[3];
+                            }
+                        }
+                        cmyk_pixel(ink, lut)
+                    }
+                    32 => [src[x * 4 + 2], src[x * 4 + 1], src[x * 4], 255],
+                    24 => [src[x * 3 + 2], src[x * 3 + 1], src[x * 3], 255],
+                    8 => {
+                        let i = src[x] as usize;
+                        match palette_ref.get(i) {
+                            Some(c) => [c[0], c[1], c[2], 255],
+                            None => [src[x], src[x], src[x], 255],
+                        }
+                    }
+                    _ => {
+                        let bit = (src[x / 8] >> (7 - (x % 8))) & 1;
+                        match palette_ref.get(bit as usize) {
+                            Some(c) => [c[0], c[1], c[2], 255],
+                            None => {
+                                let g = if bit == 0 { 0 } else { 255 };
+                                [g, g, g, 255]
                             }
                         }
                     }
-                    cmyk_pixel(ink, lut)
+                };
+                dst.copy_from_slice(&px);
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let bands = if total_px >= 4_000_000 && h_out >= 4 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 8)
+            .min(h_out)
+    } else {
+        1
+    };
+    #[cfg(target_arch = "wasm32")]
+    let bands = 1usize;
+    #[cfg(not(target_arch = "wasm32"))]
+    if bands > 1 {
+        let band_rows = h_out.div_ceil(bands);
+        let row_bytes = w_out * 4;
+        if cmyk && full {
+            let w_src = width as usize;
+            let (cp, rest) = planes.split_at_mut(plane);
+            let (mp, rest) = rest.split_at_mut(plane);
+            let (yp, kp) = rest.split_at_mut(plane);
+            std::thread::scope(|scope| {
+                for (bi, ((((r_band, c_band), m_band), y_band), k_band)) in rgba
+                    .chunks_mut(band_rows * row_bytes)
+                    .zip(cp.chunks_mut(band_rows * w_src))
+                    .zip(mp.chunks_mut(band_rows * w_src))
+                    .zip(yp.chunks_mut(band_rows * w_src))
+                    .zip(kp.chunks_mut(band_rows * w_src))
+                    .enumerate()
+                {
+                    let y0 = bi * band_rows;
+                    scope.spawn(move || {
+                        fill_band(y0, r_band, Some((c_band, m_band, y_band, k_band)));
+                    });
                 }
-                32 => [src[x * 4 + 2], src[x * 4 + 1], src[x * 4], 255],
-                24 => [src[x * 3 + 2], src[x * 3 + 1], src[x * 3], 255],
-                8 => {
-                    let i = src[x] as usize;
-                    match palette.get(i) {
-                        Some(c) => [c[0], c[1], c[2], 255],
-                        None => [src[x], src[x], src[x], 255],
-                    }
+            });
+        } else {
+            std::thread::scope(|scope| {
+                for (bi, r_band) in rgba.chunks_mut(band_rows * row_bytes).enumerate() {
+                    let y0 = bi * band_rows;
+                    scope.spawn(move || {
+                        fill_band(y0, r_band, None);
+                    });
                 }
-                _ => {
-                    let bit = (src[x / 8] >> (7 - (x % 8))) & 1;
-                    match palette.get(bit as usize) {
-                        Some(c) => [c[0], c[1], c[2], 255],
-                        None => {
-                            let g = if bit == 0 { 0 } else { 255 };
-                            [g, g, g, 255]
-                        }
-                    }
-                }
-            };
-            rgba.extend_from_slice(&px);
+            });
+        }
+    } else if cmyk && full {
+        let (cp, rest) = planes.split_at_mut(plane);
+        let (mp, rest) = rest.split_at_mut(plane);
+        let (yp, kp) = rest.split_at_mut(plane);
+        fill_band(0, &mut rgba, Some((cp, mp, yp, kp)));
+    } else {
+        fill_band(0, &mut rgba, None);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = bands;
+        if cmyk && full {
+            let (cp, rest) = planes.split_at_mut(plane);
+            let (mp, rest) = rest.split_at_mut(plane);
+            let (yp, kp) = rest.split_at_mut(plane);
+            fill_band(0, &mut rgba, Some((cp, mp, yp, kp)));
+        } else {
+            fill_band(0, &mut rgba, None);
         }
     }
     if full {
@@ -11107,6 +11200,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn large_cmyk_bitmap_decodes_in_bands_with_inks_intact() {
+        let (w, h): (u32, u32) = (2000, 2001);
+        let byte_len = w as usize * h as usize * 4;
+        let mut bmp = u32s(&[99]);
+        bmp.extend_from_slice(&[0; 50]);
+        bmp.extend_from_slice(&u32s(&[BITMAP_CMYK, 0, w, h, 0, 32, 0, byte_len as u32]));
+        bmp.extend_from_slice(&[0; 32]);
+        let mut pixels = vec![0u8; byte_len];
+        // Bottom row (oy = h - 1), first pixel: pure cyan [255, 0, 0, 0].
+        pixels[0..4].copy_from_slice(&[255, 0, 0, 0]);
+        // Top row (oy = 0), last pixel: pure magenta [0, 255, 0, 0].
+        let top_last = ((h as usize - 1) * w as usize + (w as usize - 1)) * 4;
+        pixels[top_last..top_last + 4].copy_from_slice(&[0, 255, 0, 0]);
+        bmp.extend_from_slice(&pixels);
+        let lut =
+            tracedraw_core::icc::CmykLut::with_points(3, |[c, m, _, k]| {
+                Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), 1.0 - k])
+            })
+            .unwrap();
+        let (_, def) = decode_bitmap(&bmp, 13, Some(&lut), 1.0)
+            .expect("header")
+            .expect("decoded");
+        assert_eq!((def.width_px, def.height_px), (w, h));
+        let inks = def.inks.as_ref().expect("inks kept");
+        assert!(inks.fits(&def.png));
+        let pm = tiny_skia::Pixmap::decode_png(&def.png).expect("png");
+        // Top row, last pixel -> pure magenta -> RGB [255, 0, 255].
+        let top = pm.pixel(w - 1, 0).expect("top").demultiply();
+        assert_eq!([top.red(), top.green(), top.blue()], [255, 0, 255]);
+        // Bottom row, first pixel -> pure cyan -> RGB [0, 255, 255].
+        let bot = pm.pixel(0, h - 1).expect("bot").demultiply();
+        assert_eq!([bot.red(), bot.green(), bot.blue()], [0, 255, 255]);
+    }
+
+    #[test]
     fn pattern_fill_version_13_reads_both_colours() {
         let mut p = vec![0u8; 8];
         p.extend_from_slice(&u32s(&[77])); // pattern id
@@ -13577,7 +13705,10 @@ pub(crate) mod tests {
                 assert_eq!(spans[0].tracking_pct, 0.0);
                 // The distance in points: 1.5 times 1.15 times 36 pt.
                 assert_eq!(para.leading_unit, LeadingUnit::Points);
-                assert!((para.leading_pct - 36.0 * 1.15 * 1.5).abs() < 1e-3, "{para:?}");
+                assert!(
+                    (para.leading_pct - 36.0 * 1.15 * 1.5).abs() < 1e-3,
+                    "{para:?}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -17652,7 +17783,11 @@ pub(crate) mod tests {
         assert_eq!(s.opacity, 1.0);
         let f = mask(&s).unwrap_or_else(|| panic!("{:?}", s.effects));
         assert_eq!(f.stops.len(), 3, "{:?}", f.stops);
-        assert!((grey(f.stops[1].color) - 128.0 / 255.0).abs() < 0.02, "{:?}", f.stops);
+        assert!(
+            (grey(f.stops[1].color) - 128.0 / 255.0).abs() < 0.02,
+            "{:?}",
+            f.stops
+        );
     }
 
     /// #2960: an object's vector pattern transparency read from its

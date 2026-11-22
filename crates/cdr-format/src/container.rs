@@ -205,7 +205,7 @@ pub fn external_member(bytes: &[u8], container: &Container, name: &str) -> Optio
             // inflates to and stops there.
             let declared = f.size();
             let limit = member_limit(declared);
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(declared.min(MAX_STREAM) as usize);
             if f.take(limit).read_to_end(&mut out).is_ok() {
                 if cut_short(out.len() as u64, limit, declared) {
                     log::warn!("{c} inflates past {limit} bytes; cut off there");
