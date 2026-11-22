@@ -307,8 +307,8 @@ fn cursor_coordinates(app: &App) -> String {
                 let g = t.to_gk(p);
                 s.push_str(&format!(
                     "  GK-42: X {} Y {}",
-                    crate::map_gk42::fmt_m(g.x),
-                    crate::map_gk42::fmt_m(g.y)
+                    crate::map_gk42::fmt_gk_cursor(g.x),
+                    crate::map_gk42::fmt_gk_cursor(g.y)
                 ));
             }
             s

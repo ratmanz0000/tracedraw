@@ -190,6 +190,7 @@ fn marker_position(doc: &Document, id: ShapeId) -> Option<Point> {
 
 /// The marker ids in force: the state's ones while they are being
 /// placed, the saved calibration's after it (or after a reload).
+#[allow(dead_code)]
 pub fn marker_ids(app: &App) -> Option<(ShapeId, ShapeId)> {
     let st = &app.map_gk42;
     if let (Some(a), Some(b)) = (st.marker1, st.marker2) {
@@ -430,6 +431,7 @@ fn group(n: i64) -> String {
 
 /// GK-42 metres for display: thousands with spaces, centimetres when
 /// there is a fraction (a comma as the decimal mark, as the maps do).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn fmt_m(v: f64) -> String {
     let sign = if v < 0.0 { "-" } else { "" };
     let a = (v.abs() * 100.0).round() / 100.0;
@@ -444,6 +446,28 @@ pub fn fmt_m(v: f64) -> String {
     } else {
         format!("{sign}{},{:02}", group(int), frac)
     }
+}
+
+/// GK-42 metres as whole metres without spaces or decimals, for the
+/// coordinate fields and the table ("7490000").
+pub fn fmt_gk_plain(v: f64) -> String {
+    format!("{}", v.round() as i64)
+}
+
+/// GK-42 metres at the cursor: whole metres split after the first two
+/// and the next two digits ("74 91 070", "42 53 1000").
+pub fn fmt_gk_cursor(v: f64) -> String {
+    let n = v.round() as i64;
+    let sign = if n < 0 { "-" } else { "" };
+    let d = n.unsigned_abs().to_string();
+    let body = if d.len() <= 2 {
+        d
+    } else if d.len() <= 4 {
+        format!("{} {}", &d[..2], &d[2..])
+    } else {
+        format!("{} {} {}", &d[..2], &d[2..4], &d[4..])
+    };
+    format!("{sign}{body}")
 }
 
 /// Page millimetres for display.
@@ -564,7 +588,11 @@ pub fn overlay(app: &App, painter: &Painter) {
             ];
             if let Some((t, _)) = transform_of(doc) {
                 let g = t.to_gk(p);
-                lines.push(format!("GK-42: X {} Y {}", fmt_m(g.x), fmt_m(g.y)));
+                lines.push(format!(
+                    "GK-42: X {}  Y {}",
+                    fmt_gk_cursor(g.x),
+                    fmt_gk_cursor(g.y)
+                ));
             }
             plate(painter, at + Vec2::new(14.0, -12.0), &lines);
         }
@@ -671,35 +699,57 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
 
     // The table.
     ui.add_space(4.0);
+    let avail = ui.available_width();
+    let col_gap = 4.0;
+    // Keep room for the row number, the delta column and the five column gaps;
+    // share the rest across the two mm fields and the two GK-42 fields, with
+    // minimum widths wide enough for "-1234.56" and "42531000" without clipping.
+    let field_room = (avail - 72.0).max(264.0);
+    let mm_w = (field_room * 0.22).max(60.0);
+    let gk_w = (field_room * 0.28).max(72.0);
     let mut commits: Vec<(ShapeId, Point)> = Vec::new();
     egui::Grid::new("gk42_table")
         .num_columns(6)
-        .spacing([5.0, 3.0])
+        .spacing([col_gap, 3.0])
         .show(ui, |ui| {
             ui.label(dim(&tr("gk42.table_n")));
-            ui.label(dim(&tr("gk42.table_mm")));
-            ui.label(dim(""));
-            ui.label(dim(&tr("gk42.table_gk")));
-            ui.label(dim(""));
+            ui.scope(|ui| {
+                ui.set_min_width(mm_w);
+                ui.label(dim(&tr("gk42.table_mm")));
+            });
+            ui.scope(|ui| {
+                ui.set_min_width(mm_w);
+                ui.label(dim("Y"));
+            });
+            ui.scope(|ui| {
+                ui.set_min_width(gk_w);
+                ui.label(dim(&tr("gk42.table_gk")));
+            });
+            ui.scope(|ui| {
+                ui.set_min_width(gk_w);
+                ui.label(dim("Y"));
+            });
             ui.label(dim(&tr("gk42.table_delta")))
                 .on_hover_text(tr("gk42.delta_tip"));
             ui.end_row();
             let t = preview_transform(app).map(|(t, _)| t);
-            let ids = marker_ids(app);
-            if let Some((a, b)) = ids {
+            if let Some(a) = marker_id(app, true) {
                 if let Some((id, target)) =
-                    marker_row(ui, &mut app.map_gk42, 1, 0, a, mm1, None)
+                    marker_row(ui, &mut app.map_gk42, 1, 0, a, mm1, mm_w, gk_w, None)
                 {
                     commits.push((id, target));
                 }
                 ui.end_row();
-                if let (Some(p1), Some(p2)) = (mm1, mm2) {
-                    let delta = t.as_ref().map(|t| fmt_m(delta_m(p1, p2, t)));
-                    if let Some((id, target)) =
-                        marker_row(ui, &mut app.map_gk42, 2, 1, b, mm2, delta)
-                    {
-                        commits.push((id, target));
-                    }
+            }
+            if let Some(b) = marker_id(app, false) {
+                let delta = match (mm1, mm2, t.as_ref()) {
+                    (Some(p1), Some(p2), Some(t)) => Some(fmt_gk_plain(delta_m(p1, p2, t))),
+                    _ => None,
+                };
+                if let Some((id, target)) =
+                    marker_row(ui, &mut app.map_gk42, 2, 1, b, mm2, mm_w, gk_w, delta)
+                {
+                    commits.push((id, target));
                 }
                 ui.end_row();
             }
@@ -781,8 +831,8 @@ fn seed(app: &mut App, saved: &Option<GkCalibration>) {
     let st = &mut app.map_gk42;
     st.seeded = true;
     if let Some(c) = saved {
-        st.gk1 = (fmt_m(c.gk1.x), fmt_m(c.gk1.y));
-        st.gk2 = (fmt_m(c.gk2.x), fmt_m(c.gk2.y));
+        st.gk1 = (fmt_gk_plain(c.gk1.x), fmt_gk_plain(c.gk1.y));
+        st.gk2 = (fmt_gk_plain(c.gk2.x), fmt_gk_plain(c.gk2.y));
     }
 }
 
@@ -828,6 +878,8 @@ fn marker_row(
     which: usize,
     id: ShapeId,
     mm: Option<Point>,
+    mm_w: f32,
+    gk_w: f32,
     delta: Option<String>,
 ) -> Option<(ShapeId, Point)> {
     let (mm_edit, gk_edit) = if which == 0 {
@@ -842,6 +894,7 @@ fn marker_row(
         ui,
         &mut mm_edit.0,
         &live1,
+        mm_w,
         ("gk42", if which == 0 { "m1x" } else { "m2x" }),
         "gk42.mm_x_tip",
     );
@@ -849,18 +902,21 @@ fn marker_row(
         ui,
         &mut mm_edit.1,
         &live2,
+        mm_w,
         ("gk42", if which == 0 { "m1y" } else { "m2y" }),
         "gk42.mm_y_tip",
     );
     gk_field(
         ui,
         &mut gk_edit.0,
+        gk_w,
         ("gk42", if which == 0 { "g1x" } else { "g2x" }),
         "gk42.gk_x_tip",
     );
     gk_field(
         ui,
         &mut gk_edit.1,
+        gk_w,
         ("gk42", if which == 0 { "g1y" } else { "g2y" }),
         "gk42.gk_y_tip",
     );
@@ -899,11 +955,11 @@ fn picked_row(
         return;
     };
     let g = t.to_gk(p);
-    ui.label(dim(&fmt_m(g.x)));
-    ui.label(dim(&fmt_m(g.y)));
+    ui.label(dim(&fmt_gk_plain(g.x)));
+    ui.label(dim(&fmt_gk_plain(g.y)));
     let prev = if k == 0 { mm1 } else { st.picked.get(k - 1).copied() };
     ui.label(match prev {
-        Some(prev) => dim(&fmt_m(delta_m(prev, p, t))),
+        Some(prev) => dim(&fmt_gk_plain(delta_m(prev, p, t))),
         None => dim(""),
     });
 }
@@ -911,13 +967,23 @@ fn picked_row(
 /// A millimetre field of a marker row: mirrors the marker while not
 /// focused (the commit frame keeps the typed text), and says when the
 /// field committed with Enter, so the caller moves the marker once.
-fn mm_field(ui: &mut Ui, text: &mut String, live: &str, id: (&str, &str), tip: &str) -> bool {
+fn mm_field(
+    ui: &mut Ui,
+    text: &mut String,
+    live: &str,
+    width: f32,
+    id: (&str, &str),
+    tip: &str,
+) -> bool {
     let r = ui
         .add(
             TextEdit::singleline(text)
-                .desired_width(56.0)
-                .id(egui::Id::new(id))
-                .font(egui::TextStyle::Monospace),
+                .desired_width(width)
+                .min_size(Vec2::new(width, 20.0))
+                .margin(egui::Margin::symmetric(4, 2))
+                .vertical_align(egui::Align::Center)
+                .font(FontId::proportional(11.5))
+                .id(egui::Id::new(id)),
         )
         .on_hover_text(tr(tip));
     let committed = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -929,12 +995,15 @@ fn mm_field(ui: &mut Ui, text: &mut String, live: &str, id: (&str, &str), tip: &
 
 /// A GK-42 metres field of the panel: the user's draft, committed by
 /// the apply button.
-fn gk_field(ui: &mut Ui, text: &mut String, id: (&str, &str), tip: &str) {
+fn gk_field(ui: &mut Ui, text: &mut String, width: f32, id: (&str, &str), tip: &str) {
     ui.add(
         TextEdit::singleline(text)
-            .desired_width(76.0)
-            .id(egui::Id::new(id))
-            .font(egui::TextStyle::Monospace),
+            .desired_width(width)
+            .min_size(Vec2::new(width, 20.0))
+            .margin(egui::Margin::symmetric(4, 2))
+            .vertical_align(egui::Align::Center)
+            .font(FontId::proportional(11.5))
+            .id(egui::Id::new(id)),
     )
     .on_hover_text(tr(tip));
 }
@@ -957,13 +1026,7 @@ fn fmt_1n(n: f64) -> String {
 fn table_text(app: &App, sep: char, human: bool) -> String {
     let st = &app.map_gk42;
     let doc = app.doc();
-    let fmt = |v: f64| {
-        if human {
-            fmt_m(v)
-        } else {
-            format!("{v}")
-        }
-    };
+    let fmt = |v: f64| fmt_gk_plain(v);
     let mm = |v: f64| {
         if human {
             fmt_mm(v)
@@ -1066,6 +1129,19 @@ mod tests {
             let back = parse_m(&fmt_m(v)).unwrap();
             assert!((back - v).abs() < 0.005, "{v} -> {back}");
         }
+    }
+
+    /// Plain GK-42 fields carry whole metres without spaces or decimals;
+    /// the cursor plate splits the first two and the next two digits.
+    #[test]
+    fn fmt_gk_plain_and_cursor_format_whole_metres() {
+        assert_eq!(fmt_gk_plain(7_490_000.4), "7490000");
+        assert_eq!(fmt_gk_plain(5_416_374.6), "5416375");
+        assert_eq!(fmt_gk_cursor(7_491_069.93), "74 91 070");
+        assert_eq!(fmt_gk_cursor(5_416_374.28), "54 16 374");
+        assert_eq!(fmt_gk_cursor(42_531_000.0), "42 53 1000");
+        assert_eq!(fmt_gk_cursor(500.0), "50 0");
+        assert_eq!(fmt_gk_cursor(42.0), "42");
     }
 
     /// The deltas use each axis's own scale: a millimetre right and a
