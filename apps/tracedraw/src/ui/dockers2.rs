@@ -9,7 +9,7 @@ use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
 use egui::Ui;
-use tracedraw_core::{document::ShapeKind, geometry::Affine, live::Effect, Color, Command, Fill, ShapeId};
+use tracedraw_core::{document::ShapeKind, live::Effect, Color, Command, Fill, ShapeId};
 
 /// The colour picker every colour of the drawing uses (#442).
 fn color_button(ui: &mut Ui, c: &mut Color) -> bool {
@@ -3205,13 +3205,6 @@ fn symbol_picture(
         ShapeId(u64::MAX - index as u64),
         ShapeKind::SymbolInstance { index },
     );
-    // Centre the definition in the tile: definitions saved by older files
-    // may sit away from the origin, which left their preview blank.
-    let mut shape = shape;
-    if let Some(sym) = app.doc().symbols.get(index) {
-        let c = sym.shape.bounds().center();
-        shape.transform = Affine::translate((-c.x, -c.y));
-    }
     let ppp = ui.ctx().pixels_per_point().max(0.5);
     let inner = r.shrink(2.0);
     let px = (inner.width() * ppp).round().max(4.0) as u32;
