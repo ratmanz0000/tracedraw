@@ -222,8 +222,11 @@ window shows.
   notch). A render still on its way when the wheel has rested is asked
   to give up at its next object (#2522), after a wait that follows the
   wheel's own pace, one and a half the gap between the last two
-  notches, between 0.04 s (`raster::ZOOM_SETTLE_MIN`) and 0.12 s
-  (`raster::SETTLE_SECONDS`). With the wheel's glide the picture on the
+  notches, between 0.04 s (`raster::ZOOM_SETTLE_MIN`) and 0.06 s
+  (`raster::ZOOM_SETTLE_MAX`). A quick page whose last render took at
+  most 0.012 s (`raster::FAST_ZOOM_RENDER`) draws each zoom frame on
+  its own thread synchronously at 1:1 instead of scaling the old
+  texture. With the wheel's glide the picture on the
   way is drawn for the view the glide lands at (`raster::zoom_target`),
   and the view is put at that view when the glide ends, so the landing
   is sharp as soon as that render is.

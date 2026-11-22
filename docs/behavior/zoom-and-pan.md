@@ -95,7 +95,12 @@
   A pan while the glide goes folds the glide's aim into the panned
   view, the point the pan put under the anchor staying there
   (`view_motion::tests::a_pan_while_the_glide_goes_folds_into_its_landing`).
-  The first step of a zoom renders at once; the steps after it are
+  The first step of a zoom renders at once (a quick page whose last
+  render took at most 0.012 s, `raster::FAST_ZOOM_RENDER`, draws each
+  frame's own zoom synchronously at 1:1 instead of scaling the old
+  texture while a thread runs,
+  `raster::tests::a_quick_page_zooms_sharp_in_each_frame_without_a_thread`);
+  on a slower page the steps after the first are
   skipped while that render is on its way, the running render keeping
   its turn
   (`raster::tests::the_latest_zoom_wins_without_restarting_renders`),
@@ -107,8 +112,8 @@
   A render still on its way when the wheel has rested is asked to give
   up at its next object, after a wait that follows the wheel's own
   pace: one and a half the gap between the last two notches, at the
-  least 0.04 s (`raster::ZOOM_SETTLE_MIN`), at most 0.12 s
-  (`raster::SETTLE_SECONDS`), so a wheel that has stopped is told from
+  least 0.04 s (`raster::ZOOM_SETTLE_MIN`), at most 0.06 s
+  (`raster::ZOOM_SETTLE_MAX`), so a wheel that has stopped is told from
   one that goes on a few frames later, and a slow turn's render lands
   between the notches.
 - With the Scroll setting: the wheel scrolls vertically; Shift+wheel

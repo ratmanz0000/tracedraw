@@ -34,11 +34,22 @@ pub const SETTLE_SECONDS: f64 = 0.12;
 /// frames, enough to tell a wheel that has stopped from one that goes on.
 pub const ZOOM_SETTLE_MIN: f64 = 0.04;
 
+/// The longest wait, seconds, before a render still running for an
+/// earlier zoom is asked to give up once the wheel stops.
+pub const ZOOM_SETTLE_MAX: f64 = 0.06;
+
 /// How much longer than the gap between the last two steps of a zoom the
 /// wait grows: notches a beat apart wait the shortest wait, slower turns
 /// wait long enough that the render in flight still lands between the
 /// notches.
 pub const ZOOM_SETTLE_PACE: f64 = 1.5;
+
+/// A zoom whose previous render took no longer than this, seconds, draws
+/// each frame's own zoom at once on this thread instead of scaling the
+/// previous texture on the card: a quick page stays sharp at 1:1 on
+/// every frame without a delayed sharpen pass.
+#[cfg(not(target_arch = "wasm32"))]
+pub const FAST_ZOOM_RENDER: f64 = 0.012;
 
 /// With Light zoom (Options > Tools > Zoom/Pan): how long the view rests
 /// after a zoom before the drawing is drawn anew for it, seconds. Long
@@ -334,6 +345,10 @@ pub struct Raster {
     /// does, for tests (#3440).
     #[cfg(test)]
     threaded: bool,
+    /// Quick pages draw each zoom frame synchronously at 1:1, as the
+    /// program does under [`FAST_ZOOM_RENDER`], for tests.
+    #[cfg(test)]
+    fast_zoom_sync: bool,
     /// A lock a render on its thread takes before drawing, for tests that
     /// hold a render while the view moves on.
     #[cfg(test)]
@@ -642,17 +657,34 @@ impl Raster {
         pixel_dpi: Option<f64>,
     ) -> Option<(TextureId, Rect)> {
         let ppp = ctx.pixels_per_point();
+        #[cfg(not(target_arch = "wasm32"))]
+        let fast_zoom = {
+            #[cfg(test)]
+            let allow = self.fast_zoom_sync && !self.always_slow;
+            #[cfg(not(test))]
+            let allow = true;
+            allow
+                && self.last_seconds > 0.0
+                && self.last_seconds <= FAST_ZOOM_RENDER
+                && self.job.is_none()
+                && !self.follows_zoom
+                && !self.light_zoom
+        };
+        #[cfg(target_arch = "wasm32")]
+        let fast_zoom = false;
         // The picture is drawn for the view the wheel's glide lands at,
         // not for the view on its way to it: one render a turn, not one
         // for a zoom the glide has already passed. The Pixels view is
         // drawn at one render pixel per document pixel, and where it is
-        // drawn is the view; no aim there.
-        let zoom_target = self.zoom_target.take();
-        let key_view = if pixel_dpi.is_some() {
-            *view
+        // drawn is the view; no aim there. A quick page draws each frame
+        // at 1:1 directly, so it needs no aim either.
+        let raw_target = self.zoom_target.take();
+        let zoom_target = if fast_zoom || pixel_dpi.is_some() {
+            None
         } else {
-            zoom_target.unwrap_or(*view)
+            raw_target
         };
+        let key_view = zoom_target.unwrap_or(*view);
         let window = pixel_dpi.and_then(|dpi| pixel_window(&key_view, rect, dpi, ppp));
         let (w, h) = match window {
             Some(win) => (win.w, win.h),
@@ -762,7 +794,7 @@ impl Raster {
                         // lands between the notches all the same.
                         let gap = self.zoom_step.take().map_or(0.0, |t| (now - t).max(0.0));
                         self.zoom_step = Some(now);
-                        now + (gap * ZOOM_SETTLE_PACE).clamp(ZOOM_SETTLE_MIN, SETTLE_SECONDS)
+                        now + (gap * ZOOM_SETTLE_PACE).clamp(ZOOM_SETTLE_MIN, ZOOM_SETTLE_MAX)
                     }
                 };
                 if now < due {
@@ -849,10 +881,9 @@ impl Raster {
                 }
             }
         }
-        // The browser draws on its one thread: never set there; the
-        // program draws on a thread whatever the zoom (#3440).
-        #[cfg(any(target_arch = "wasm32", not(test)))]
-        let _ = zoom_now;
+        // The browser draws on its one thread: never set there.
+        #[cfg(target_arch = "wasm32")]
+        let _ = (zoom_now, fast_zoom);
         if self.defer {
             ctx.request_repaint();
             let t = self.texture.as_ref()?;
@@ -905,12 +936,13 @@ impl Raster {
         if self.always_slow {
             self.last_seconds = 1.0;
         }
-        #[cfg(test)]
-        let threaded = self.threaded
-            || (window.is_none()
-                && (self.last_seconds > SLOW_RENDER || self.follows_zoom || zoom_now));
-        #[cfg(not(test))]
-        let threaded = true;
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        let threaded = !(window.is_none() && zoom_now && fast_zoom)
+            && (self.threaded
+                || (window.is_none()
+                    && (self.last_seconds > SLOW_RENDER || self.follows_zoom || zoom_now)));
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        let threaded = !(window.is_none() && zoom_now && fast_zoom);
         #[cfg(not(target_arch = "wasm32"))]
         if threaded && self.texture.is_some() {
             // The Pixels view's picture shows where its document pixels
@@ -2685,6 +2717,43 @@ mod tests {
         }
         assert_eq!(raster.picture_zoom(), Some(aim.zoom));
         assert_eq!(raster.render_count(), rendered, "a render for the bits");
+    }
+
+    /// A quick page (under `FAST_ZOOM_RENDER`) draws each frame of a
+    /// zoom synchronously at 1:1 on screen instead of scaling the
+    /// previous texture while a thread draws; once a render exceeds
+    /// `FAST_ZOOM_RENDER`, zoom falls back to its thread and `zoom_target`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_quick_page_zooms_sharp_in_each_frame_without_a_thread() {
+        static TURNS: Turns = Turns::new();
+        let ctx = Context::default();
+        let doc = Document::new("t", Size::new(100.0, 50.0));
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 200.0));
+        let mut raster = Raster {
+            turns: Some(&TURNS),
+            threaded: true,
+            fast_zoom_sync: true,
+            ..Default::default()
+        };
+        let mut view = View::default();
+        pass(&ctx, &mut raster, &doc, &view, rect, 0.0);
+        raster.last_seconds = 0.002;
+        let at = egui::pos2(160.0, 100.0);
+        let mut aim = view;
+        aim.zoom_at(at, 1.15);
+        view.zoom_at(at, 1.05);
+        raster.zoom_target = Some(aim);
+        let (_, screen) = pass(&ctx, &mut raster, &doc, &view, rect, 0.016);
+        assert!(raster.job.is_none(), "drawn at once on this thread");
+        assert_eq!(raster.picture_zoom(), Some(view.zoom), "sharp 1:1 frame");
+        assert_eq!(screen, rect);
+        // A slow page takes the threaded path aimed at `zoom_target`.
+        raster.last_seconds = FAST_ZOOM_RENDER + 0.02;
+        view.zoom_at(at, 1.04);
+        raster.zoom_target = Some(aim);
+        pass(&ctx, &mut raster, &doc, &view, rect, 0.032);
+        assert_eq!(raster.job.as_ref().map(|j| j.key.zoom), Some(aim.zoom));
     }
 
     /// A page beside the current one in the Multipage View is rendered
