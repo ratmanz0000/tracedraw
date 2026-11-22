@@ -226,20 +226,27 @@ impl App {
         let _ = self.engine.run_batch("Import", &cmds);
     }
 
-    fn frame_data(&self, id: ShapeId) -> Option<Vec<(String, String)>> {
+    /// The object data of paragraph frame `id`, borrowed: the links of
+    /// every shown frame are asked several times a frame, and they were
+    /// copied out of the shape each time.
+    fn frame_data(&self, id: ShapeId) -> Option<&[(String, String)]> {
         let s = self.doc().find_shape(id)?;
-        matches!(s.kind, ShapeKind::Text { frame: Some(_), .. }).then(|| s.data.clone())
+        if matches!(s.kind, ShapeKind::Text { frame: Some(_), .. }) {
+            Some(s.data.as_slice())
+        } else {
+            None
+        }
     }
 
     /// Next frame in the chain, if any and still present.
     pub fn next_frame(&self, id: ShapeId) -> Option<ShapeId> {
-        let next = data_id(&self.frame_data(id)?, NEXT)?;
+        let next = data_id(self.frame_data(id)?, NEXT)?;
         self.frame_data(next).map(|_| next)
     }
 
     /// Previous frame in the chain, if any and still present.
     pub fn prev_frame(&self, id: ShapeId) -> Option<ShapeId> {
-        let prev = data_id(&self.frame_data(id)?, PREV)?;
+        let prev = data_id(self.frame_data(id)?, PREV)?;
         self.frame_data(prev).map(|_| prev)
     }
 
@@ -337,11 +344,11 @@ impl App {
         let cmds = vec![
             Command::SetObjectData {
                 shape: a,
-                data: with_key(da, NEXT, Some(b)),
+                data: with_key(da.to_vec(), NEXT, Some(b)),
             },
             Command::SetObjectData {
                 shape: b,
-                data: with_key(db, PREV, Some(a)),
+                data: with_key(db.to_vec(), PREV, Some(a)),
             },
         ];
         let _ = self.engine.run_batch("Link Frames", &cmds);
@@ -567,20 +574,20 @@ impl App {
             let Some(d) = self.frame_data(id) else {
                 continue;
             };
-            let next = data_id(&d, NEXT);
-            let prev = data_id(&d, PREV);
+            let next = data_id(d, NEXT);
+            let prev = data_id(d, PREV);
             if next.is_none() && prev.is_none() {
                 continue;
             }
             cmds.push(Command::SetObjectData {
                 shape: id,
-                data: with_key(with_key(d, NEXT, None), PREV, None),
+                data: with_key(with_key(d.to_vec(), NEXT, None), PREV, None),
             });
             if let Some(n) = next {
                 if let Some(dn) = self.frame_data(n) {
                     cmds.push(Command::SetObjectData {
                         shape: n,
-                        data: with_key(dn, PREV, None),
+                        data: with_key(dn.to_vec(), PREV, None),
                     });
                 }
             }
@@ -588,7 +595,7 @@ impl App {
                 if let Some(dp) = self.frame_data(p) {
                     cmds.push(Command::SetObjectData {
                         shape: p,
-                        data: with_key(dp, NEXT, None),
+                        data: with_key(dp.to_vec(), NEXT, None),
                     });
                 }
             }
@@ -755,12 +762,12 @@ impl App {
                 };
                 let prev = i.checked_sub(1).and_then(|j| left.get(j).copied());
                 let next = left.get(i + 1).copied();
-                if data_id(&data, PREV) == prev && data_id(&data, NEXT) == next {
+                if data_id(data, PREV) == prev && data_id(data, NEXT) == next {
                     continue;
                 }
                 cmds.push(Command::SetObjectData {
                     shape: *id,
-                    data: with_key(with_key(data, PREV, prev), NEXT, next),
+                    data: with_key(with_key(data.to_vec(), PREV, prev), NEXT, next),
                 });
             }
             cmds.extend(self.flow_commands(&left, all));
@@ -1454,5 +1461,35 @@ mod tests {
         assert_eq!(found.len(), 2, "{}", app.status);
         assert_eq!(app.next_frame(found[0]), Some(found[1]));
         assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+    }
+
+    /// The links of a frame are read out of the shape's own data, without
+    /// taking a copy of it first: the next and previous frames of a chain
+    /// are asked several times a frame (the frames shown, the overlay of
+    /// the text being edited).
+    #[test]
+    fn link_lookups_read_the_frames_data() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let a = frame(&mut app, LONG, 30.0, 8.0);
+        let b = frame(&mut app, "", 60.0, 60.0);
+        assert!(!app.is_linked_frame(a));
+        assert!(app.next_frame(a).is_none() && app.prev_frame(a).is_none());
+        app.select(vec![a, b]);
+        app.link_text_frames();
+        // Several reads in a row, as a frame of the chain is drawn.
+        for _ in 0..3 {
+            assert_eq!(app.next_frame(a), Some(b));
+            assert_eq!(app.prev_frame(b), Some(a));
+            assert!(app.is_linked_frame(a) && app.is_linked_frame(b));
+            assert_eq!(app.next_frame(b), None);
+            assert_eq!(app.prev_frame(a), None);
+        }
+        // Unlinking still writes the links back.
+        app.select(vec![a]);
+        app.unlink_text_frames();
+        assert!(!app.is_linked_frame(a) && !app.is_linked_frame(b));
+        assert!(app.doc().find_shape(a).is_some_and(|s| s.data.is_empty()));
+        assert!(app.doc().find_shape(b).is_some_and(|s| s.data.is_empty()));
     }
 }

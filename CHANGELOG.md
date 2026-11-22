@@ -8,6 +8,7 @@ full, row-by-row status.
 
 - Print Merged Document: the merged drawing is made only to be printed, so once the Print dialog and Print Preview are closed it is gone again and the drawing you merged is back in front, instead of an extra merged drawing staying open after every print or preview. Create Merged Document is the command that keeps the merged drawing (discussion #1610).
 - Cross hair to the window edges: the lines also follow the Shape tool's pointer, crossing at its tip (discussion #3268).
+- Paragraph text editing: `FontSystem` caches full `TextLayout` results with exact typed keys instead of formatting strings, `App` caches the edited text's layout across caret, non-printing marks, hit-testing and overflow checks, `text_overflows` hashes text fields without `Debug` string allocations, and frame-link lookups borrow object data without cloning (#3959, #3960).
 
 ## 0.51.0 (2026-11-22)
 

@@ -8,10 +8,11 @@
 
 use crate::app::App;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use tracedraw_core::document::text_outline::TextRequest;
 use tracedraw_core::geometry::{Affine, BezPath, Point, Rect, Size};
-use tracedraw_core::{Command, Shape, ShapeId, ShapeKind, TextSpan};
+use tracedraw_core::{Command, ParagraphStyle, Shape, ShapeId, ShapeKind, TextAlign, TextSpan};
 
 /// The longest a text's layout may take, in seconds, for it to flow anew
 /// in its frame on every frame of a drag: a quarter of a 60 Hz frame, so
@@ -330,6 +331,183 @@ fn with_scaled_letters(kind: ShapeKind, t: Affine) -> ShapeKind {
     }
 }
 
+/// Hash `v` as its bits, so `-0.0` and `0.0` (and a NaN of one payload)
+/// keep one place in a cache key.
+fn hash_f64<H: Hasher>(h: &mut H, v: f64) {
+    v.to_bits().hash(h);
+}
+
+/// Hash an enum that does not implement `Hash` by its variant.
+fn hash_variant<H: Hasher, T>(h: &mut H, v: &T) {
+    std::mem::discriminant(v).hash(h);
+}
+
+/// The layout-relevant fields of one span (the letters, their look of
+/// type, and their own paragraph format). Colours and overprints are
+/// left out: they do not change whether the text fits its frame.
+fn hash_span<H: Hasher>(h: &mut H, sp: &TextSpan) {
+    sp.text.hash(h);
+    sp.font_family.hash(h);
+    hash_f64(h, sp.size_pt);
+    sp.bold.hash(h);
+    sp.italic.hash(h);
+    hash_f64(h, sp.tracking_pct);
+    hash_f64(h, sp.baseline_shift_pt);
+    hash_f64(h, sp.offset_x_pct);
+    hash_f64(h, sp.width_pct);
+    hash_f64(h, sp.angle_deg);
+    hash_variant(h, &sp.underline);
+    hash_variant(h, &sp.strikethrough);
+    sp.all_caps.hash(h);
+    sp.enclosed.hash(h);
+    sp.features.hash(h);
+    hash_variant(h, &sp.position);
+    for v in &sp.variations {
+        v.tag.hash(h);
+        hash_f64(h, v.value);
+    }
+    match &sp.paragraph {
+        Some(p) => {
+            1u8.hash(h);
+            hash_para_format(h, p);
+        }
+        None => 0u8.hash(h),
+    }
+}
+
+/// The layout-relevant fields of a paragraph's own format.
+fn hash_para_format<H: Hasher>(h: &mut H, p: &tracedraw_core::paragraphs::ParagraphFormat) {
+    hash_variant(h, &p.align);
+    hash_f64(h, p.leading_pct);
+    hash_variant(h, &p.leading_unit);
+    hash_f64(h, p.char_spacing_pct);
+    hash_f64(h, p.word_spacing_pct);
+    hash_f64(h, p.space_before);
+    hash_f64(h, p.space_after);
+    p.space_before_pct.map(f64::to_bits).hash(h);
+    p.space_after_pct.map(f64::to_bits).hash(h);
+    hash_f64(h, p.first_line_indent);
+    hash_f64(h, p.left_indent);
+    hash_f64(h, p.right_indent);
+    p.bullets.hash(h);
+    p.bullet_char.hash(h);
+    hash_f64(h, p.bullet_indent);
+    hash_bullet(h, &p.bullet);
+    p.drop_cap_lines.hash(h);
+    for t in &p.tabs {
+        hash_f64(h, t.pos);
+        hash_variant(h, &t.kind);
+        t.leader.hash(h);
+    }
+    p.hyphenate.hash(h);
+    hash_variant(h, &p.direction);
+}
+
+/// The layout-relevant fields of a bullet (its look of type, not its
+/// colour).
+fn hash_bullet<H: Hasher>(h: &mut H, b: &tracedraw_core::document::BulletStyle) {
+    hash_variant(h, &b.numbering);
+    b.prefix.hash(h);
+    b.suffix.hash(h);
+    b.start.hash(h);
+    b.font.hash(h);
+    hash_f64(h, b.size_pct);
+    hash_f64(h, b.baseline_shift);
+    hash_f64(h, b.offset);
+    b.no_hanging.hash(h);
+    b.level.hash(h);
+    hash_f64(h, b.level_indent);
+    b.restart.hash(h);
+    b.continue_list.hash(h);
+}
+
+/// What a frame's text wraps around, hashed the way `FrameFlow::new`
+/// hashes it into its own key (the wrap regions and the baseline grid).
+fn hash_flow<H: Hasher>(h: &mut H, flow: &tracedraw_core::text_flow::FrameFlow) {
+    for r in flow.wrap.iter() {
+        (r.wrap.mode as u8, r.wrap.side as u8).hash(h);
+        hash_f64(h, r.wrap.offset);
+        for (a, b) in &r.segments {
+            hash_f64(h, a.x);
+            hash_f64(h, a.y);
+            hash_f64(h, b.x);
+            hash_f64(h, b.y);
+        }
+    }
+    if let Some((o, p)) = flow.grid {
+        hash_f64(h, o);
+        hash_f64(h, p);
+    }
+}
+
+/// The layout-relevant fields of a paragraph style (the frame fill and
+/// the colour of a bullet are left out).
+fn hash_para<H: Hasher>(h: &mut H, para: &ParagraphStyle) {
+    hash_f64(h, para.leading_pct);
+    hash_variant(h, &para.leading_unit);
+    hash_f64(h, para.char_spacing_pct);
+    hash_f64(h, para.word_spacing_pct);
+    hash_f64(h, para.space_before);
+    hash_f64(h, para.space_after);
+    para.space_before_pct.map(f64::to_bits).hash(h);
+    para.space_after_pct.map(f64::to_bits).hash(h);
+    hash_f64(h, para.first_line_indent);
+    hash_f64(h, para.left_indent);
+    hash_f64(h, para.right_indent);
+    para.columns.hash(h);
+    hash_f64(h, para.gutter);
+    for v in &para.column_widths {
+        hash_f64(h, *v);
+    }
+    for v in &para.column_gutters {
+        hash_f64(h, *v);
+    }
+    para.columns_right_to_left.hash(h);
+    para.bullets.hash(h);
+    para.bullet_char.hash(h);
+    hash_f64(h, para.bullet_indent);
+    hash_bullet(h, &para.bullet);
+    para.drop_cap_lines.hash(h);
+    for t in &para.tabs {
+        hash_f64(h, t.pos);
+        hash_variant(h, &t.kind);
+        t.leader.hash(h);
+    }
+    para.hyphenate.hash(h);
+    para.fit_to_frame.hash(h);
+    para.type_block.hash(h);
+    hash_f64(h, para.baseline_grid_mm);
+    hash_variant(h, &para.vertical_align);
+    para.vertical.hash(h);
+    hash_variant(h, &para.vertical_columns);
+    hash_variant(h, &para.direction);
+    hash_flow(h, &para.flow);
+}
+
+/// A hash of everything a paragraph frame's overflow depends on: its
+/// spans, frame, alignment, paragraph style (flow included) and the
+/// default tab spacing. `format!("{:?}")` of the whole kind did this and
+/// wrote every span's text and the wrap segments out on each frame for
+/// each shown frame.
+fn text_overflow_key(
+    spans: &[TextSpan],
+    frame: &Size,
+    align: TextAlign,
+    para: &ParagraphStyle,
+    tab_step_bits: u64,
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tab_step_bits.hash(&mut h);
+    for sp in spans {
+        hash_span(&mut h, sp);
+    }
+    hash_f64(&mut h, frame.width);
+    hash_f64(&mut h, frame.height);
+    hash_variant(&mut h, &align);
+    hash_para(&mut h, para);
+    h.finish()
+}
+
 impl App {
     /// `t` (page space) resizes table `id` instead of scaling it (see
     /// [`resized_table`]): `t` an axis-aligned scale by positive amounts
@@ -587,43 +765,61 @@ impl App {
     }
 
     /// Paragraph text `s` does not fit its frame (the last frame of a
-    /// linked chain included); cached per document revision.
+    /// linked chain included). Taken from the layout already made for the
+    /// text being edited when that is this frame, else cached by the
+    /// text's own content.
     pub fn text_overflows(&self, s: &Shape) -> bool {
+        let ShapeKind::Text {
+            spans,
+            frame: Some(f),
+            align,
+            para,
+            on_path: None,
+            ..
+        } = &s.kind
+        else {
+            return false;
+        };
+        // The layout already made this revision for this exact shape (the
+        // text being edited, its caret and its marks): its overflow is
+        // the answer, without hashing the kind or laying the text out.
+        if let Some(c) = self.text_layout_cache.borrow().as_ref() {
+            if c.matches(
+                self.engine.instance(),
+                self.engine.revision(),
+                s.id,
+                s.transform,
+            ) {
+                return c.layout.overflow;
+            }
+        }
         // Keyed by the text's own content (spans, frame, align, paragraph
-        // incl. its flow, on-path), not by the document revision: a
-        // revision bump used to clear the whole cache and re-lay out every
-        // shown frame on each keystroke. Unchanged frames keep their hit;
-        // a wrap change reaches the flow and thus the key.
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", s.kind).hash(&mut h);
-        let key = h.finish();
+        // incl. its flow, default tab spacing), not by the document
+        // revision: a revision bump used to clear the whole cache and
+        // re-lay out every shown frame on each keystroke. Unchanged
+        // frames keep their hit; a wrap change reaches the flow and thus
+        // the key.
+        let key = text_overflow_key(
+            spans,
+            f,
+            *align,
+            para,
+            tracedraw_core::default_tab_step().to_bits(),
+        );
         let mut cache = self.overflow_cache.borrow_mut();
         if let Some((k, v)) = cache.get(&s.id) {
             if *k == key {
                 return *v;
             }
         }
-        let v = match &s.kind {
-            ShapeKind::Text {
-                spans,
-                frame: Some(f),
-                align,
-                para,
-                on_path: None,
-                ..
-            } => {
-                let req = tracedraw_core::document::text_outline::TextRequest {
-                    spans,
-                    frame: Some(*f),
-                    align: *align,
-                    para,
-                    on_path: None,
-                };
-                tracedraw_text::fonts().layout(&req).overflow
-            }
-            _ => false,
+        let req = TextRequest {
+            spans,
+            frame: Some(*f),
+            align: *align,
+            para,
+            on_path: None,
         };
+        let v = tracedraw_text::fonts().layout(&req).overflow;
         if cache.len() > 4000 {
             cache.clear();
         }
@@ -1051,6 +1247,48 @@ mod tests {
         let s = app.doc().shape(id).expect("shape").1.clone();
         assert!(app.text_overflows(&s));
         assert!(app.shown_text_frames(None)[0].overflow);
+    }
+
+    /// An unchanged frame is asked whether it overflows several times a
+    /// frame (the frames shown, a drag of it); the answer is cached by
+    /// the text's content. While this frame's layout is the one made for
+    /// editing it, that layout answers and the overflow cache is not
+    /// used.
+    #[test]
+    fn overflow_of_an_unchanged_frame_is_cached_and_the_edited_layout_answers() {
+        let mut app = App::headless();
+        let id = paragraph(&mut app);
+        let s = app.doc().shape(id).expect("shape").1.clone();
+        assert!(!app.text_overflows(&s));
+        assert!(!app.text_overflows(&s), "the same answer again");
+        assert!(
+            app.overflow_cache.borrow().get(&id).is_some(),
+            "the overflow was cached"
+        );
+
+        // The layout made for editing this frame is the overflow's
+        // source: the overflow cache is left alone.
+        app.overflow_cache.borrow_mut().clear();
+        app.begin_text_edit(id);
+        let (layout, _) = app.cached_text_layout_of(id).expect("layout");
+        let s = app.doc().shape(id).expect("shape").1.clone();
+        assert_eq!(app.text_overflows(&s), layout.overflow);
+        assert!(
+            app.overflow_cache.borrow().get(&id).is_none(),
+            "the edited layout answered without the overflow cache"
+        );
+        app.finish_text();
+
+        // A frame that is not a paragraph text does not overflow.
+        let rect = app
+            .new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        let rect = app.doc().shape(rect).expect("shape").1.clone();
+        assert!(!app.text_overflows(&rect));
     }
 
     #[test]
