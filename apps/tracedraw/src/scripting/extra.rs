@@ -8,12 +8,57 @@ use crate::dimensions::{Dimension, Measure};
 use serde_json::{json, Value};
 use tracedraw_core::{
     document::{Shape, ShapeKind},
-    geometry::{Affine, Point},
+    geometry::{Affine, Point, Rect},
     Command, Fill, LayerId, ShapeId, Symbol,
 };
 
+/// What makes two groups copies of each other for `symbolize_groups`:
+/// each object that is not text, in order, by its kind, its box from
+/// the corner of their common box (to a tenth of a millimetre) and its
+/// fill. A copy only moved (by itself or its objects) matches; a
+/// recoloured or reshaped one does not.
+fn fingerprint(objects: &[&Shape]) -> Option<(String, Point)> {
+    let boxes: Vec<Rect> = objects.iter().map(|s| s.bounds()).collect();
+    let all = boxes.iter().copied().reduce(|a, b| a.union(b))?;
+    if !all.is_finite() {
+        return None;
+    }
+    let origin = Point::new(all.x0, all.y0);
+    let tenth = |v: f64| (v * 10.0).round() as i64;
+    let mut out = String::new();
+    for (s, b) in objects.iter().zip(&boxes) {
+        let fill = serde_json::to_string(&s.fill).unwrap_or_default();
+        out.push_str(&format!(
+            "{}|{}|{}|{}|{}|{fill};",
+            crate::ui::dockers::kind_id(&s.kind),
+            tenth(b.x0 - origin.x),
+            tenth(b.y0 - origin.y),
+            tenth(b.width()),
+            tenth(b.height()),
+        ));
+    }
+    Some((out, origin))
+}
+
 fn is_text(s: &Shape) -> bool {
     matches!(s.kind, ShapeKind::Text { .. })
+}
+
+/// A group's objects that are not text, and its text objects.
+fn split_group(s: &Shape) -> Option<(Vec<&Shape>, Vec<&Shape>)> {
+    let ShapeKind::Group { children } = &s.kind else {
+        return None;
+    };
+    Some(children.iter().partition(|c| !is_text(c)))
+}
+
+/// The objects a symbol draws, for matching: a group's objects that are
+/// not text, or the one object.
+fn definition_objects(def: &Shape) -> Vec<&Shape> {
+    match split_group(def) {
+        Some((graphics, _)) => graphics,
+        None => vec![def],
+    }
 }
 
 /// How near an object a script's dimension point has to be to hold to
@@ -226,36 +271,88 @@ impl HostInner {
     /// that draws the same. A group with text keeps its text beside the
     /// instance, in a group, so each label stays editable (#2343).
     fn symbolize_groups(&mut self, sample: ShapeId, a: &Value) -> Result<Value, String> {
-        let name = a.get("name").and_then(|v| v.as_str());
-        let plan = tracedraw_core::symbols::plan(&self.doc, sample, name)?;
-        let mut cmds = Vec::new();
-        if let Some(sym) = &plan.new_symbol {
-            cmds.push(Command::AddSymbol { symbol: sym.clone() });
-        }
+        let s = self.shape(sample.raw())?;
+        let (graphics, _) = split_group(&s).ok_or("symbolize_groups needs a group")?;
+        let (key, origin) = fingerprint(&graphics).ok_or("the group has no objects to match")?;
+        // An existing symbol that draws the same, else a new one.
+        let found = self.doc.symbols.iter().position(|sym| {
+            fingerprint(&definition_objects(&sym.shape)).is_some_and(|(k, _)| k == key)
+        });
+        let (index, name) = match found {
+            Some(i) => (i, self.doc.symbols[i].name.clone()),
+            None => {
+                let index = self.doc.symbols.len();
+                let name = self.symbol_name(a, index);
+                let children: Vec<Shape> = graphics.iter().map(|c| (*c).clone()).collect();
+                let mut def = Shape::new(ShapeId(0), ShapeKind::Group { children });
+                def.fill = Fill::None;
+                def.stroke = None;
+                def.transform_by(Affine::translate((-origin.x, -origin.y)));
+                self.run(Command::AddSymbol {
+                    symbol: Symbol {
+                        name: name.clone(),
+                        shape: def,
+                    },
+                })?;
+                (index, name)
+            }
+        };
+        // The top-level groups of every page, with their layer.
+        let groups: Vec<(LayerId, Shape)> = self
+            .doc
+            .pages
+            .iter()
+            .flat_map(|p| p.layers.iter())
+            .flat_map(|l| l.shapes.iter().map(move |s| (l.id, s)))
+            .filter(|(_, s)| matches!(s.kind, ShapeKind::Group { .. }))
+            .map(|(l, s)| (l, s.clone()))
+            .collect();
+        let (mut replaced, mut with_text, mut skipped) = (0, 0, 0);
         let mut ids = Vec::new();
-        let mut replacements = Vec::new();
-        for m in &plan.matches {
-            let inst = self.new_id();
-            let group = if m.texts.is_empty() { inst } else { self.new_id() };
-            ids.push(group.raw());
-            replacements.push((
-                m.group.id,
-                tracedraw_core::symbols::replacement(m, plan.index, inst, group),
-            ));
-        }
-        if !replacements.is_empty() {
-            cmds.push(Command::ReplaceShapes { replacements });
-        }
-        for c in cmds {
-            self.run(c)?;
+        for (layer, g) in groups {
+            let Some((graphics, texts)) = split_group(&g) else {
+                continue;
+            };
+            let Some((k, at)) = fingerprint(&graphics) else {
+                skipped += 1;
+                continue;
+            };
+            if k != key {
+                skipped += 1;
+                continue;
+            }
+            let texts: Vec<Shape> = texts.into_iter().cloned().collect();
+            self.run(Command::DeleteShapes { shapes: vec![g.id] })?;
+            let place = Affine::translate((at.x, at.y));
+            let id = if texts.is_empty() {
+                self.place(layer, index, g.transform * place)?
+            } else {
+                // The labels stay text, grouped with the instance.
+                with_text += 1;
+                let mut children = vec![instance(self.new_id(), index, place)];
+                children.extend(texts);
+                let mut grouped = Shape::new(self.new_id(), ShapeKind::Group { children });
+                grouped.transform = g.transform;
+                grouped.name = g.name.clone();
+                grouped.fill = Fill::None;
+                grouped.stroke = None;
+                let id = grouped.id;
+                self.run(Command::AddShape {
+                    layer,
+                    shape: grouped,
+                })?;
+                id
+            };
+            replaced += 1;
+            ids.push(id.raw());
         }
         self.drop_missing_selection();
         Ok(json!({
-            "replaced": plan.matches.len(),
-            "with_text": plan.with_text,
-            "skipped": plan.skipped,
-            "symbol_index": plan.index,
-            "symbol_name": plan.name,
+            "replaced": replaced,
+            "with_text": with_text,
+            "skipped": skipped,
+            "symbol_index": index,
+            "symbol_name": name,
             "ids": ids,
         }))
     }

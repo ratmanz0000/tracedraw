@@ -2022,9 +2022,10 @@ mod tests {
     /// #3562: a change to the drawing is not laid over the last picture
     /// a band at a time: the bands showed the drawing before and after
     /// the change at once, cut along their edges (a shadow being dragged
-    /// flickered in pieces). A view that moved still comes in bands.
+    /// flickered in pieces). SMOOTH_ZOOM_NO_BANDS: a moved view comes
+    /// whole too, the last picture scales while the new one renders.
     #[test]
-    fn a_change_comes_whole_and_a_moved_view_in_bands() {
+    fn a_change_comes_whole_and_so_does_a_moved_view() {
         static TURNS: Turns = Turns::new();
         let ctx = Context::default();
         let doc = Document::new("t", Size::new(100.0, 50.0));
@@ -2085,7 +2086,7 @@ mod tests {
             t += 1.0;
         }
         let job = raster.job.as_ref().expect("the new zoom on its thread");
-        assert!(job.bands.is_some(), "a moved view comes in bands");
+        assert!(job.bands.is_none(), "a moved view comes whole");
         wait(&mut raster, &mut |r| pass(r, 2, 60.0, 200.0));
     }
 

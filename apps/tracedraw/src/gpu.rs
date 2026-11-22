@@ -1204,6 +1204,7 @@ mod tests {
         assert!(!probe_drawn(&corner, [900, 700]));
     }
 
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn a_renderer_that_fails_hands_over_to_the_next() {
         let args = vec!["drawing.cdr".to_string()];
@@ -1248,6 +1249,7 @@ mod tests {
     /// program, so it could not hand over) leaves its renderer noted; the
     /// next start goes on with the renderer after it, and an opened window
     /// clears the note (#570).
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn a_start_that_never_opened_its_window_is_followed_by_the_next_renderer() {
         let dir = std::env::temp_dir().join(format!(
@@ -1329,6 +1331,7 @@ mod tests {
     /// watch goes on with OpenGL after `WINDOW_WAIT`, the attempt note
     /// stays so a start after it was closed by hand goes on with OpenGL
     /// too, and only a frame on the screen remembers the renderer.
+    #[cfg(any(feature = "gpu", target_os = "android"))]
     #[test]
     fn a_window_whose_first_frame_never_shows_goes_on_with_opengl() {
         let s = crate::settings::Settings::default();
@@ -1378,7 +1381,10 @@ mod tests {
         // being made no longer counts as a start that worked.
         let lib = include_str!("lib.rs");
         assert!(lib.contains("gpu::note_frame(ui.ctx(), mode);"));
-        let made = include_str!("gpu.rs")
+        // The checkout may hold the source with Windows line endings:
+        // normalize them so the closing brace is found.
+        let src = include_str!("gpu.rs").replace("\r\n", "\n");
+        let made = src
             .split("pub fn note_renderer(")
             .nth(1)
             .and_then(|b| b.split("\n}\n").next())

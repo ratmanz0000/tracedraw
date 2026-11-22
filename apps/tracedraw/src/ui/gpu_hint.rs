@@ -219,14 +219,27 @@ mod tests {
 
     #[test]
     fn the_hint_is_for_acceleration_turned_off_only() {
-        assert!(wanted(true, false, true, false));
-        // On, the card's driver failed: turning it on would not help.
-        assert!(!wanted(true, true, true, false));
-        // A card draws the window already.
-        assert!(!wanted(false, false, true, false));
-        // Turned off in Options > Global > Warnings, or shown this run.
-        assert!(!wanted(true, false, false, false));
-        assert!(!wanted(true, false, true, true));
+        // Without wgpu there is no hardware window to turn on: the hint
+        // would point at an option that does nothing. It never shows.
+        #[cfg(not(any(feature = "gpu", target_os = "android")))]
+        {
+            assert!(!wanted(true, false, true, false));
+            assert!(!wanted(true, true, true, false));
+            assert!(!wanted(false, false, true, false));
+            assert!(!wanted(true, false, false, false));
+            assert!(!wanted(true, false, true, true));
+        }
+        #[cfg(any(feature = "gpu", target_os = "android"))]
+        {
+            assert!(wanted(true, false, true, false));
+            // On, the card's driver failed: turning it on would not help.
+            assert!(!wanted(true, true, true, false));
+            // A card draws the window already.
+            assert!(!wanted(false, false, true, false));
+            // Turned off in Options > Global > Warnings, or shown this run.
+            assert!(!wanted(true, false, false, false));
+            assert!(!wanted(true, false, true, true));
+        }
     }
 
     #[test]
