@@ -4642,7 +4642,7 @@ mod wmf_export_tests {
         for sample in samples {
             let mut doc = Document::new("t", Size::new(120.0, 40.0));
             let mut ids = doc.ids().clone();
-            let t = Shape::new(
+            let mut t = Shape::new(
                 ids.shape(),
                 ShapeKind::Text {
                     spans: vec![TextSpan::new(sample, "Arial", 12.0)],
@@ -4653,6 +4653,8 @@ mod wmf_export_tests {
                     on_path: None,
                 },
             );
+            t.fill = Fill::Solid(Color::BLACK);
+            t.stroke = None;
             doc.pages[0].layers[0].shapes.push(t);
             doc.set_ids(ids);
             let wmf = page_to_wmf(&doc, 0);
