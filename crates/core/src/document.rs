@@ -193,6 +193,41 @@ pub mod text_outline {
     pub fn glyphs(req: &TextRequest) -> Option<GlyphLayout> {
         GLYPHER.get().map(|f| f(req))
     }
+
+    /// Result of resolving a run of raw glyph indices (`ETO_GLYPH_INDEX` in
+    /// Windows metafiles) against the font face they were shaped for:
+    /// decoded Unicode text when every glyph maps back through `cmap`, else
+    /// the placed glyph outlines in local millimetres (baseline at y = 0,
+    /// y up).
+    #[derive(Clone, Debug)]
+    pub enum ResolvedGlyphRun {
+        Text(String),
+        Path(BezPath),
+    }
+
+    type GlyphRunResolver =
+        fn(&str, bool, bool, f64, &[u16], &[f64]) -> Option<ResolvedGlyphRun>;
+    static GLYPH_RUN_RESOLVER: OnceLock<GlyphRunResolver> = OnceLock::new();
+
+    /// Register the font database's glyph-index resolver.
+    pub fn set_glyph_indices(f: GlyphRunResolver) {
+        let _ = GLYPH_RUN_RESOLVER.set(f);
+    }
+
+    /// Resolve `gids` in `(family, bold, italic)` at `em_mm` height with
+    /// optional per-glyph horizontal advances `advances_mm`.
+    pub fn resolve_glyph_indices(
+        family: &str,
+        bold: bool,
+        italic: bool,
+        em_mm: f64,
+        gids: &[u16],
+        advances_mm: &[f64],
+    ) -> Option<ResolvedGlyphRun> {
+        GLYPH_RUN_RESOLVER
+            .get()
+            .and_then(|f| f(family, bold, italic, em_mm, gids, advances_mm))
+    }
 }
 
 /// Hook for a metafile player. Readers of other formats meet Windows
