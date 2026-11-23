@@ -551,6 +551,8 @@ mod tests {
                 x: 6_523_200.0,
                 y: 42_536_000.0,
             },
+            marker3: None,
+            gk3: None,
         };
         doc.gk42 = Some(cal);
         let path = std::env::temp_dir().join(format!(

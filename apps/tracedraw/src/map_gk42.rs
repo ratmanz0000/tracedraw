@@ -1,4 +1,4 @@
-//! GK-42 map calibration (a local feature): two reference markers on
+//! GK-42 map calibration (a local feature): three reference markers on
 //! the page tie the page millimetres to true GK-42 metres, and clicks
 //! with the mode on pick up points whose coordinates the panel lists.
 //!
@@ -9,7 +9,7 @@
 //! docker: the placement steps, the scales the calibration implies,
 //! the table of the markers and the picked points, the clipboard and
 //! the apply and reset buttons. See the module docs of
-//! `tracedraw_core::gk42` for the two-point maths.
+//! `tracedraw_core::gk42` for the marker maths.
 
 use crate::app::App;
 use crate::i18n::{tr, trf};
@@ -18,7 +18,7 @@ use crate::ui::tips::{keyed, RichTip};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect as ERect, Stroke, TextEdit, Ui, Vec2};
 use tracedraw_core::document::{Shape, ShapeKind};
 use tracedraw_core::geometry::{Point, Rect};
-use tracedraw_core::gk42::{zone_of, GkCalibration, GkPoint, GkTransform};
+use tracedraw_core::gk42::{zones_disagree, GkCalibration, GkPoint, GkTransform};
 use tracedraw_core::{Color, Command, Document, Fill, LayerId, ShapeId, Stroke as CoreStroke};
 
 /// The page coordinates of the marker rows and the picked rows go out
@@ -32,22 +32,27 @@ pub struct Gk42State {
     /// The mode is on: a click on the page places the markers or adds a
     /// picked point (the top-bar dot is pressed).
     pub on: bool,
-    /// The placement step: 0 = marker 1, 1 = marker 2, 2 = pick points.
+    /// The placement step: 0 to 2 = place marker 1, 2 or 3; 3 = pick points.
     pub step: u8,
     /// The first marker's shape, placed but not applied yet.
     pub marker1: Option<ShapeId>,
     /// The second marker's shape, placed but not applied yet.
     pub marker2: Option<ShapeId>,
+    /// The third marker's shape, placed but not applied yet.
+    pub marker3: Option<ShapeId>,
     /// The picked points, page millimetres, in click order.
     pub picked: Vec<Point>,
     /// The typed true coordinates of marker 1, metres (northing, easting).
     pub gk1: (String, String),
     /// The typed true coordinates of marker 2, metres (northing, easting).
     pub gk2: (String, String),
+    /// The typed true coordinates of marker 3, metres (northing, easting).
+    pub gk3: (String, String),
     /// The millimetre fields of the table, mirrored from the markers
     /// while their fields are not being edited.
     pub mm1: (String, String),
     pub mm2: (String, String),
+    pub mm3: (String, String),
     /// The coordinate drafts were seeded from a saved calibration once
     /// (so an erased field is not refilled behind the user's back).
     pub seeded: bool,
@@ -64,11 +69,14 @@ impl Default for Gk42State {
             step: 0,
             marker1: None,
             marker2: None,
+            marker3: None,
             picked: Vec::new(),
             gk1: (String::new(), String::new()),
             gk2: (String::new(), String::new()),
+            gk3: (String::new(), String::new()),
             mm1: (String::new(), String::new()),
             mm2: (String::new(), String::new()),
+            mm3: (String::new(), String::new()),
             seeded: false,
             error: None,
             note: None,
@@ -76,43 +84,41 @@ impl Default for Gk42State {
     }
 }
 
-/// Turning the mode on picks the flow up where the markers left it:
-/// with both markers there the clicks add picked points, with one
-/// marker the next click places the other, with none the first click
-/// places marker 1.
-pub fn set_mode(app: &mut App, on: bool) {
-    app.map_gk42.on = on;
-    if on {
-        let m1 = marker_id(app, true);
-        let m2 = marker_id(app, false);
-        let st = &mut app.map_gk42;
-        if m1.is_none() {
-            st.step = 0;
-        } else if m2.is_none() {
-            st.step = 1;
-        } else {
-            st.step = 2;
-        }
+/// The next placement step: the first marker missing, or 3 (pick
+/// points) once all three markers are there.
+fn next_step(app: &App) -> u8 {
+    if marker_id(app, true).is_none() {
+        0
+    } else if marker_id(app, false).is_none() {
+        1
+    } else if marker3_id(app).is_none() {
+        2
+    } else {
+        3
     }
 }
 
-/// A click on the page with the mode on: the first two clicks place
+/// Turning the mode on picks the flow up where the markers left it:
+/// with all three markers there the clicks add picked points, otherwise
+/// the next click places the first missing marker.
+pub fn set_mode(app: &mut App, on: bool) {
+    app.map_gk42.on = on;
+    if on {
+        app.map_gk42.step = next_step(app);
+    }
+}
+
+/// A click on the page with the mode on: the first three clicks place
 /// the calibration markers, the rest add picked points. Drags never
 /// come here: the tool under the mode keeps doing its work.
 pub fn click(app: &mut App, p: Point) {
     let step = app.map_gk42.step;
-    match step {
-        0 => {
-            if place_marker(app, p, false) {
-                app.map_gk42.step = 1;
-            }
+    if step < 3 {
+        if place_marker(app, p, step) {
+            app.map_gk42.step = step + 1;
         }
-        1 => {
-            if place_marker(app, p, true) {
-                app.map_gk42.step = 2;
-            }
-        }
-        _ => app.map_gk42.picked.push(p),
+    } else {
+        app.map_gk42.picked.push(p);
     }
 }
 
@@ -142,8 +148,9 @@ fn marker_layer(app: &mut App) -> Option<LayerId> {
 }
 
 /// Placing one marker: a small filled circle on the markers' layer,
-/// red for marker 1 and blue for marker 2, named for the Objects docker.
-fn place_marker(app: &mut App, p: Point, second: bool) -> bool {
+/// red for marker 1, blue for marker 2 and amber for marker 3, named
+/// for the Objects docker. `index` is 0 to 2.
+fn place_marker(app: &mut App, p: Point, index: u8) -> bool {
     let Some(layer) = marker_layer(app) else {
         return false;
     };
@@ -151,21 +158,19 @@ fn place_marker(app: &mut App, p: Point, second: bool) -> bool {
     // A 6 mm circle centred on the click.
     let rect = Rect::new(p.x - 3.0, p.y - 3.0, p.x + 3.0, p.y + 3.0);
     let mut shape = Shape::new(id, ShapeKind::Ellipse { rect, arc: None });
-    shape.fill = Fill::Solid(if second {
-        Color::rgb8(9, 132, 227)
-    } else {
-        Color::rgb8(214, 48, 49)
+    shape.fill = Fill::Solid(match index {
+        0 => Color::rgb8(214, 48, 49),
+        1 => Color::rgb8(9, 132, 227),
+        _ => Color::rgb8(230, 150, 0),
     });
     shape.stroke = Some(CoreStroke::hairline(Color::BLACK));
-    shape.name = Some(trf(
-        "gk42.marker_name",
-        &[("n", if second { "2" } else { "1" })],
-    ));
+    let n = (index + 1).to_string();
+    shape.name = Some(trf("gk42.marker_name", &[("n", n.as_str())]));
     app.run(Command::AddShape { layer, shape });
-    if second {
-        app.map_gk42.marker2 = Some(id);
-    } else {
-        app.map_gk42.marker1 = Some(id);
+    match index {
+        0 => app.map_gk42.marker1 = Some(id),
+        1 => app.map_gk42.marker2 = Some(id),
+        _ => app.map_gk42.marker3 = Some(id),
     }
     true
 }
@@ -204,6 +209,70 @@ fn marker_id(app: &App, first: bool) -> Option<ShapeId> {
     })
 }
 
+/// The third marker's id from either source; `None` for a calibration
+/// saved with two markers.
+fn marker3_id(app: &App) -> Option<ShapeId> {
+    app.map_gk42
+        .marker3
+        .or_else(|| app.doc().gk42.as_ref()?.marker3)
+}
+
+/// The marker ids in use with their page points: two, or three once the
+/// third marker is placed or saved.
+fn marker_pages(app: &App) -> Option<(Vec<ShapeId>, Vec<Point>)> {
+    let doc = app.doc();
+    let mut ids = vec![marker_id(app, true)?, marker_id(app, false)?];
+    if let Some(i3) = marker3_id(app) {
+        ids.push(i3);
+    }
+    let pages = ids
+        .iter()
+        .map(|&i| marker_position(doc, i))
+        .collect::<Option<Vec<_>>>()?;
+    Some((ids, pages))
+}
+
+/// The typed draft as `(northing, easting)` pairs, marker 3 only when it
+/// is in use.
+fn typed_draft(st: &Gk42State, three: bool) -> Option<Vec<(f64, f64)>> {
+    fn pair(p: &(String, String)) -> Option<(f64, f64)> {
+        Some((parse_m(&p.0)?, parse_m(&p.1)?))
+    }
+    let mut out = vec![pair(&st.gk1)?, pair(&st.gk2)?];
+    if three {
+        out.push(pair(&st.gk3)?);
+    }
+    Some(out)
+}
+
+/// The calibration record from the ids and the true coordinates.
+fn build_cal(ids: &[ShapeId], gk: &[GkPoint], layer: LayerId) -> Option<GkCalibration> {
+    Some(GkCalibration {
+        layer,
+        marker1: *ids.first()?,
+        marker2: *ids.get(1)?,
+        gk1: *gk.first()?,
+        gk2: *gk.get(1)?,
+        marker3: ids.get(2).copied(),
+        gk3: gk.get(2).copied(),
+    })
+}
+
+/// The transform a calibration implies at the given page points.
+fn cal_transform(cal: &GkCalibration, pages: &[Point]) -> Option<GkTransform> {
+    cal.transform_at(*pages.first()?, *pages.get(1)?, pages.get(2).copied())
+}
+
+/// True when the marker positions cannot define a map: two markers on
+/// one horizontal or vertical line, or three on one straight line.
+fn pages_degenerate(pages: &[Point]) -> bool {
+    match pages {
+        [a, b] => (b.x - a.x).abs() < 1e-9 || (b.y - a.y).abs() < 1e-9,
+        [a, b, c] => ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() < 1e-9,
+        _ => true,
+    }
+}
+
 /// The applied calibration with the markers' current page positions
 /// and the transform it implies: `None` when there is none, a marker
 /// is gone, or the geometry is degenerate (mirrored, on one line).
@@ -211,93 +280,57 @@ pub fn transform_of(doc: &Document) -> Option<(GkTransform, GkCalibration)> {
     let cal = doc.gk42.as_ref()?;
     let p1 = marker_position(doc, cal.marker1)?;
     let p2 = marker_position(doc, cal.marker2)?;
-    let t = cal.transform_at(p1, p2)?;
+    let p3 = match cal.marker3 {
+        Some(id) => Some(marker_position(doc, id)?),
+        None => None,
+    };
+    let t = cal.transform_at(p1, p2, p3)?;
     Some((t, cal.clone()))
 }
 
-/// Resolve typed `(x1, y1)` and `(x2, y2)` into geodetic `(northing, easting)`
-/// pairs: checks both `(Northing, Easting)` and `(Easting, Northing)` against
-/// the markers' positions AND zone agreement, so a 7-digit northing crossing a
-/// million boundary (e.g. `5998000` -> `6002000`) when typed second does not
-/// cause a false `zone_mismatch` when the first column shares one zone.
-fn oriented_gk(
-    i1: ShapeId,
-    i2: ShapeId,
-    p1: Point,
-    p2: Point,
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
-) -> (GkPoint, GkPoint) {
-    let build = |a1: f64, b1: f64, a2: f64, b2: f64| GkCalibration {
-        layer: LayerId(0),
-        marker1: i1,
-        marker2: i2,
-        gk1: GkPoint { x: a1, y: b1 },
-        gk2: GkPoint { x: a2, y: b2 },
-    };
-    let zones_ok = |cal: &GkCalibration| match (zone_of(cal.gk1.y), zone_of(cal.gk2.y)) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    };
-    let direct = build(x1, y1, x2, y2);
-    let swapped = build(y1, x1, y2, x2);
-    let direct_valid = direct.transform_at(p1, p2).is_some();
-    let swapped_valid = swapped.transform_at(p1, p2).is_some();
-    let clearly_easting_first =
-        x1 >= 10_500_000.0 && x2 >= 10_500_000.0 && y1 < 10_500_000.0 && y2 < 10_500_000.0;
-    if clearly_easting_first && swapped_valid {
-        return (swapped.gk1, swapped.gk2);
+/// Resolve the typed `(northing, easting)` pairs into geodetic points:
+/// checks both the typed order and the swapped `(Easting, Northing)` order
+/// against the markers' positions AND zone agreement, so a 7-digit northing
+/// crossing a million boundary does not cause a false `zone_mismatch`.
+fn oriented_gk(pages: &[Point], typed: &[(f64, f64)]) -> Vec<GkPoint> {
+    let direct: Vec<GkPoint> = typed.iter().map(|&(x, y)| GkPoint { x, y }).collect();
+    let swapped: Vec<GkPoint> = typed.iter().map(|&(x, y)| GkPoint { x: y, y: x }).collect();
+    let fits = |g: &[GkPoint]| GkTransform::fit(pages, g).is_some();
+    let zones_ok = |g: &[GkPoint]| !zones_disagree(g);
+    let easting_first = typed.iter().all(|&(x, _)| x >= 10_500_000.0)
+        && typed.iter().all(|&(_, y)| y < 10_500_000.0);
+    if easting_first && fits(&swapped) {
+        return swapped;
     }
-    if direct_valid && zones_ok(&direct) {
-        return (direct.gk1, direct.gk2);
+    if fits(&direct) && zones_ok(&direct) {
+        return direct;
     }
-    if swapped_valid && zones_ok(&swapped) {
-        return (swapped.gk1, swapped.gk2);
+    if fits(&swapped) && zones_ok(&swapped) {
+        return swapped;
     }
-    if direct_valid {
-        return (direct.gk1, direct.gk2);
+    if fits(&direct) {
+        return direct;
     }
-    if swapped_valid {
-        return (swapped.gk1, swapped.gk2);
+    if fits(&swapped) {
+        return swapped;
     }
-    (direct.gk1, direct.gk2)
+    direct
 }
 
-/// Diagnose why the currently typed 4 coordinates do not resolve with `p1`/`p2`,
+/// Diagnose why the typed coordinates do not resolve against the markers,
 /// returning `None` when the inputs are incomplete or valid.
 fn diagnose_draft(app: &App) -> Option<&'static str> {
-    let st = &app.map_gk42;
-    let i1 = marker_id(app, true)?;
-    let i2 = marker_id(app, false)?;
-    let p1 = marker_position(app.doc(), i1)?;
-    let p2 = marker_position(app.doc(), i2)?;
-    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
-        parse_m(&st.gk1.0),
-        parse_m(&st.gk1.1),
-        parse_m(&st.gk2.0),
-        parse_m(&st.gk2.1),
-    ) else {
-        return None;
-    };
-    if (p2.x - p1.x).abs() < 1e-9 || (p2.y - p1.y).abs() < 1e-9 {
+    let (ids, pages) = marker_pages(app)?;
+    let typed = typed_draft(&app.map_gk42, pages.len() == 3)?;
+    if pages_degenerate(&pages) {
         return Some("gk42.broken");
     }
-    let (gk1, gk2) = oriented_gk(i1, i2, p1, p2, x1, y1, x2, y2);
-    if let (Some(a), Some(b)) = (zone_of(gk1.y), zone_of(gk2.y)) {
-        if a != b {
-            return Some("gk42.zone_mismatch");
-        }
+    let gk = oriented_gk(&pages, &typed);
+    if zones_disagree(&gk) {
+        return Some("gk42.zone_mismatch");
     }
-    let cal = GkCalibration {
-        layer: LayerId(0),
-        marker1: i1,
-        marker2: i2,
-        gk1,
-        gk2,
-    };
-    if cal.transform_at(p1, p2).is_none() {
+    let cal = build_cal(&ids, &gk, LayerId(0))?;
+    if cal_transform(&cal, &pages).is_none() {
         return Some("gk42.bad_axes");
     }
     None
@@ -307,31 +340,17 @@ fn diagnose_draft(app: &App) -> Option<&'static str> {
 /// against the typed coordinates, falling back to the saved calibration's.
 /// The bool says whether the coordinates came from the saved one.
 pub fn preview_transform(app: &App) -> Option<(GkTransform, bool)> {
-    let st = &app.map_gk42;
-    let doc = app.doc();
-    let i1 = marker_id(app, true)?;
-    let i2 = marker_id(app, false)?;
-    let p1 = marker_position(doc, i1)?;
-    let p2 = marker_position(doc, i2)?;
-    let g1x = parse_m(&st.gk1.0);
-    let g1y = parse_m(&st.gk1.1);
-    let g2x = parse_m(&st.gk2.0);
-    let g2y = parse_m(&st.gk2.1);
-    if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (g1x, g1y, g2x, g2y) {
-        let (gk1, gk2) = oriented_gk(i1, i2, p1, p2, x1, y1, x2, y2);
-        let cal = GkCalibration {
-            layer: LayerId(0),
-            marker1: i1,
-            marker2: i2,
-            gk1,
-            gk2,
-        };
-        if let Some(t) = cal.transform_at(p1, p2) {
-            return Some((t, false));
+    let (ids, pages) = marker_pages(app)?;
+    if let Some(typed) = typed_draft(&app.map_gk42, pages.len() == 3) {
+        let gk = oriented_gk(&pages, &typed);
+        if let Some(cal) = build_cal(&ids, &gk, LayerId(0)) {
+            if let Some(t) = cal_transform(&cal, &pages) {
+                return Some((t, false));
+            }
         }
     }
-    let cal = doc.gk42.as_ref()?;
-    let t = cal.transform_at(p1, p2)?;
+    let cal = app.doc().gk42.as_ref()?;
+    let t = cal_transform(cal, &pages)?;
     Some((t, true))
 }
 
@@ -340,22 +359,22 @@ pub fn preview_transform(app: &App) -> Option<(GkTransform, bool)> {
 /// false when the draft does not parse, the markers are incomplete or
 /// the zones of the two eastings disagree.
 pub fn apply(app: &mut App) -> bool {
-    let Some((i1, i2, gk1, gk2)) = parse_draft(app) else {
+    let Some((ids, gk)) = parse_draft(app) else {
         return false;
     };
-    let layer = match app.doc().locate(i1) {
+    let Some(&first) = ids.first() else {
+        return false;
+    };
+    let layer = match app.doc().locate(first) {
         Ok((l, _)) => l,
         Err(_) => {
             app.map_gk42.error = Some(tr("gk42.broken"));
             return false;
         }
     };
-    let cal = GkCalibration {
-        layer,
-        marker1: i1,
-        marker2: i2,
-        gk1,
-        gk2,
+    let Some(cal) = build_cal(&ids, &gk, layer) else {
+        app.map_gk42.error = Some(tr("gk42.broken"));
+        return false;
     };
     app.run(Command::SetGkCalibration { cal: Some(cal) });
     app.map_gk42.error = None;
@@ -363,89 +382,42 @@ pub fn apply(app: &mut App) -> bool {
     true
 }
 
-/// Parsing the panel's coordinate fields into the calibration data.
-fn parse_draft(app: &mut App) -> Option<(ShapeId, ShapeId, GkPoint, GkPoint)> {
-    let i1 = marker_id(app, true);
-    let i2 = marker_id(app, false);
-    let p1 = i1.and_then(|id| marker_position(app.doc(), id));
-    let p2 = i2.and_then(|id| marker_position(app.doc(), id));
+/// Parsing the panel's coordinate fields into the calibration data. All
+/// three markers must be placed; the typed values are oriented against
+/// their page positions.
+fn parse_draft(app: &mut App) -> Option<(Vec<ShapeId>, Vec<GkPoint>)> {
+    let Some((ids, pages)) = marker_pages(app) else {
+        app.map_gk42.error = Some(tr("gk42.need_markers"));
+        return None;
+    };
+    if pages.len() < 3 {
+        app.map_gk42.error = Some(tr("gk42.need_markers"));
+        return None;
+    }
     let st = &mut app.map_gk42;
-    let mut bad: Option<&'static str> = None;
-    let Some(i1) = i1 else {
-        st.error = Some(tr("gk42.need_markers"));
+    let Some(typed) = typed_draft(st, true) else {
+        st.error = Some(tr("gk42.bad_number"));
         return None;
     };
-    let Some(i2) = i2 else {
-        st.error = Some(tr("gk42.need_markers"));
-        return None;
-    };
-    let g1x = match parse_m(&st.gk1.0) {
-        Some(v) => v,
-        None => {
-            bad = Some("gk42.bad_number");
-            0.0
-        }
-    };
-    let g1y = match parse_m(&st.gk1.1) {
-        Some(v) => v,
-        None => {
-            bad = Some("gk42.bad_number");
-            0.0
-        }
-    };
-    let g2x = match parse_m(&st.gk2.0) {
-        Some(v) => v,
-        None => {
-            bad = Some("gk42.bad_number");
-            0.0
-        }
-    };
-    let g2y = match parse_m(&st.gk2.1) {
-        Some(v) => v,
-        None => {
-            bad = Some("gk42.bad_number");
-            0.0
-        }
-    };
-    if let Some(key) = bad {
-        st.error = Some(tr(key));
+    if pages_degenerate(&pages) {
+        st.error = Some(tr("gk42.broken"));
         return None;
     }
-    let (gk1, gk2) = match (p1, p2) {
-        (Some(a), Some(b)) => oriented_gk(i1, i2, a, b, g1x, g1y, g2x, g2y),
-        _ => (GkPoint { x: g1x, y: g1y }, GkPoint { x: g2x, y: g2y }),
-    };
-    if let (Some(a), Some(b)) = (zone_of(gk1.y), zone_of(gk2.y)) {
-        if a != b {
-            st.error = Some(tr("gk42.zone_mismatch"));
-            return None;
-        }
+    let gk = oriented_gk(&pages, &typed);
+    if zones_disagree(&gk) {
+        st.error = Some(tr("gk42.zone_mismatch"));
+        return None;
     }
-    match (p1, p2) {
-        (Some(a), Some(b)) => {
-            if (b.x - a.x).abs() < 1e-9 || (b.y - a.y).abs() < 1e-9 {
-                st.error = Some(tr("gk42.broken"));
-                return None;
-            }
-            let check = GkCalibration {
-                layer: LayerId(0),
-                marker1: i1,
-                marker2: i2,
-                gk1,
-                gk2,
-            };
-            if check.transform_at(a, b).is_none() {
-                st.error = Some(tr("gk42.bad_axes"));
-                return None;
-            }
-        }
-        _ => {
-            st.error = Some(tr("gk42.broken"));
-            return None;
-        }
+    let Some(cal) = build_cal(&ids, &gk, LayerId(0)) else {
+        st.error = Some(tr("gk42.broken"));
+        return None;
+    };
+    if cal_transform(&cal, &pages).is_none() {
+        st.error = Some(tr("gk42.bad_axes"));
+        return None;
     }
     st.error = None;
-    Some((i1, i2, gk1, gk2))
+    Some((ids, gk))
 }
 
 /// Resetting everything: the saved calibration goes, the marker shapes
@@ -460,9 +432,13 @@ pub fn reset(app: &mut App) {
     if let Some(i) = app.map_gk42.marker2 {
         ids.push(i);
     }
+    if let Some(i) = app.map_gk42.marker3 {
+        ids.push(i);
+    }
     if let Some(c) = &saved {
         ids.push(c.marker1);
         ids.push(c.marker2);
+        ids.extend(c.marker3);
     }
     ids.sort();
     ids.dedup();
@@ -482,11 +458,14 @@ pub fn reset(app: &mut App) {
     let st = &mut app.map_gk42;
     st.marker1 = None;
     st.marker2 = None;
+    st.marker3 = None;
     st.picked.clear();
     st.gk1 = (String::new(), String::new());
     st.gk2 = (String::new(), String::new());
+    st.gk3 = (String::new(), String::new());
     st.mm1 = (String::new(), String::new());
     st.mm2 = (String::new(), String::new());
+    st.mm3 = (String::new(), String::new());
     st.step = 0;
     st.seeded = false;
     st.error = None;
@@ -588,13 +567,10 @@ pub fn fmt_mm(v: f64) -> String {
     format!("{:.*}", MM_DIGITS, v)
 }
 
-/// The distance between two page points in map metres: the axes scale
-/// separately, so the millimetre difference scales along each axis
-/// before the sum goes under the root.
+/// The distance between two page points in map metres, with the scales
+/// and the turn of the map.
 fn delta_m(a: Point, b: Point, t: &GkTransform) -> f64 {
-    let dx = (b.x - a.x) * t.east;
-    let dy = (b.y - a.y) * t.north;
-    (dx * dx + dy * dy).sqrt()
+    t.distance_m(a, b)
 }
 
 /// A dashed line: short segments, plain line shapes only.
@@ -657,7 +633,9 @@ fn plate(painter: &Painter, anchor: Pos2, lines: &[String]) {
 
 /// Lines shown in the floating readout next to the cursor: the real
 /// ruler coordinates first, then GK-42 (`XX XX X...` without commas)
-/// whenever a live or applied calibration resolves.
+/// whenever a live or applied calibration resolves. The two pairs are
+/// written Y then X, as geography reads them; the values keep their own
+/// axis and the maths is untouched.
 pub fn cursor_lines(app: &App) -> Option<Vec<String>> {
     let active_t = preview_transform(app).map(|(t, _)| t);
     if !app.map_gk42.on && active_t.is_none() {
@@ -667,17 +645,17 @@ pub fn cursor_lines(app: &App) -> Option<Vec<String>> {
     let r = app.to_ruler(p);
     let u = app.units;
     let mut lines = vec![format!(
-        "X: {}  Y: {} {}",
-        fmt_mm(u.world_from_mm(r.x)),
+        "Y: {}  X: {} {}",
         fmt_mm(u.world_from_mm(r.y)),
+        fmt_mm(u.world_from_mm(r.x)),
         u.label()
     )];
     if let Some(t) = active_t {
         let g = t.to_gk(p);
         lines.push(format!(
-            "GK-42: X {}  Y {}",
-            fmt_gk_cursor(g.x),
-            fmt_gk_cursor(g.y)
+            "GK-42: Y {}  X {}",
+            fmt_gk_cursor(g.y),
+            fmt_gk_cursor(g.x)
         ));
     }
     Some(lines)
@@ -700,19 +678,27 @@ pub fn overlay(app: &App, painter: &Painter) {
     let p2 = marker_id(app, false)
         .and_then(|i| marker_position(doc, i))
         .map(|p| view.to_screen(p));
+    let p3 = marker3_id(app)
+        .and_then(|i| marker_position(doc, i))
+        .map(|p| view.to_screen(p));
+    let line = Stroke::new(1.0, Color32::from_rgb(0, 120, 215));
     if let (Some(a), Some(b)) = (p1, p2) {
-        dashed(
-            painter,
-            a,
-            b,
-            Stroke::new(1.0, Color32::from_rgb(0, 120, 215)),
-        );
+        dashed(painter, a, b, line);
+    }
+    if let (Some(b), Some(c)) = (p2, p3) {
+        dashed(painter, b, c, line);
+    }
+    if let (Some(c), Some(a)) = (p3, p1) {
+        dashed(painter, c, a, line);
     }
     if let Some(a) = p1 {
         badge(painter, a, "1", red);
     }
     if let Some(b) = p2 {
         badge(painter, b, "2", blue);
+    }
+    if let Some(c) = p3 {
+        badge(painter, c, "3", Color32::from_rgb(230, 150, 0));
     }
     for (k, p) in st.picked.iter().enumerate() {
         let s = view.to_screen(*p);
@@ -738,6 +724,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
     // hold the document borrow while the state changes.
     let mm1 = marker_id(app, true).and_then(|i| marker_position(app.doc(), i));
     let mm2 = marker_id(app, false).and_then(|i| marker_position(app.doc(), i));
+    let mm3 = marker3_id(app).and_then(|i| marker_position(app.doc(), i));
     let saved = app.doc().gk42.clone();
     let applied_ok = transform_of(app.doc()).is_some();
     seed(app, &saved);
@@ -757,16 +744,11 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
             .rich_tip(keyed("gk42.place_points"))
             .clicked()
         {
+            let step = next_step(app);
             let st = &mut app.map_gk42;
             st.on = true;
             st.note = None;
-            st.step = if st.marker1.is_none() {
-                0
-            } else if st.marker2.is_none() {
-                1
-            } else {
-                2
-            };
+            st.step = step;
         }
     });
 
@@ -775,6 +757,8 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
         chip(ui, mm1.is_some(), "gk42.step1");
         ui.label(rt(">").color(Tokens::text_dim()));
         chip(ui, mm2.is_some(), "gk42.step2");
+        ui.label(rt(">").color(Tokens::text_dim()));
+        chip(ui, mm3.is_some(), "gk42.step_marker3");
         ui.label(rt(">").color(Tokens::text_dim()));
         chip(ui, saved.is_some(), "gk42.step3");
     });
@@ -849,19 +833,19 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
             ui.label(dim(&tr("gk42.table_n")));
             ui.scope(|ui| {
                 ui.set_min_width(mm_w);
-                ui.label(dim(&format!("{} X", tr("gk42.table_mm"))));
+                ui.label(dim(&format!("{} Y", tr("gk42.table_mm"))));
             });
             ui.scope(|ui| {
                 ui.set_min_width(mm_w);
-                ui.label(dim("Y"));
+                ui.label(dim("X"));
             });
             ui.scope(|ui| {
                 ui.set_min_width(gk_w);
-                ui.label(dim(&format!("{} X", tr("gk42.table_gk"))));
+                ui.label(dim(&format!("Y, {}", tr("gk42.table_gk"))));
             });
             ui.scope(|ui| {
                 ui.set_min_width(gk_w);
-                ui.label(dim("Y"));
+                ui.label(dim("X"));
             });
             ui.label(dim(&tr("gk42.table_delta")))
                 .on_hover_text(tr("gk42.delta_tip"));
@@ -882,6 +866,18 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
                 };
                 if let Some((id, target)) =
                     marker_row(ui, &mut app.map_gk42, 2, 1, b, mm2, mm_w, gk_w, delta)
+                {
+                    commits.push((id, target));
+                }
+                ui.end_row();
+            }
+            if let Some(c) = marker3_id(app) {
+                let delta = match (mm2, mm3, t.as_ref()) {
+                    (Some(p2), Some(p3), Some(t)) => Some(fmt_gk_plain(delta_m(p2, p3, t))),
+                    _ => None,
+                };
+                if let Some((id, target)) =
+                    marker_row(ui, &mut app.map_gk42, 3, 2, c, mm3, mm_w, gk_w, delta)
                 {
                     commits.push((id, target));
                 }
@@ -938,7 +934,7 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
         {
             reset(app);
         }
-        let can_apply = marker_id(app, true).is_some() && marker_id(app, false).is_some();
+        let can_apply = marker_pages(app).is_some_and(|(_, pages)| pages.len() == 3);
         let r = ui
             .add_enabled(can_apply, egui::Button::new(tr("gk42.apply")))
             .rich_tip_always(keyed("gk42.apply"));
@@ -967,6 +963,9 @@ fn seed(app: &mut App, saved: &Option<GkCalibration>) {
     if let Some(c) = saved {
         st.gk1 = (fmt_gk_plain(c.gk1.x), fmt_gk_plain(c.gk1.y));
         st.gk2 = (fmt_gk_plain(c.gk2.x), fmt_gk_plain(c.gk2.y));
+        if let Some(g3) = c.gk3 {
+            st.gk3 = (fmt_gk_plain(g3.x), fmt_gk_plain(g3.y));
+        }
     }
 }
 
@@ -1003,9 +1002,11 @@ fn rt(text: impl Into<String>) -> egui::RichText {
 /// One marker row of the table: the two millimetre fields (the pair
 /// moves the marker when either commits with Enter), the two GK-42
 /// fields (the apply takes them) and the distance in the last cell.
-/// `which` selects the state's field pair (0 = marker 1, 1 = marker 2).
-/// Returns the move to run after the widgets, so the borrow of the
-/// state ends first.
+/// `which` selects the state's field pair (0 to 2 = markers 1 to 3).
+/// The columns read Y then X: the first field holds the axis's own
+/// second value (mm y / easting), the second its first (mm x /
+/// northing). Returns the move to run after the widgets, so the borrow
+/// of the state ends first.
 #[allow(clippy::too_many_arguments)]
 fn marker_row(
     ui: &mut Ui,
@@ -1018,49 +1019,28 @@ fn marker_row(
     gk_w: f32,
     delta: Option<String>,
 ) -> Option<(ShapeId, Point)> {
-    let (mm_edit, gk_edit) = if which == 0 {
-        (&mut st.mm1, &mut st.gk1)
-    } else {
-        (&mut st.mm2, &mut st.gk2)
+    let (mm_edit, gk_edit) = match which {
+        0 => (&mut st.mm1, &mut st.gk1),
+        1 => (&mut st.mm2, &mut st.gk2),
+        _ => (&mut st.mm3, &mut st.gk3),
+    };
+    let [my, mx, gy, gx] = match which {
+        0 => ["m1y", "m1x", "g1y", "g1x"],
+        1 => ["m2y", "m2x", "g2y", "g2x"],
+        _ => ["m3y", "m3x", "g3y", "g3x"],
     };
     ui.label(dim(&n.to_string()));
-    let live1 = mm.map(|p| fmt_mm(p.x)).unwrap_or_default();
-    let live2 = mm.map(|p| fmt_mm(p.y)).unwrap_or_default();
-    let commit1 = mm_field(
-        ui,
-        &mut mm_edit.0,
-        &live1,
-        mm_w,
-        ("gk42", if which == 0 { "m1x" } else { "m2x" }),
-        "gk42.mm_x_tip",
-    );
-    let commit2 = mm_field(
-        ui,
-        &mut mm_edit.1,
-        &live2,
-        mm_w,
-        ("gk42", if which == 0 { "m1y" } else { "m2y" }),
-        "gk42.mm_y_tip",
-    );
-    gk_field(
-        ui,
-        &mut gk_edit.0,
-        gk_w,
-        ("gk42", if which == 0 { "g1x" } else { "g2x" }),
-        "gk42.gk_x_tip",
-    );
-    gk_field(
-        ui,
-        &mut gk_edit.1,
-        gk_w,
-        ("gk42", if which == 0 { "g1y" } else { "g2y" }),
-        "gk42.gk_y_tip",
-    );
+    let live_y = mm.map(|p| fmt_mm(p.y)).unwrap_or_default();
+    let live_x = mm.map(|p| fmt_mm(p.x)).unwrap_or_default();
+    let commit_y = mm_field(ui, &mut mm_edit.1, &live_y, mm_w, ("gk42", my), "gk42.mm_y_tip");
+    let commit_x = mm_field(ui, &mut mm_edit.0, &live_x, mm_w, ("gk42", mx), "gk42.mm_x_tip");
+    gk_field(ui, &mut gk_edit.1, gk_w, ("gk42", gy), "gk42.gk_y_tip");
+    gk_field(ui, &mut gk_edit.0, gk_w, ("gk42", gx), "gk42.gk_x_tip");
     ui.label(match delta {
         Some(d) => dim(&d),
         None => dim(""),
     });
-    if commit1 || commit2 {
+    if commit_y || commit_x {
         if let (Some(x), Some(y)) = (parse_m(&mm_edit.0), parse_m(&mm_edit.1)) {
             return Some((id, Point::new(x, y)));
         }
@@ -1082,8 +1062,8 @@ fn picked_row(
         return;
     };
     ui.label(dim(&(k + 1).to_string()));
-    ui.label(dim(&fmt_mm(p.x)));
     ui.label(dim(&fmt_mm(p.y)));
+    ui.label(dim(&fmt_mm(p.x)));
     let Some(t) = t else {
         ui.label(dim(""));
         ui.label(dim(""));
@@ -1091,8 +1071,8 @@ fn picked_row(
         return;
     };
     let g = t.to_gk(p);
-    ui.label(dim(&fmt_gk_plain(g.x)));
     ui.label(dim(&fmt_gk_plain(g.y)));
+    ui.label(dim(&fmt_gk_plain(g.x)));
     let prev = if k == 0 {
         mm1
     } else {
@@ -1162,7 +1142,8 @@ fn fmt_1n(n: f64) -> String {
 
 /// The table as text: the markers and the picked points with their
 /// coordinates. `human` uses the display formats (spaces, commas),
-/// otherwise plain numbers with dots, as CSV wants.
+/// otherwise plain numbers with dots, as CSV wants. The columns read Y
+/// then X, matching the panel.
 fn table_text(app: &App, sep: char, human: bool) -> String {
     let st = &app.map_gk42;
     let doc = app.doc();
@@ -1177,17 +1158,21 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
     let mut out = String::new();
     let head = [
         tr("gk42.table_n"),
-        format!("{} X", tr("gk42.table_mm")),
         format!("{} Y", tr("gk42.table_mm")),
-        format!("X, {}", tr("gk42.table_gk")),
+        format!("{} X", tr("gk42.table_mm")),
         format!("Y, {}", tr("gk42.table_gk")),
+        format!("X, {}", tr("gk42.table_gk")),
         tr("gk42.table_delta"),
     ]
     .join(&sep.to_string());
     out.push_str(&head);
     out.push('\n');
     let t = preview_transform(app).map(|(t, _)| t);
-    for (n, id) in [(1, marker_id(app, true)), (2, marker_id(app, false))] {
+    for (n, id) in [
+        (1, marker_id(app, true)),
+        (2, marker_id(app, false)),
+        (3, marker3_id(app)),
+    ] {
         let Some(id) = id else { continue };
         let Some(p) = marker_position(doc, id) else {
             continue;
@@ -1199,7 +1184,7 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
             }
             None => (String::new(), String::new(), String::new()),
         };
-        out.push_str(&[n.to_string(), mm(p.x), mm(p.y), gx, gy, d].join(&sep.to_string()));
+        out.push_str(&[n.to_string(), mm(p.y), mm(p.x), gy, gx, d].join(&sep.to_string()));
         out.push('\n');
     }
     for (k, p) in st.picked.iter().enumerate() {
@@ -1218,7 +1203,7 @@ fn table_text(app: &App, sep: char, human: bool) -> String {
             }
             None => (String::new(), String::new(), String::new()),
         };
-        out.push_str(&[(k + 1).to_string(), mm(p.x), mm(p.y), gx, gy, d].join(&sep.to_string()));
+        out.push_str(&[(k + 1).to_string(), mm(p.y), mm(p.x), gy, gx, d].join(&sep.to_string()));
         out.push('\n');
     }
     out
@@ -1277,10 +1262,8 @@ mod tests {
     #[test]
     fn delta_m_scales_each_axis() {
         let t = GkTransform {
-            east: 10.0,
-            east_off: 0.0,
-            north: 12.0,
-            north_off: 0.0,
+            e: [10.0, 0.0, 0.0],
+            n: [0.0, 12.0, 0.0],
         };
         assert_eq!(
             delta_m(Point::new(0.0, 0.0), Point::new(3.0, 0.0), &t),
@@ -1320,6 +1303,8 @@ mod tests {
         assert_eq!(app.map_gk42.step, 1);
         click(&mut app, Point::new(150.0, 150.0));
         assert_eq!(app.map_gk42.step, 2);
+        click(&mut app, Point::new(50.0, 150.0));
+        assert_eq!(app.map_gk42.step, 3);
         let layer_name = tr("gk42.layer");
         let doc = app.doc();
         let layer = doc
@@ -1328,9 +1313,10 @@ mod tests {
             .flat_map(|p| &p.layers)
             .find(|l| l.name == layer_name)
             .expect("the markers layer");
-        assert_eq!(layer.shapes.len(), 2);
+        assert_eq!(layer.shapes.len(), 3);
         let id1 = app.map_gk42.marker1.unwrap();
         let id2 = app.map_gk42.marker2.unwrap();
+        let id3 = app.map_gk42.marker3.unwrap();
         let s1 = doc.find_shape(id1).expect("marker 1");
         match &s1.kind {
             ShapeKind::Ellipse { rect, .. } => {
@@ -1343,12 +1329,13 @@ mod tests {
         // 1:42 000 for the 100 mm between the markers.
         app.map_gk42.gk1 = ("6 519 000".into(), "42 531 000".into());
         app.map_gk42.gk2 = ("6 523 200".into(), "42 536 000".into());
+        app.map_gk42.gk3 = ("6 523 200".into(), "42 531 000".into());
         assert!(apply(&mut app));
         let (t, cal) = transform_of(app.doc()).expect("applied");
         assert_eq!(cal.zone(), Some(42));
-        assert_eq!(t.east, 50.0);
-        assert_eq!(t.north, 42.0);
-        assert_eq!(t.scale_x(), 50_000.0);
+        assert!((t.e[0] - 50.0).abs() < 1e-9);
+        assert!((t.n[1] - 42.0).abs() < 1e-9);
+        assert!((t.scale_x() - 50_000.0).abs() < 1e-6);
         // Two more clicks: picked points, overlay-only.
         click(&mut app, Point::new(100.0, 100.0));
         click(&mut app, Point::new(120.0, 110.0));
@@ -1359,11 +1346,13 @@ mod tests {
         assert_eq!(app.doc().gk42, None);
         assert!(app.doc().find_shape(id1).is_none());
         assert!(app.doc().find_shape(id2).is_none());
+        assert!(app.doc().find_shape(id3).is_none());
         assert!(app.map_gk42.picked.is_empty());
         app.engine.undo().expect("the reset is one step");
         assert!(app.doc().gk42.is_some());
         assert!(app.doc().find_shape(id1).is_some());
         assert!(app.doc().find_shape(id2).is_some());
+        assert!(app.doc().find_shape(id3).is_some());
     }
 
     /// The mm fields move the marker: moving marker 1 stretches the
@@ -1374,13 +1363,18 @@ mod tests {
         set_mode(&mut app, true);
         click(&mut app, Point::new(50.0, 50.0));
         click(&mut app, Point::new(150.0, 150.0));
+        click(&mut app, Point::new(50.0, 150.0));
         app.map_gk42.gk1 = ("6519000".into(), "42531000".into());
         app.map_gk42.gk2 = ("6523200".into(), "42536000".into());
+        app.map_gk42.gk3 = ("6523200".into(), "42531000".into());
         assert!(apply(&mut app));
         let id1 = app.map_gk42.marker1.unwrap();
         assert!(move_marker(&mut app, id1, Point::new(60.0, 50.0)));
         let (t, _) = transform_of(app.doc()).expect("still applied");
-        assert!((t.east - 5_000.0 / 90.0).abs() < 1e-9);
+        // Marker 1 moved 10 mm right: the three markers now imply a shear
+        // of 5 m per mm along Y, the X scale stays 50 m per mm.
+        assert!((t.e[0] - 50.0).abs() < 1e-9);
+        assert!((t.e[1] - 5.0).abs() < 1e-9);
     }
 
     /// The apply refuses disagreeing zones and non-parsing fields, and
@@ -1391,8 +1385,10 @@ mod tests {
         set_mode(&mut app, true);
         click(&mut app, Point::new(50.0, 50.0));
         click(&mut app, Point::new(150.0, 150.0));
+        click(&mut app, Point::new(50.0, 150.0));
         app.map_gk42.gk1 = ("6519000".into(), "42531000".into());
         app.map_gk42.gk2 = ("6523200".into(), "43536000".into());
+        app.map_gk42.gk3 = ("6523200".into(), "42531000".into());
         assert!(!apply(&mut app));
         assert_eq!(app.doc().gk42, None);
         assert!(app.map_gk42.error.is_some());
@@ -1414,15 +1410,17 @@ mod tests {
         set_mode(&mut app, true);
         click(&mut app, Point::new(50.0, 50.0));
         click(&mut app, Point::new(150.0, 150.0));
+        click(&mut app, Point::new(50.0, 150.0));
         app.map_gk42.gk1 = ("5416000".into(), "7490000".into());
         app.map_gk42.gk2 = ("5416748.56".into(), "7492139.86".into());
+        app.map_gk42.gk3 = ("5416748.56".into(), "7490000".into());
         app.pointer_page = Some(Point::new(100.0, 100.0));
 
         // Before Apply: draft GK-42 coordinates already resolve on the cursor plate.
         let before = cursor_lines(&app).expect("cursor lines");
         assert_eq!(before.len(), 2, "{before:?}");
-        assert_eq!(before[0], "X: 100.00  Y: 100.00 mm");
-        assert_eq!(before[1], "GK-42: X 54 16 374  Y 74 91 070");
+        assert_eq!(before[0], "Y: 100.00  X: 100.00 mm");
+        assert_eq!(before[1], "GK-42: Y 74 91 070  X 54 16 374");
         assert!(!before[1].contains(','));
 
         // After Apply with pick mode turned off: the cursor plate still shows both.
@@ -1430,6 +1428,40 @@ mod tests {
         set_mode(&mut app, false);
         let after = cursor_lines(&app).expect("cursor lines with mode off");
         assert_eq!(after, before);
+    }
+
+    /// The copied table and the CSV put the Y column before the X one,
+    /// in the header and in every row, just like the docker's grid.
+    /// The saved calibration still carries the same two axes.
+    #[test]
+    fn table_text_writes_y_then_x() {
+        let mut app = App::headless();
+        set_mode(&mut app, true);
+        click(&mut app, Point::new(50.0, 50.0));
+        click(&mut app, Point::new(150.0, 150.0));
+        click(&mut app, Point::new(50.0, 150.0));
+        app.map_gk42.gk1 = ("6 519 000".into(), "42 531 000".into());
+        app.map_gk42.gk2 = ("6 523 200".into(), "42 536 000".into());
+        app.map_gk42.gk3 = ("6 523 200".into(), "42 531 000".into());
+        assert!(apply(&mut app), "error: {:?}", app.map_gk42.error);
+        click(&mut app, Point::new(100.0, 100.0));
+        for sep in ['\t', ';'] {
+            let text = table_text(&app, sep, sep == '\t');
+            let lines: Vec<&str> = text.lines().collect();
+            let head: Vec<&str> = lines[0].split(sep).collect();
+            assert_eq!(head[1], format!("{} Y", tr("gk42.table_mm")));
+            assert_eq!(head[2], format!("{} X", tr("gk42.table_mm")));
+            assert_eq!(head[3], format!("Y, {}", tr("gk42.table_gk")));
+            assert_eq!(head[4], format!("X, {}", tr("gk42.table_gk")));
+            let mark: Vec<&str> = lines[1].split(sep).collect();
+            assert_eq!((mark[3], mark[4]), ("42531000", "6519000"));
+            let pick: Vec<&str> = lines[4].split(sep).collect();
+            assert_eq!(pick[1], if sep == '\t' { "100.00" } else { "100" });
+            assert_eq!((pick[3], pick[4]), ("42533500", "6521100"));
+        }
+        let (_, cal) = transform_of(app.doc()).expect("calibration");
+        assert_eq!(cal.gk1.x, 6_519_000.0);
+        assert_eq!(cal.gk1.y, 42_531_000.0);
     }
 
     /// 7-digit (Easting, Northing) pairs where Northing crosses a million
@@ -1442,17 +1474,20 @@ mod tests {
         set_mode(&mut app, true);
         click(&mut app, Point::new(50.0, 50.0));
         click(&mut app, Point::new(150.0, 150.0));
+        click(&mut app, Point::new(50.0, 150.0));
         // (Easting, Northing) 7-digit inputs where Northing crosses 6 000 000.
         app.map_gk42.gk1 = ("4312000".into(), "5998000".into());
         app.map_gk42.gk2 = ("4316000".into(), "6002000".into());
+        app.map_gk42.gk3 = ("4312000".into(), "6002000".into());
         assert!(apply(&mut app), "error: {:?}", app.map_gk42.error);
         let (t, cal) = transform_of(app.doc()).expect("valid calibration");
         assert_eq!(cal.zone(), Some(4));
-        assert!((t.east - 40.0).abs() < 1e-9);
-        assert!((t.north - 40.0).abs() < 1e-9);
+        assert!((t.e[0] - 40.0).abs() < 1e-9);
+        assert!((t.n[1] - 40.0).abs() < 1e-9);
         // Inverted north axis: rejected with explicit error, doc unchanged.
         app.map_gk42.gk1 = ("6002000".into(), "4312000".into());
         app.map_gk42.gk2 = ("5998000".into(), "4316000".into());
+        app.map_gk42.gk3 = ("6002000".into(), "4316000".into());
         assert!(!apply(&mut app));
         assert_eq!(app.map_gk42.error, Some(tr("gk42.bad_axes")));
     }

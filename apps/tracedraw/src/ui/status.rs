@@ -303,13 +303,14 @@ fn cursor_coordinates(app: &App) -> String {
                 u.label()
             );
             // The GK-42 metres of the point (a local feature), when the
-            // document or panel carries a working calibration.
+            // document or panel carries a working calibration. Written
+            // Y then X as geography reads them; the axes stay put.
             if let Some((t, _)) = crate::map_gk42::preview_transform(app) {
                 let g = t.to_gk(raw_p);
                 s.push_str(&format!(
-                    "  GK-42: X {} Y {}",
-                    crate::map_gk42::fmt_gk_cursor(g.x),
-                    crate::map_gk42::fmt_gk_cursor(g.y)
+                    "  GK-42: Y {} X {}",
+                    crate::map_gk42::fmt_gk_cursor(g.y),
+                    crate::map_gk42::fmt_gk_cursor(g.x)
                 ));
             }
             s
@@ -1228,5 +1229,23 @@ mod tests {
         app.units = crate::app::Units::Points;
         assert!(outline_text(&app, &s).ends_with("0.567 pt"));
         assert_eq!(outline_text(&app, &None), "None");
+    }
+
+    /// The status bar's GK-42 readout writes the easting (Y) before the
+    /// northing (X), as the canvas plate does. The calibration itself
+    /// keeps its axes.
+    #[test]
+    fn gk42_cursor_text_writes_y_then_x() {
+        crate::i18n::set_language("en");
+        let mut app = App::headless();
+        crate::map_gk42::set_mode(&mut app, true);
+        crate::map_gk42::click(&mut app, tracedraw_core::geometry::Point::new(50.0, 50.0));
+        crate::map_gk42::click(&mut app, tracedraw_core::geometry::Point::new(150.0, 150.0));
+        app.map_gk42.gk1 = ("6519000".into(), "42531000".into());
+        app.map_gk42.gk2 = ("6523200".into(), "42536000".into());
+        assert!(crate::map_gk42::apply(&mut app));
+        app.pointer_page = Some(tracedraw_core::geometry::Point::new(100.0, 100.0));
+        let text = cursor_coordinates(&app);
+        assert!(text.contains("GK-42: Y 42 53 3500  X 65 21 100"), "{text}");
     }
 }

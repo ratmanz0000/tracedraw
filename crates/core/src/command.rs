@@ -2736,6 +2736,8 @@ mod tests {
                 x: 6_523_200.0,
                 y: 42_536_000.0,
             },
+            marker3: None,
+            gk3: None,
         };
         assert_eq!(e.document().gk42, None);
         let first = cal(6_519_000.0);
