@@ -1196,6 +1196,11 @@ pub struct CurvePrefs {
     /// segment, so higher values make more lines.
     #[serde(default)]
     pub straight_threshold: u32,
+    /// Freehand: a line of clicks ends at the second click, one straight
+    /// segment (#3848). Off at first: each click adds a node and the line
+    /// goes on until a double-click, Space or Enter (#2339).
+    #[serde(default)]
+    pub freehand_click_ends: bool,
     /// Parallel Lines on the curve tools' property bar (#3626): lines
     /// drawn alongside each new curve. Off at first.
     #[serde(default)]
@@ -1289,6 +1294,7 @@ impl Default for CurvePrefs {
             pen_ignores_hand: true,
             corner_threshold: 0,
             straight_threshold: 0,
+            freehand_click_ends: false,
             parallel: ParallelLines::default(),
         }
     }
@@ -1708,6 +1714,7 @@ mod tests {
         // The Save dialog first; a name without an extension keeps PDF.
         crate::files::test_save::answer(Some(std::env::temp_dir().join("td-prefs")));
         app.export();
+        crate::files::test_save::finish(&mut app);
         assert!(matches!(&app.dialog, Dialog::Export(st) if st.format == 1 && st.remember));
         // The presets for the web and office never overwrite the choices.
         assert!(!ExportState::web().remember && !ExportState::office().remember);

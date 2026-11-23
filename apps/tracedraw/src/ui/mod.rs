@@ -117,6 +117,9 @@ pub mod status;
 pub mod straighten_dialog;
 pub mod stretch_zones_dialog;
 pub mod pixel_bar;
+pub mod pixel_cmds;
+pub mod pixel_icons;
+pub mod pixel_mode;
 pub mod pixel_lights;
 pub mod symmetry_bar;
 pub mod tab_focus;
@@ -586,19 +589,33 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
         .resizable(false)
         .show_separator_line(false)
         .show(ui, |ui| {
+            // A right click on the bar's empty part opens the toolbars'
+            // menu, as on the other bars (discussion #3918). Under the
+            // titles, which take their own clicks.
+            let empty = ui.interact(
+                ui.max_rect(),
+                egui::Id::new("menu_bar_background"),
+                egui::Sense::click(),
+            );
+            crate::ui::bars::menu_bar_menu(app, &empty);
             // Minimize, Maximize and Close at the right end, and the empty
             // part of the bar as a title bar, when turned on (#2574).
+            let menus = |app: &mut App, ui: &mut Ui| {
+                if app.pixel_edit.is_some() {
+                    pixel_mode::menu_bar(app, ui)
+                } else {
+                    menus::menu_bar(app, ui)
+                }
+            };
             if !crate::window_buttons::shown(app) {
-                menus::menu_bar(app, ui);
+                menus(app, ui);
                 return;
             }
             let full = ui.max_rect();
             let split = full.right() - crate::window_buttons::WIDTH;
             let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
             let right = egui::Rect::from_min_max(egui::pos2(split, full.top()), full.max);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                menus::menu_bar(app, ui)
-            });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| menus(app, ui));
             // The bar takes the whole width it is given: the empty part
             // starts after its last title. Taken from the bar's width it
             // was always empty, so the bar never moved the window (#3134).
@@ -674,8 +691,10 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     let show_palette = app.settings.palette.show_palette;
     // A document palette taken out into a bar of its own shows there, not
     // in the row as well. Hiding the default palette leaves it shown.
-    let show_doc_palette =
-        app.settings.palette.show_document && !app.extra_palettes.iter().any(|r| r.document);
+    // The image editing mode keeps no colours with the drawing.
+    let show_doc_palette = app.settings.palette.show_document
+        && !app.extra_palettes.iter().any(|r| r.document)
+        && app.pixel_edit.is_none();
     // Palette bars lie at the places `BarSlot` names along each side,
     // from the edge inwards; each bar drawn at a side is noted for the
     // drops of a dragged palette bar beside it (`palette_bars::side_target`).
@@ -876,10 +895,13 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     // Document tabs above the rulers.
     // The tabs' blue line is the strip's lower edge: no separator and no
     // gap between it and the rulers.
-    Panel::top("document_tabs")
-        .frame(Frame::new().fill(crate::theme::Tokens::tab_strip()))
-        .show_separator_line(false)
-        .show(ui, |ui| tabs::document_tabs(app, ui));
+    // The image editing mode shows the picture alone, without the tabs.
+    if app.pixel_edit.is_none() {
+        Panel::top("document_tabs")
+            .frame(Frame::new().fill(crate::theme::Tokens::tab_strip()))
+            .show_separator_line(false)
+            .show(ui, |ui| tabs::document_tabs(app, ui));
+    }
 
     if app.show_welcome {
         egui::CentralPanel::default()
@@ -914,7 +936,9 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
         .frame(Frame::NONE)
         .show(ui, |ui| {
             let full = ui.available_rect_before_wrap();
-            if app.window_layout != windows::WindowLayout::Tabs && !app.docs.is_empty() {
+            if app.pixel_edit.is_some() {
+                pixel_mode::canvas(app, ui, full);
+            } else if app.window_layout != windows::WindowLayout::Tabs && !app.docs.is_empty() {
                 windows::arranged(app, ui, full);
             } else if detached::is_detached(app, app.active_doc) {
                 // The active drawing is in its own window (#2904): this
@@ -928,7 +952,7 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
 
     if app.has_document() && !app.show_welcome {
         symmetry_bar::show(app, &ctx);
-        pixel_bar::show(app, &ctx);
+        pixel_bar::show(app);
         clip_bar::show(app, &ctx);
         focus_bar::show(app, &ctx);
         effect_picker::show(app, &ctx);
@@ -3399,6 +3423,7 @@ mod tests {
         // Export asks for the file first, then shows the options.
         crate::files::test_save::answer(Some(std::env::temp_dir().join("td-keys")));
         key(&ctx, &mut app, Key::E, Modifiers::COMMAND);
+        crate::files::test_save::finish(&mut app);
         assert!(
             matches!(app.dialog, crate::ui::dialogs::Dialog::Export(_)),
             "Ctrl+E opens Export"
@@ -3490,12 +3515,13 @@ mod tests {
         );
     }
 
-    /// #2507: the node bar of Interactive Fill is compact, and its
-    /// transparency is the object's uniform transparency (the value of
-    /// the Properties docker): dragging it makes the object see-through.
-    /// It was as wide as the window allowed and changed the node only.
+    /// The node bar of Interactive Fill is compact (#2507: it was as
+    /// wide as the window allowed) and its transparency is the selected
+    /// node's own: that colour of the fill fades, the other node and
+    /// the object as a whole stay opaque (#2827: it set the object's
+    /// uniform transparency, so everything faded).
     #[test]
-    fn the_node_bar_is_compact_and_sets_the_objects_transparency() {
+    fn the_node_bar_is_compact_and_sets_the_nodes_transparency() {
         let ctx = crate::theme::ui_context();
         let mut app = App::headless();
         app.show_welcome = false;
@@ -3530,12 +3556,16 @@ mod tests {
         );
         let s = app.doc().find_shape(id).expect("rect");
         let t = crate::mixed::ShapeTransparency::of(s);
-        assert_eq!(t.kind, 1, "uniform transparency: {t:?}");
-        assert!(t.amount > 30.0, "{}", t.amount);
-        // The node itself and the fill stay as they were.
+        assert_eq!(t.amount, 0.0, "the object stays opaque: {t:?}");
+        assert_eq!(s.opacity, 1.0);
+        // The node alone is see-through; the other one is not.
         let (_, f, _) = app.selected_fountain().expect("fountain");
-        assert_eq!(f.stops[0].opacity, 1.0);
-        assert_eq!(app.engine.undo_label(), Some("Transparency"));
+        assert!(f.stops[0].opacity < 0.7, "{}", f.stops[0].opacity);
+        assert_eq!(f.stops[1].opacity, 1.0);
+        assert_eq!(app.engine.undo_label(), Some("Fill"));
+        // The bar shows the node's value again on the next frame.
+        frame(&ctx, &mut app);
+        assert!(ctx.memory(|m| m.area_rect(bar)).is_some());
     }
 
     /// #2508: with Interactive Fill a click on an object picks it and

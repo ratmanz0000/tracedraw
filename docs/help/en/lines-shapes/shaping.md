@@ -93,8 +93,19 @@ makes it permanent.
   and place. The cutter is removed. Groups, texts and pictures stay as they
   are.
 - [[menu.object.cut_grid]] turns each selected object into rows and columns
-  of boxes that fill its bounds, with the gap you set between them, in the
-  object's paint and place.
+  of pieces, in the object's paint and place. The window has the same
+  four fields for the rows and for the columns: the number, the height
+  or width of each, the gap between them, and the total they take
+  together. The total starts as the object's size; changing the number,
+  the gap or the total shares the total out anew, and typing a height or
+  width keeps the number and changes the total. A total smaller than the
+  object lays the grid from the object's top-left corner. Keep the
+  object's shape makes the pieces the parts of the object inside each
+  box (a circle is cut into pieces of a circle) instead of whole boxes;
+  Add guidelines puts a guideline on every edge of the rows and columns;
+  Group the pieces keeps them in one group. With Preview on, the drawing
+  shows the pieces as lines over the object while the window is open,
+  and the window says how many pieces there will be and their size.
 - [[menu.object.remove_strays]] removes lone points, curves with no fill, no
   outline and no effect, and empty artistic texts from the unlocked layers
   of the page. The status bar says how many went.
@@ -130,12 +141,15 @@ distance from the selected objects, as a curve of its own:
 3. Choose [[dialog.outline_offset_outside]] or [[dialog.outline_offset_inside]]
    and click OK.
 
-Each object gets one new curve with sharp corners and the object's fill and
-outline; the original stays as it is. A curve outside goes behind its object
-and one inside in front of it, and the new curves are selected. An open line
-gets a closed band round both of its sides. The dialog remembers the last
-distance. For several outlines at once, or rounded corners, use the Contour
-tool.
+Each object gets a new curve with the object's fill and outline; the
+original stays as it is. A curve outside goes behind its object and one
+inside in front of it, and the new curves are selected. An open line gets
+a closed band round both of its sides. Corners makes the new outline's
+corners sharp, round or cut off, and Outlines makes several at once, each
+one the distance beyond the one before. With Preview on, the drawing
+shows the new outlines while the window is open. The dialog remembers the
+last distance, corners and number. For outlines that stay linked to
+their object, use the Contour tool.
 
 Related: [[menu.object.combine]] (<kbd>Ctrl+L</kbd>) makes several objects one
 curve without changing their shapes, and [[menu.object.break_apart]] splits a

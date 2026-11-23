@@ -6058,6 +6058,102 @@ fn a_pen_click_after_a_pulled_node_follows_its_handle() {
     );
 }
 
+/// A slight tremor of 1 to 2 screen pixels on a trackpad press with the
+/// Pen tool (#3907) keeps the node a straight-edged corner instead of
+/// leaving a tiny or zero Bezier handle that rounds or bevels the miter.
+#[test]
+fn a_pen_micro_drag_keeps_a_sharp_miter_corner() {
+    let (ctx, mut app, _) = setup();
+    app.select(Vec::new());
+    app.set_tool(Tool::Pen);
+    let (a, b, c) = (
+        Point::new(80.0, 100.0),
+        Point::new(110.0, 150.0),
+        Point::new(140.0, 100.0),
+    );
+    click_page(&ctx, &mut app, a);
+    let bs = app.view.to_screen(b);
+    let jitter = bs + egui::vec2(1.5, 0.5);
+    frame(
+        &ctx,
+        &mut app,
+        vec![
+            Event::PointerMoved(bs),
+            button(bs, true, PointerButton::Primary, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    frame(&ctx, &mut app, vec![Event::PointerMoved(jitter)], Modifiers::NONE);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(jitter, false, PointerButton::Primary, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    click_page(&ctx, &mut app, c);
+    app.finish_curve();
+    let segs: Vec<_> = last_path(&app).segments().collect();
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert!(
+        segs.iter()
+            .all(|s| matches!(s, tracedraw_core::geometry::PathSeg::Line(_))),
+        "both legs stay straight for a true miter corner: {segs:?}"
+    );
+}
+
+/// Dimension tools detect object edges ahead of alignment guides and
+/// inside groups, light the snapped edge, and Segment Dimension measures
+/// a grouped edge cleanly (#3907).
+#[test]
+fn dimension_tools_detect_and_measure_edges_including_grouped_shapes() {
+    use crate::snap_points::SnapMode;
+    let (ctx, mut app, first) = setup();
+    app.select(vec![first]);
+    app.delete_selection();
+    let r = app
+        .new_shape(ShapeKind::Rect {
+            rect: Rect::new(40.0, 40.0, 120.0, 90.0),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![r]);
+    app.group_selection();
+    app.snap.alignment_guides = true;
+    app.snap.grid = true;
+    app.set_tool(Tool::ParallelDimension);
+    let edge_pt = app.view.to_screen(Point::new(40.2, 58.0));
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::PointerMoved(edge_pt)],
+        Modifiers::NONE,
+    );
+    let mark = app.snap_mark.get().expect("edge mark");
+    assert_eq!(mark.mode, SnapMode::Edge);
+    assert!(mark.edge.is_some(), "edge geometry present for highlight");
+
+    app.set_tool(Tool::SegmentDimension);
+    let mid_top = app.view.to_screen(Point::new(80.0, 90.0));
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::PointerMoved(mid_top)],
+        Modifiers::NONE,
+    );
+    let seg_mark = app.snap_mark.get().expect("segment mark");
+    assert_eq!(seg_mark.mode, SnapMode::Edge);
+    assert!(seg_mark.edge.is_some());
+    click_at(&ctx, &mut app, mid_top, Modifiers::NONE);
+    assert_eq!(app.dimension_points.len(), 2, "segment ends captured");
+    let offset = app.view.to_screen(Point::new(80.0, 105.0));
+    click_at(&ctx, &mut app, offset, Modifiers::NONE);
+    let dim_id = app.selection[0];
+    let dim = crate::dimensions::Dimension::of(app.doc().find_shape(dim_id).expect("dim"))
+        .expect("dimension data");
+    assert_eq!(dim.anchors.len(), 2, "{:?}", dim.anchors);
+}
+
 /// A 3-point curve whose chord starts on an end node of the selected
 /// curve continues it, and one that ends on the other end node closes
 /// it (the owner's report: the second curve left the object open).
@@ -13359,6 +13455,7 @@ fn the_export_dialog_starts_with_the_last_exports_choices() {
             vec![key(egui::Key::E, Modifiers::COMMAND)],
             Modifiers::COMMAND,
         );
+        crate::files::test_save::finish(app);
         match &app.dialog {
             Dialog::Export(st) => st.clone(),
             other => panic!("no Export dialog: {other:?}"),
@@ -13432,6 +13529,7 @@ fn export_asks_for_the_file_then_shows_the_options_of_its_format() {
         vec![key(egui::Key::E, Modifiers::COMMAND)],
         Modifiers::COMMAND,
     );
+    crate::files::test_save::finish(&mut app);
     // The Save dialog: every format, the one used last (SVG at first)
     // first, the drawing's name with its extension.
     let asked = test_save::asked();
@@ -13443,6 +13541,7 @@ fn export_asks_for_the_file_then_shows_the_options_of_its_format() {
         .iter()
         .any(|(_, e)| e.contains(&"jpg".to_string()) && e.contains(&"jpeg".to_string())));
     assert_eq!(asked[0].file_name(), Some("Graphic1.svg"));
+    assert_eq!(asked[0].title(), Some("Export"), "#3994");
     // Then the options of PNG, the format the name chose, for that file.
     let Dialog::Export(st) = &app.dialog else {
         panic!("no options after the Save dialog: {:?}", app.dialog);
@@ -13484,6 +13583,7 @@ fn export_asks_for_the_file_then_shows_the_options_of_its_format() {
     // The next export offers PDF first, in the folder exported to.
     test_save::answer(None);
     app.export();
+    crate::files::test_save::finish(&mut app);
     let asked = test_save::asked();
     assert_eq!(asked[0].filters()[0].1, vec!["pdf".to_string()]);
     assert_eq!(asked[0].directory(), Some(dir.as_path()));
@@ -13493,6 +13593,7 @@ fn export_asks_for_the_file_then_shows_the_options_of_its_format() {
     // the Save dialog, without the format's options or presets).
     test_save::answer(Some(dir.join("again.webp")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     assert_eq!(test_save::asked().len(), 1, "one Save dialog");
     let Dialog::Export(st) = &app.dialog else {
         panic!("no options on the second export: {:?}", app.dialog);
@@ -13519,10 +13620,12 @@ fn cancelling_the_export_writes_nothing() {
     let dir = export_test_dir("cancel");
     test_save::answer(None);
     app.export();
+    crate::files::test_save::finish(&mut app);
     assert_eq!(test_save::asked().len(), 1);
     assert!(matches!(app.dialog, Dialog::None));
     test_save::answer(Some(dir.join("a.svg")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     let Dialog::Export(st) = &mut app.dialog else {
         panic!("no options");
     };
@@ -13558,6 +13661,7 @@ fn with_the_options_set_not_to_show_export_writes_at_once() {
     let dir = export_test_dir("skip");
     test_save::answer(Some(dir.join("first.svg")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     let Dialog::Export(st) = &mut app.dialog else {
         panic!("no options");
     };
@@ -13576,6 +13680,7 @@ fn with_the_options_set_not_to_show_export_writes_at_once() {
         vec![key(egui::Key::E, Modifiers::COMMAND)],
         Modifiers::COMMAND,
     );
+    crate::files::test_save::finish(&mut app);
     assert_eq!(test_save::asked().len(), 1);
     assert!(matches!(app.dialog, Dialog::None), "{:?}", app.dialog);
     assert!(dir.join("second.svg").exists(), "{}", app.status);
@@ -13592,6 +13697,7 @@ fn with_the_options_set_not_to_show_export_writes_at_once() {
         vec![key(egui::Key::E, Modifiers::COMMAND | Modifiers::SHIFT)],
         Modifiers::COMMAND | Modifiers::SHIFT,
     );
+    crate::files::test_save::finish(&mut app);
     let Dialog::Export(st) = &mut app.dialog else {
         panic!("Ctrl+Shift+E showed no options: {:?}", app.dialog);
     };
@@ -13606,6 +13712,7 @@ fn with_the_options_set_not_to_show_export_writes_at_once() {
     assert!(!app.settings.formats.skip_export_dialog);
     test_save::answer(Some(dir.join("fourth.svg")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     assert!(matches!(app.dialog, Dialog::Export(_)));
     assert!(!dir.join("fourth.svg").exists());
     app.dialog = Dialog::None;
@@ -13728,6 +13835,7 @@ fn the_export_dialog_asks_before_deleting_a_preset() {
     assert!(app.settings.formats.save_preset("FB-WEB", &png));
     crate::files::test_save::answer(Some(std::env::temp_dir().join("td-presets")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     let Dialog::Export(st) = &mut app.dialog else {
         panic!("no Export dialog");
     };
@@ -13801,6 +13909,7 @@ fn the_export_dialog_lists_every_preset_and_a_format_change_unchooses() {
     let all = vec!["Web PNG (PNG)", "Print JPG (JPEG)", "Big PNG (PNG)"];
     crate::files::test_save::answer(Some(std::env::temp_dir().join("td-presets")));
     app.export();
+    crate::files::test_save::finish(&mut app);
     // The dialog opens at SVG, which has no preset of its own: the list
     // still holds every preset.
     let Dialog::Export(st) = &app.dialog else {
@@ -25478,6 +25587,87 @@ fn the_tab_ruler_drags_the_left_and_right_indents() {
     assert!((para(&app).left_indent - 15.0).abs() < 0.6);
 }
 
+/// The first line's indent has a marker of its own above the left one
+/// (#3911): dragged right it indents the first line, dragged left of the
+/// left indent it makes a hanging indent; the left marker moves every
+/// line, the first line keeping its place from it. Each drag is one undo
+/// step.
+#[test]
+fn the_tab_ruler_drags_the_first_line_indent() {
+    use crate::tab_ruler::IndentSide;
+    let (ctx, mut app, id) = editing_with_ruler(Vec::new());
+    let none = Modifiers::NONE;
+    let para = |app: &App| {
+        let s = app.doc().find_shape(id).expect("text").clone();
+        app.paragraph_style_of(&s).expect("text").1
+    };
+    let r = app.tab_ruler().expect("ruler");
+    assert_eq!(r.first_line_indent, 0.0);
+    // Where the two left markers meet, the outer quarter is the first
+    // line's and the quarter below it the left indent's.
+    assert_eq!(r.indent_at(r.on_first_line(0.0)), Some(IndentSide::FirstLine));
+    assert_eq!(r.indent_at(r.on_indents(0.0)), Some(IndentSide::Left));
+    let undo = app.engine.history_labels().0.len();
+    // The first line indented 10 mm.
+    drag(
+        &ctx,
+        &mut app,
+        r.on_first_line(0.0),
+        r.on_first_line(10.0),
+        none,
+        Vec::new(),
+    );
+    assert!(app.indent_drag.is_none());
+    let p = para(&app);
+    assert!((p.first_line_indent - 10.0).abs() < 0.6, "{}", p.first_line_indent);
+    assert_eq!(p.left_indent, 0.0);
+    assert!(tab_stops_of(&app, id).is_empty(), "no stop added");
+    assert_eq!(app.engine.history_labels().0.len(), undo + 1, "one step");
+    // The left marker moves every line: the first line keeps its 10 mm.
+    let r = app.tab_ruler().expect("ruler");
+    drag(
+        &ctx,
+        &mut app,
+        r.on_indents(0.0),
+        r.on_indents(20.0),
+        none,
+        Vec::new(),
+    );
+    let p = para(&app);
+    assert!((p.left_indent - 20.0).abs() < 0.6, "{}", p.left_indent);
+    assert!((p.first_line_indent - 10.0).abs() < 0.6, "{}", p.first_line_indent);
+    // The first line dragged to 5 mm: a hanging indent of 15 mm.
+    let r = app.tab_ruler().expect("ruler");
+    let at = r.indent_pos(IndentSide::FirstLine);
+    assert!((at - 30.0).abs() < 1.2, "{at}");
+    drag(
+        &ctx,
+        &mut app,
+        r.on_first_line(at),
+        r.on_first_line(5.0),
+        none,
+        Vec::new(),
+    );
+    let p = para(&app);
+    assert!((p.first_line_indent + 15.0).abs() < 0.6, "{}", p.first_line_indent);
+    assert!((p.left_indent - 20.0).abs() < 0.6, "{}", p.left_indent);
+    assert_eq!(app.engine.history_labels().0.len(), undo + 3, "one step each");
+    // Not past the frame's left edge.
+    let r = app.tab_ruler().expect("ruler");
+    drag(
+        &ctx,
+        &mut app,
+        r.on_first_line(r.indent_pos(IndentSide::FirstLine)),
+        r.on_first_line(-30.0),
+        none,
+        Vec::new(),
+    );
+    let p = para(&app);
+    assert!((p.left_indent + p.first_line_indent).abs() < 0.6, "{p:?}");
+    app.undo();
+    assert!((para(&app).first_line_indent + 15.0).abs() < 0.6);
+}
+
 /// While a stop is dragged the text flows to it as it moves, not only
 /// when the button is let go (#1852, #1912); the reflows come at most
 /// `LIVE_EVERY` apart, the stop dragged off the strip shows the text
@@ -30952,8 +31142,13 @@ fn the_middle_button_pans_while_a_picture_is_edited_inside() {
     for _ in 0..2 {
         frame(&ctx, &mut app, Vec::new(), none);
     }
-    let mid = app.view.to_screen(Point::new(50.0, 30.0));
-    let before = app.view.to_screen(Point::new(0.0, 0.0));
+    // The picture shows in the image editing mode's own view.
+    let corner = |app: &App| {
+        let pe = app.pixel_edit.as_ref().expect("editing");
+        pe.ws.to_screen(pe.ws_area, 0.0, 0.0)
+    };
+    let mid = app.pixel_edit.as_ref().expect("editing").ws_area.center();
+    let before = corner(&app);
     frame(&ctx, &mut app, vec![Event::PointerMoved(mid)], none);
     frame(
         &ctx,
@@ -30972,8 +31167,8 @@ fn the_middle_button_pans_while_a_picture_is_edited_inside() {
         vec![button(panned, false, PointerButton::Middle, none)],
         none,
     );
-    let after = app.view.to_screen(Point::new(0.0, 0.0));
     assert!(app.pixel_edit.is_some(), "still editing");
+    let after = corner(&app);
     assert!(
         (after - before).length() > 30.0,
         "the middle drag pans: {before:?} {after:?}"
@@ -31379,4 +31574,77 @@ fn renderer_effects_leave_the_pick_of_a_plain_object_as_it_was() {
         None,
         "the corner the warp cut off"
     );
+}
+
+#[test]
+fn a_guideline_dragged_with_a_finger_moves_and_stays() {
+    // #3867: a finger lifted takes the pointer with it (PointerGone), so
+    // the release of a guideline's drag seemed to be outside the window
+    // and the guideline was deleted instead of moved.
+    let (ctx, mut app, _) = setup();
+    app.select(Vec::new());
+    let y = 150.0;
+    app.add_guide(tracedraw_core::document::Guide::horizontal(y));
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let at = app.view.to_screen(Point::new(100.0, y));
+    let to = app.view.to_screen(Point::new(100.0, y + 10.0));
+    pen_drag(&ctx, &mut app, at, to, &|_| 1.0);
+    let guides = app.page_guides();
+    assert_eq!(guides.len(), 1, "the guideline stays");
+    let moved = match guides[0].line {
+        tracedraw_core::document::GuideLine::Horizontal { y } => y,
+        ref other => panic!("guideline turned into {other:?}"),
+    };
+    assert!((moved - (y + 10.0)).abs() < 0.5, "guideline at {moved}");
+}
+
+#[test]
+fn freehand_with_the_second_click_ending_draws_one_segment_and_stops() {
+    // #3848: Options > Tools > Freehand/Bézier can end a Freehand line of
+    // clicks at the second click, one straight segment, Ctrl held or not;
+    // the pointer moved on after it draws no next segment.
+    let (ctx, mut app, _id) = setup();
+    app.settings.curves.freehand_click_ends = true;
+    app.set_tool(Tool::Freehand);
+    let view = app.view.clone();
+    let at = |x: f64, y: f64| view.to_screen(Point::new(x, y));
+    let before = shape_count(&app);
+    for (x, mods) in [(100.0, Modifiers::NONE), (40.0, Modifiers::CTRL)] {
+        let n = shape_count(&app);
+        click_at(&ctx, &mut app, at(x, 100.0), mods);
+        click_at(&ctx, &mut app, at(x, 160.0), mods);
+        assert!(app.curve.is_none(), "the line ended ({mods:?})");
+        assert_eq!(shape_count(&app), n + 1);
+        let segments = last_path(&app)
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, tracedraw_core::geometry::PathEl::LineTo(_)))
+            .count();
+        assert_eq!(segments, 1, "one straight segment");
+        frame(
+            &ctx,
+            &mut app,
+            vec![Event::PointerMoved(at(140.0, 180.0))],
+            Modifiers::NONE,
+        );
+        assert!(app.curve.is_none(), "nothing follows the pointer");
+    }
+    assert_eq!(shape_count(&app), before + 2);
+}
+
+/// Discussion #3918: a right click on the menu bar's empty part opens the
+/// toolbars' menu, as on the other bars; a click away closes it. A right
+/// click on a menu title still leaves the titles alone.
+#[test]
+fn a_right_click_on_the_menu_bar_opens_the_toolbars_menu() {
+    let (ctx, mut app, _) = setup();
+    let bar = ctx
+        .read_response(egui::Id::new("menu_bar_background"))
+        .map(|r| r.rect)
+        .expect("the menu bar");
+    let at = egui::pos2(bar.right() - 60.0, bar.center().y);
+    let shown = right_click_menu(&ctx, &mut app, at, false);
+    assert!(shown.iter().all(|s| *s), "{shown:?}");
+    click_menu_away(&ctx, &mut app);
+    assert!(!bar_menu_shown(&ctx, &mut app, Vec::new()));
 }

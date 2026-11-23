@@ -2105,6 +2105,11 @@ pub struct ParagraphStyle {
     /// the first line's indent going to the right. Not in older files.
     #[serde(default, skip_serializing_if = "TextDirection::is_left_to_right")]
     pub direction: TextDirection,
+    /// How much of a justified line's room Arabic-script words take by
+    /// stretching their joins (kashida, #3827) instead of the spaces
+    /// between them. Off by default; not in older files.
+    #[serde(default, skip_serializing_if = "Kashida::is_off")]
+    pub kashida: Kashida,
     /// The paragraph frame's background; `None` = transparent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_fill: Option<Fill>,
@@ -2113,6 +2118,12 @@ pub struct ParagraphStyle {
     /// [`crate::text_flow`]); not saved.
     #[serde(skip)]
     pub flow: crate::text_flow::FrameFlow,
+    /// The closed shape this frame's text was put into (Text > Text
+    /// Frame > Put Text Inside Shape): its lines stay inside that
+    /// shape's outline, wherever the two stand. `None`, or a shape that
+    /// is gone: the plain rectangular frame. Not in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<ShapeId>,
     /// Which bullets this text draws when it is one part of a text drawn
     /// in parts ([`Shape::text_parts`], #3682); `None` (a whole text):
     /// every bullet, in its paragraph's first letter's look. Set only on
@@ -2302,6 +2313,14 @@ impl LeadingUnit {
 }
 
 impl ParagraphStyle {
+    /// The room kept between the outline of the shape the text was put
+    /// into ([`ParagraphStyle::inside`]) and its lines, mm.
+    pub fn inside_inset(&self) -> f64 {
+        1.0
+    }
+}
+
+impl ParagraphStyle {
     /// The distance from one baseline to the next, mm, for a line whose
     /// font has `line_height_mm` from ascent to descent plus gap at a size
     /// of `size_mm`.
@@ -2376,6 +2395,42 @@ impl TextDirection {
     }
 }
 
+/// How a justified paragraph in Arabic script fills its lines (see
+/// [`ParagraphStyle::kashida`], #3827): only by widening the spaces
+/// between words (`Off`), or also by stretching the joins between
+/// connected letters (kashida), a little (`Low`), more (`Medium`) or as
+/// far as the line needs (`High`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kashida {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Kashida {
+    /// Every setting, in the order a list shows them.
+    pub const ALL: [Kashida; 4] = [Kashida::Off, Kashida::Low, Kashida::Medium, Kashida::High];
+
+    pub fn is_off(&self) -> bool {
+        *self == Kashida::Off
+    }
+
+    /// The share of a line's room the stretched joins take (the rest
+    /// widens the spaces), and the most one join is stretched by, in ems
+    /// of the font size.
+    pub fn share_and_cap(self) -> (f64, f64) {
+        match self {
+            Kashida::Off => (0.0, 0.0),
+            Kashida::Low => (0.35, 0.5),
+            Kashida::Medium => (0.7, 1.0),
+            Kashida::High => (1.0, 2.5),
+        }
+    }
+}
+
 /// Where paragraph text sits in its frame (the Text docker's Frame
 /// section): at the top, in the middle or at the bottom of the room its
 /// lines leave. Text that overflows the frame starts at the top.
@@ -2421,9 +2476,11 @@ impl Default for ParagraphStyle {
             vertical: false,
             vertical_columns: VerticalColumns::RightToLeft,
             direction: TextDirection::LeftToRight,
+            kashida: Kashida::Off,
             frame_fill: None,
             bullet_part: None,
             flow: crate::text_flow::FrameFlow::default(),
+            inside: None,
         }
     }
 }
@@ -7888,6 +7945,18 @@ impl Document {
     }
 
     fn from_json_here(s: &str) -> Result<Self> {
+        // Read straight from the text when it can be: every step of
+        // `migrate` keeps the layout, so a file of any version reads as
+        // it is. A drawing's JSON taken in as a value first held several
+        // times the text in memory: a 246 MB file with large drawings
+        // took more than 20 GB to open (#3833). A file that does not read
+        // this way (a number written as null, a wrong table) goes the
+        // long way below, which mends what it can or says what is wrong.
+        if STEPS_KEEP_LAYOUT {
+            if let Some(doc) = Self::from_json_text(s) {
+                return Ok(doc.opened());
+            }
+        }
         let mut v: serde_json::Value = json_value(s)?;
         let from = tdraw_version(&v);
         migrate(&mut v, from);
@@ -7907,15 +7976,44 @@ impl Document {
             }
         }
         let _table = crate::bytes::ReadingTable::start(blobs);
-        let mut doc: Document = match Document::deserialize(&v) {
+        let doc: Document = match Document::deserialize(&v) {
             Ok(doc) => doc,
             Err(e) => numbers_lost_as_zero(v, e)?,
         };
+        Ok(doc.opened())
+    }
+
+    /// The drawing `s` holds, read from the text without a JSON value in
+    /// between (#3833): first the table of pictures and fonts at its end
+    /// (the rest skipped over), then the drawing, its pictures looked up
+    /// in the table. `None` when the text does not read this way.
+    fn from_json_text(s: &str) -> Option<Self> {
+        if json_depth(s) > MAX_JSON_DEPTH {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Table {
+            #[serde(default)]
+            blobs: Vec<String>,
+        }
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let table = Table::deserialize(&mut de).ok()?;
+        let _table = crate::bytes::ReadingTable::start(table.blobs);
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let doc = Document::deserialize(&mut de).ok()?;
+        de.end().ok()?;
+        Some(doc)
+    }
+
+    /// A drawing just read, with what a file does not save worked out.
+    fn opened(mut self) -> Self {
         // What text wraps around is not saved: work it out again.
-        doc.refresh_text_flow();
-        doc.refit_text_meshes();
-        doc.break_symbol_loops();
-        Ok(doc)
+        self.refresh_text_flow();
+        self.refit_text_meshes();
+        self.break_symbol_loops();
+        self
     }
 
     /// Stretch the mesh fill of every text whose grid lies inside the
@@ -8180,8 +8278,38 @@ pub fn tdraw_version(v: &serde_json::Value) -> u32 {
 }
 
 /// The version a `.tdraw` text says it has (0 for unreadable text).
+/// Only that number is read, the rest of the text skipped over: taking
+/// the whole drawing in as a JSON value for it held several times the
+/// text in memory just before the drawing was read (#3833).
 pub fn tdraw_text_version(s: &str) -> u32 {
-    json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0)
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default)]
+        format_version: Option<u64>,
+    }
+    let read = || {
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        Version::deserialize(&mut de).ok()
+    };
+    let version = if json_depth(s) > SHALLOW_JSON_DEPTH {
+        on_deep_stack(read)
+    } else {
+        read()
+    };
+    match version {
+        Some(Version {
+            format_version: Some(n),
+        }) => {
+            let n = if n == SAME_AS_ZERO { 0 } else { n };
+            n.min(u64::from(u32::MAX)) as u32
+        }
+        Some(Version {
+            format_version: None,
+        }) => 0,
+        // Not a whole number, or text that is not JSON: as before.
+        None => json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0),
+    }
 }
 
 /// One step of [`migrate`]: the JSON of version `i` to version `i + 1`.
@@ -8197,6 +8325,11 @@ const STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 const DOWN_STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 
 fn same_layout(_: &mut serde_json::Value) {}
+
+/// Every one of [`STEPS`] is [`same_layout`], so `Document::from_json`
+/// reads a file of any version straight from its text. A step that
+/// changes the layout must set this to false.
+const STEPS_KEEP_LAYOUT: bool = true;
 
 /// The TraceDraw release that first wrote each `.tdraw` format version
 /// (`TDRAW_RELEASES[v]`), for Save As. Version 1 is not offered: it has
@@ -9896,6 +10029,53 @@ mod tests {
         p
     }
 
+    #[test]
+    fn tdraw_files_read_straight_from_their_text() {
+        // A drawing reads from its text without a JSON value in between,
+        // packed or plain, to the drawing the long way gives; the long way
+        // stays for what only it mends (#3833).
+        let mut doc = Document::new("Straight", crate::geometry::Size::new(100.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        for i in 0..3 {
+            let id = doc.ids_mut().shape();
+            let mut path = BezPath::new();
+            path.move_to((f64::from(i), 1.5));
+            path.curve_to((2.25, 3.0), (4.0, 5.125), (6.0, 7.0));
+            let s = Shape::new(
+                id,
+                ShapeKind::Path {
+                    path,
+                    closed: i % 2 == 0,
+                },
+            );
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+        }
+        let mut packed = Vec::new();
+        doc.write_tdraw_version(&mut packed, TDRAW_FORMAT_VERSION)
+            .expect("write");
+        for text in [
+            tdraw_text(&packed).expect("text"),
+            doc.to_json_version(0).expect("plain"),
+        ] {
+            let straight = Document::from_json_text(&text).expect("straight");
+            assert_eq!(straight.opened(), doc);
+            assert_eq!(Document::from_json(&text).expect("reads"), doc);
+        }
+        // The version alone is read the short way too, as the long way
+        // reads it.
+        assert_eq!(tdraw_text_version(&tdraw_text(&packed).expect("text")), TDRAW_FORMAT_VERSION);
+        assert_eq!(tdraw_text_version(&doc.to_json_version(0).expect("plain")), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 1}"), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 2.5}"), 0);
+        assert_eq!(tdraw_text_version("not json"), 0);
+        // A number lost as null reads only the long way, as 0.
+        let text = doc.to_json_version(0).expect("plain");
+        let lost = text.replacen("1.5", "null", 1);
+        assert!(Document::from_json_text(&lost).is_none());
+        let back = Document::from_json(&lost).expect("mended");
+        assert_eq!(back.pages[0].layers[0].shapes.len(), 3);
+    }
+
     /// A saved drawing is packed (#2849): each distinct picture and font
     /// once however many objects hold it, the whole JSON gzip-compressed;
     /// it reads back the same, with the copies sharing one buffer again.
@@ -9952,6 +10132,8 @@ mod tests {
         let table: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(table[BLOBS_KEY].as_array().map(Vec::len), Some(2));
         assert_eq!(tdraw_text_version(&text), TDRAW_FORMAT_VERSION);
+        // Read straight from the text, with the table (#3833).
+        assert!(Document::from_json_text(&text).is_some());
         let back = Document::from_tdraw_bytes(&packed).expect("reads");
         let pictures: Vec<&crate::SharedBytes> = back.pages[0].layers[0]
             .shapes
@@ -11103,6 +11285,30 @@ mod tests {
         assert_eq!(p.direction, TextDirection::RightToLeft);
         let plain = serde_json::to_string(&crate::ParagraphFormat::default()).expect("writes");
         assert!(!plain.contains("direction"), "{plain}");
+    }
+
+    /// Kashida (#3827): older files read as off, which is not written;
+    /// a setting is saved, read back and carried by a paragraph format.
+    #[test]
+    fn kashida_defaults_to_off_and_round_trips() {
+        let old: ParagraphStyle = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.kashida, Kashida::Off);
+        let json = serde_json::to_string(&old).expect("writes");
+        assert!(!json.contains("kashida"), "{json}");
+        let mut k = old.clone();
+        k.kashida = Kashida::Medium;
+        let json = serde_json::to_string(&k).expect("writes");
+        assert!(json.contains("\"kashida\":\"medium\""), "{json}");
+        let back: ParagraphStyle = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.kashida, Kashida::Medium);
+        let f = crate::ParagraphFormat::of(TextAlign::Justify, &k);
+        let json = serde_json::to_string(&f).expect("writes");
+        let back: crate::ParagraphFormat = serde_json::from_str(&json).expect("parses");
+        let mut p = ParagraphStyle::default();
+        back.apply_to(&mut p);
+        assert_eq!(p.kashida, Kashida::Medium);
+        let plain = serde_json::to_string(&crate::ParagraphFormat::default()).expect("writes");
+        assert!(!plain.contains("kashida"), "{plain}");
     }
 
     /// The column order of vertical text (#1986): older files read as

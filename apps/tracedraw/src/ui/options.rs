@@ -463,6 +463,15 @@ pub fn options_dialog(app: &mut App, ctx: &Context, close: &mut bool) {
     if app.options_snapshot.is_none() {
         app.options_snapshot = Some(OptionsSnapshot::take(app));
     }
+    if let Some(dir) = crate::files::take_picked("options-before-save-folder") {
+        app.settings.backup.before_save_dir = Some(dir);
+    }
+    if let Some(dir) = crate::files::take_picked("options-auto-backup-folder") {
+        app.settings.backup.auto_dir = Some(dir);
+    }
+    if let Some(dir) = crate::files::take_picked("options-dictionary-folder") {
+        app.settings.spelling.dictionary_folder = Some(dir);
+    }
     let set = app.options_page.set();
     let mut ok = false;
     let mut cancel = false;
@@ -1305,6 +1314,23 @@ fn display_page(app: &mut App, ui: &mut Ui) {
             "options.show_page_border",
             "options.show_page_border_tip",
         ));
+        // The colour round the page, softer than white if wished (#3930).
+        ui.horizontal(|ui| {
+            ui.label(tr("options.preview_background")).rich_tip(crate::ui::tips::pair(
+                "options.preview_background",
+                "options.preview_background_tip",
+            ));
+            crate::ui::tips::tip_over(
+                ui,
+                crate::ui::tips::pair(
+                    "options.preview_background",
+                    "options.preview_background_tip",
+                ),
+                |ui| {
+                    rgb_button(ui, &mut app.settings.preview_background);
+                },
+            );
+        });
     });
     ui.separator();
     grid("display_wheel").show(ui, |ui| {
@@ -2228,6 +2254,7 @@ fn path_field(
     dir: &mut Option<std::path::PathBuf>,
     fallback: String,
     place: crate::files::FolderUse,
+    key: &'static str,
 ) -> bool {
     use crate::files::FolderAction;
     let text = dir
@@ -2258,9 +2285,7 @@ fn path_field(
         if browse.clicked() {
             match action {
                 FolderAction::PickFolder(token) => {
-                    if let Some(p) = crate::files::pick_folder(token) {
-                        *dir = Some(p);
-                    }
+                    crate::files::pick_folder_into(token, None, key);
                 }
                 FolderAction::OpenFiles => files = true,
                 FolderAction::SaveZip | FolderAction::Unavailable(_) => {}
@@ -2307,6 +2332,7 @@ fn save_page(app: &mut App, ui: &mut Ui) {
                     &mut b.before_save_dir,
                     String::new(),
                     crate::files::FolderUse::BackupFolder,
+                    "options-before-save-folder",
                 );
             });
         });
@@ -2339,6 +2365,7 @@ fn save_page(app: &mut App, ui: &mut Ui) {
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
                 crate::files::FolderUse::AutoBackupFolder,
+                "options-auto-backup-folder",
             );
         });
     });
@@ -2855,6 +2882,7 @@ fn spelling_tab(app: &mut App, ui: &mut Ui) {
                         &mut p.dictionary_folder,
                         String::new(),
                         crate::files::FolderUse::DictionaryFolder,
+                        "options-dictionary-folder",
                     );
                     if ui
                         .add_enabled(
@@ -3575,6 +3603,33 @@ pub struct ShortcutEditor {
     /// keys that hold only with the Shape tool) instead of the main one
     /// (#3243).
     pub node_table: bool,
+    /// The list scrolls to the command picked once, next frame (a bar's
+    /// button clicked while the Customization pages are open, #3890).
+    pub scroll_to_selected: bool,
+}
+
+/// A click on a bar's button (a tool of the toolbox, a toolbar's button)
+/// while the Customization pages are open picks that command in the
+/// Commands page's list, with its Shortcut Keys tab, instead of hunting
+/// for it by name (#3890).
+pub(crate) fn pick_bar_item(app: &mut App, item: &str) {
+    if item == crate::ui::bar_items::SEP {
+        return;
+    }
+    let id = match crate::ui::bar_items::tool_of(item) {
+        Some(t) => t.id().to_string(),
+        None => item.to_string(),
+    };
+    let ed = &mut app.shortcut_editor;
+    ed.category = None;
+    ed.filter.clear();
+    ed.selected = Some(id);
+    ed.capture = None;
+    ed.note = None;
+    ed.confirm_reset_all = false;
+    ed.keys_tab = true;
+    ed.scroll_to_selected = true;
+    app.options_page = OptionsPage::Commands;
 }
 
 /// The Commands page's category for the toolbox's tools.
@@ -3926,12 +3981,22 @@ fn commands_page_body(app: &mut App, ui: &mut Ui) {
                 ui.set_width(LIST_W);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    egui::ScrollArea::vertical()
+                    let mut list = egui::ScrollArea::vertical()
                         .id_salt("command_list")
                         .auto_shrink([false, false])
                         .max_height(LIST_H)
-                        .min_scrolled_height(LIST_H)
-                        .show_rows(ui, ROW_H, items.len(), |ui, rows| {
+                        .min_scrolled_height(LIST_H);
+                    if std::mem::take(&mut app.shortcut_editor.scroll_to_selected) {
+                        let at = app.shortcut_editor.selected.as_ref().and_then(|s| {
+                            items.iter().position(|c| &c.id == s)
+                        });
+                        if let Some(i) = at {
+                            // The row near the middle of the list.
+                            let y = (i as f32 * ROW_H - LIST_H / 2.0).max(0.0);
+                            list = list.vertical_scroll_offset(y);
+                        }
+                    }
+                    list.show_rows(ui, ROW_H, items.len(), |ui, rows| {
                             for i in rows {
                                 if let Some(c) = items.get(i) {
                                     command_list_row(app, ui, c);
@@ -5481,6 +5546,13 @@ fn curves_page(app: &mut App, ui: &mut Ui) {
                 "options.straight_threshold_tip",
             ));
         ui.end_row();
+        ui.label("");
+        ui.checkbox(&mut c.freehand_click_ends, tr("options.freehand_click_ends"))
+            .rich_tip(crate::ui::tips::pair(
+                "options.freehand_click_ends",
+                "options.freehand_click_ends_tip",
+            ));
+        ui.end_row();
         row_label(ui, &tr("options.pen"));
         ui.checkbox(&mut c.pen_preview, tr("options.pen_preview"))
             .rich_tip(crate::ui::tips::pair(
@@ -6902,6 +6974,32 @@ mod tests {
         );
         reset_category_shortcuts(&mut app, "menu.file");
         assert!(app.settings.shortcuts.is_empty());
+    }
+
+    /// With the Customization pages open, a click on a toolbox tool or a
+    /// bar's button picks it in the Commands page's list, on its Shortcut
+    /// Keys tab, whatever the category and search were (#3890).
+    #[test]
+    fn a_bar_button_clicked_while_customizing_is_picked_in_the_commands_list() {
+        use crate::tools::Tool;
+        let mut app = App::headless();
+        app.dialog = crate::ui::dialogs::Dialog::Options;
+        app.options_page = OptionsPage::Appearance;
+        assert!(crate::ui::bar_items::customization_open(&app));
+        app.shortcut_editor.category = Some(MACROS.to_string());
+        app.shortcut_editor.filter = "zzz".into();
+        let tool = format!("{}{}", crate::ui::bar_items::TOOL, Tool::Rectangle.id());
+        pick_bar_item(&mut app, &tool);
+        assert_eq!(app.options_page, OptionsPage::Commands);
+        assert_eq!(app.shortcut_editor.selected.as_deref(), Some(Tool::Rectangle.id()));
+        assert!(app.shortcut_editor.category.is_none() && app.shortcut_editor.filter.is_empty());
+        assert!(app.shortcut_editor.keys_tab && app.shortcut_editor.scroll_to_selected);
+        let items = listed_commands(&app, None, "");
+        assert!(items.iter().any(|c| c.id == Tool::Rectangle.id()));
+        pick_bar_item(&mut app, "menu.file.save");
+        assert_eq!(app.shortcut_editor.selected.as_deref(), Some("menu.file.save"));
+        pick_bar_item(&mut app, crate::ui::bar_items::SEP);
+        assert_eq!(app.shortcut_editor.selected.as_deref(), Some("menu.file.save"));
     }
 
     #[test]

@@ -153,6 +153,11 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     let doc: &Document = app.doc();
     draw_text_frames(app, painter, preview);
 
+    // The objects drawn where the drag takes them: a dashed frame stays
+    // at the selection's box as it was, to judge the change by (#3949).
+    if live.is_some() {
+        draw_start_frame(app, painter);
+    }
     // Selection.
     match preview {
         Some(_) if !shows_transform_outline(app, live.is_some()) => {}
@@ -1016,6 +1021,8 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     }
     draw_pixel_grid(app, painter, rect);
     draw_empty_clip_frames(app, painter);
+    crate::cut_tools::paint_grid_preview(app, painter);
+    crate::dialog_preview::paint(app, painter);
 }
 
 /// The part of the page a fill or an outline colour dragged in a colour
@@ -2356,6 +2363,26 @@ fn symmetry_copy_paths(
     }
 }
 
+/// The selection's box where the transform started (the objects stay
+/// there until the release), in dashes: with Show objects while
+/// transforming the objects move and the frame stays (#3949).
+fn draw_start_frame(app: &App, painter: &Painter) {
+    let Some(r) = start_frame(app) else {
+        return;
+    };
+    let r = ERect::from_two_pos(
+        app.view.to_screen(r.origin()),
+        app.view.to_screen(Point::new(r.x1, r.y1)),
+    );
+    dashed_rect(painter, r.expand(0.5), Tokens::DRAG_OUTLINE);
+}
+
+/// The box [`draw_start_frame`] draws, in page space.
+pub(crate) fn start_frame(app: &App) -> Option<Rect> {
+    app.selection_bounds()
+        .filter(|r| r.width().is_finite() && r.height().is_finite())
+}
+
 /// Whether the drag outline shows while the selection is transformed:
 /// always, unless the objects are drawn where they go (`live`) and
 /// Options > Display has the outline over them off (#3704).
@@ -2537,6 +2564,33 @@ fn draw_text_path_preview(app: &App, painter: &Painter, p: Point) {
     );
 }
 
+/// One clip frame selected: the outlines of what it holds, a thin dashed
+/// line out past the frame too, so where the contents sit inside it can
+/// be seen while the frame is placed or its contents edited (#3804).
+fn draw_clip_contents_outline(app: &App, painter: &Painter, preview: Option<Affine>) {
+    let shapes = app.selected_rc();
+    let [s] = shapes.as_slice() else {
+        return;
+    };
+    let ShapeKind::ClipFrame { contents, .. } = &s.kind else {
+        return;
+    };
+    let t = preview.unwrap_or(Affine::IDENTITY) * s.transform;
+    let line = EStroke::new(1.0, Tokens::DRAG_OUTLINE.gamma_multiply(0.8));
+    for c in contents {
+        let mut c = c.clone();
+        c.transform_by(t);
+        for (mut pts, closed) in flatten(&c.page_path(), &app.view) {
+            if closed {
+                if let Some(first) = pts.first().copied() {
+                    pts.push(first);
+                }
+            }
+            painter.extend(egui::Shape::dashed_line(&pts, line, 4.0, 3.0));
+        }
+    }
+}
+
 fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
     let shapes = app.selected_rc();
     if shapes.is_empty() {
@@ -2613,6 +2667,9 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
             epaint::StrokeKind::Middle,
         );
         return;
+    }
+    if pick {
+        draw_clip_contents_outline(app, painter, preview);
     }
     if app.rotate_mode && pick {
         // Rotation arrows at corners, skew arrows at edges, the centre of
@@ -3659,7 +3716,11 @@ fn draw_nodes(app: &App, painter: &Painter) {
                 }
                 let (h, v) = app.spacing_arrow_spots(&s);
                 draw_spacing_arrow(painter, h, true, main);
-                draw_spacing_arrow(painter, v, false, main);
+                // Text fitted to a path: the horizontal arrow only, which
+                // opens up or closes the letters along the path (#193).
+                if !crate::text_nodes::on_path(&s) {
+                    draw_spacing_arrow(painter, v, false, main);
+                }
                 continue;
             }
             // Text fitted to a path: the horizontal arrow only, which
@@ -4341,8 +4402,12 @@ pub fn draw_snap_mark(app: &App, painter: &Painter) {
         return;
     }
     let c = app.view.to_screen(t.point);
-    // While dragging, the edge snapped to lights up in blue.
-    if let (Some(seg), false) = (t.edge, matches!(app.drag, crate::app::Drag::None)) {
+    // While dragging or measuring with a dimension tool, the edge snapped
+    // to lights up in blue.
+    let highlight_edge = !matches!(app.drag, crate::app::Drag::None)
+        || app.is_dimension_tool()
+        || app.dimension_dragging;
+    if let (Some(seg), true) = (t.edge, highlight_edge) {
         let pts: Vec<Pos2> = (0..=24)
             .map(|i| {
                 app.view
@@ -5007,6 +5072,44 @@ mod tests {
         assert!(shows_transform_outline(&app, false));
         let old: crate::settings::Settings = serde_json::from_str("{}").expect("old settings");
         assert!(old.transform_outline_over_objects, "on for settings saved before");
+    }
+
+    /// With Show objects while transforming, a scale drag draws the
+    /// objects at their new size while a dashed frame stays at the box
+    /// they started from (#3949): the frame is the selection's box before
+    /// the drag, which the objects keep until the release.
+    #[test]
+    fn a_frame_stays_where_a_live_transform_started() {
+        let mut app = App::headless();
+        app.settings.live_transform_preview = true;
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(10.0, 10.0, 30.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("a rectangle");
+        app.select(vec![id]);
+        let before = app.selection_bounds().expect("a box");
+        app.drag = Drag::Scale {
+            handle: Handle::SE,
+            anchor: Point::new(before.x0, before.y0),
+            start_bounds: before,
+            current: Point::new(before.x1 + 40.0, before.y1 + 30.0),
+            grab: tracedraw_core::geometry::Vec2::ZERO,
+            mods: Default::default(),
+            snapped: (false, false),
+            start_geometry: None,
+        };
+        let t = app.preview_transform_of(&app.drag).expect("a preview");
+        // The objects go to the new size...
+        let corner = t * Point::new(before.x1, before.y1);
+        assert!(
+            (corner - Point::new(before.x1, before.y1)).hypot() > 10.0,
+            "{corner:?}"
+        );
+        // ...and the frame stays.
+        assert_eq!(start_frame(&app), Some(before));
     }
 
     /// Show objects while transforming is off by default (#3569).

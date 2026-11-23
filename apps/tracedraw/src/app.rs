@@ -801,16 +801,18 @@ impl CurveInProgress {
     /// The incoming handle of node `i`: frozen for a cusp, else the mirror
     /// of its outgoing handle about the node.
     pub fn in_handle(&self, i: usize) -> Option<Point> {
-        if let Some(h) = self.in_handles.get(&i) {
-            return *h;
-        }
         let (p, out) = *self.nodes.get(i)?;
+        if let Some(h) = self.in_handles.get(&i) {
+            return h.filter(|h| (*h - p).hypot() > 1e-9);
+        }
+        let out = out.filter(|o| (*o - p).hypot() > 1e-9);
         if let (Some(len), Some(o)) = (self.in_lengths.get(&i), out) {
             let d = o - p;
             let n = d.hypot();
-            if n > 1e-12 {
+            if n > 1e-12 && *len > 1e-9 {
                 return Some(p - d * (len / n));
             }
+            return None;
         }
         out.map(|o| p - (o - p))
     }
@@ -904,6 +906,7 @@ impl CurveInProgress {
             if let (Some((first, _)), Some((end, end_out))) =
                 (self.nodes.first().copied(), self.nodes.last().copied())
             {
+                let end_out = end_out.filter(|o| (*o - end).hypot() > 1e-9);
                 let into = self.closing_handle();
                 if self.smooth && last > 0 && (end_out.is_some() || into.is_some()) {
                     path.curve_to(end_out.unwrap_or(end), into.unwrap_or(first), first);
@@ -961,6 +964,7 @@ impl CurveInProgress {
                 continue;
             }
             let (prev, prev_out) = nodes[i - 1];
+            let prev_out = prev_out.filter(|o| (*o - prev).hypot() > 1e-9);
             let cur_in = if i < self.nodes.len() {
                 self.in_handle(i)
             } else {
@@ -1420,6 +1424,9 @@ pub struct App {
     pub shape_gen: crate::shape_gen::ShapeGenSettings,
     /// The Shape Generator's live differential growth.
     pub shape_gen_growth: Option<crate::shape_gen_growth::GrowthLive>,
+    /// The Shape Generator tool's preview, kept between the frames of a
+    /// drag.
+    pub shape_gen_tool_cache: std::cell::RefCell<Option<crate::shape_gen_tool::ToolPreview>>,
     /// Speech Balloon tool (#2179): the style, the tail's width (percent
     /// of the body's smaller side) and bend for new balloons, and the
     /// balloon whose tail tip is being dragged.
@@ -1688,6 +1695,14 @@ pub struct App {
     pub show_welcome: bool,
     /// Object > Outline Offset: the distance last used, mm (#2622).
     pub outline_offset_mm: f64,
+    /// The corners and the number of outlines Outline Offset made last.
+    pub outline_offset_join: tracedraw_core::shaping::Join,
+    pub outline_offset_steps: u32,
+    /// Dialogs that change the drawing show their result on the page
+    /// while they are open (their Preview box).
+    pub dialog_preview: bool,
+    /// Outline Offset's preview curves.
+    pub offset_preview: crate::dialog_preview::OffsetCache,
     /// Object > Clip to Frame > Place Inside Frame is waiting for a click on the frame.
     pub pending_clip_frame: bool,
     /// A frame's flow tab was clicked: the next click says where its text
@@ -2301,6 +2316,12 @@ pub struct App {
     pub left_inner_dockers: DockerColumn,
     /// Dockers floating over the window, each in a window of its own.
     pub floating_dockers: Vec<FloatingDocker>,
+    /// Panels whose window of their own was closed: opened again, each
+    /// comes back in that window, where it was (#3950).
+    pub closed_own_windows: Vec<FloatingDocker>,
+    /// The column each panel was last docked in, where Dock Back puts a
+    /// panel in a window of its own (#3950).
+    pub docked_before: Vec<(DockerTab, DockerPlace)>,
     /// A second docker shown under the one in front in each column (by
     /// [`DockerPlace::column_index`]), the two stacked in the column's
     /// height (#2312).
@@ -2670,9 +2691,29 @@ pub enum DockerTab {
     Macros,
     PrintMerge,
     Gk42,
+    /// The image editing mode's panels (Bitmaps > Edit Inside): kept out
+    /// of [`DockerTab::ALL`], shown only in that mode.
+    PixelLayers,
+    PixelSelection,
+    PixelRetouch,
+    PixelDistort,
+    PixelEffects,
+    PixelImage,
+    PixelHistogram,
 }
 
 impl DockerTab {
+    /// The image editing mode's panels, in Window > Panels order there.
+    pub const PIXEL: [DockerTab; 7] = [
+        DockerTab::PixelLayers,
+        DockerTab::PixelEffects,
+        DockerTab::PixelSelection,
+        DockerTab::PixelRetouch,
+        DockerTab::PixelDistort,
+        DockerTab::PixelImage,
+        DockerTab::PixelHistogram,
+    ];
+
     pub const ALL: [DockerTab; 49] = [
         DockerTab::Properties,
         DockerTab::Objects,
@@ -2845,6 +2886,13 @@ impl DockerTab {
             DockerTab::Effects => "docker.effects",
             DockerTab::PrintMerge => "docker.print_merge",
             DockerTab::Gk42 => "docker.gk42",
+            DockerTab::PixelLayers => "pixel.section.layers",
+            DockerTab::PixelSelection => "pixel.section.selection",
+            DockerTab::PixelRetouch => "pixel.section.retouch",
+            DockerTab::PixelDistort => "pixel.section.distort",
+            DockerTab::PixelEffects => "pixel.section.effects",
+            DockerTab::PixelImage => "pixel.section.picture",
+            DockerTab::PixelHistogram => "pixel.section.histogram",
         }
     }
 
@@ -3377,6 +3425,7 @@ impl App {
             action_lines: Default::default(),
             shape_gen: Default::default(),
             shape_gen_growth: None,
+            shape_gen_tool_cache: Default::default(),
             balloon_style: Default::default(),
             balloon_width: 30.0,
             balloon_bend: 0.0,
@@ -3496,6 +3545,10 @@ impl App {
             page_numbers: PageNumberSettings::default(),
             show_welcome: false,
             outline_offset_mm: 2.0,
+            outline_offset_join: Default::default(),
+            outline_offset_steps: 1,
+            dialog_preview: true,
+            offset_preview: Default::default(),
             pending_clip_frame: false,
             pending_text_link: None,
             dialog_return: None,
@@ -3765,6 +3818,8 @@ impl App {
             inner_dockers: DockerColumn::default(),
             left_inner_dockers: DockerColumn::default(),
             floating_dockers: Vec::new(),
+            closed_own_windows: Vec::new(),
+            docked_before: Vec::new(),
             docker_stacks: Default::default(),
             docker_drag: None,
             docker_last: (DockerTab::Hints, true),
@@ -3997,7 +4052,8 @@ impl App {
     }
 
     /// Where auto-backups go unless Options > Save names a folder: a
-    /// `TraceDraw` folder in the temporary folder (none in a browser,
+    /// `TraceDraw` folder in the temporary folder, or in a portable copy's
+    /// own folder (#3908) (none in a browser,
     /// which keeps them in the page's storage, see `auto_backup_dir`).
     pub fn auto_backup_dir_default() -> Option<PathBuf> {
         if crate::files::WEB {
@@ -4005,7 +4061,7 @@ impl App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            Some(std::env::temp_dir().join("TraceDraw"))
+            Some(crate::settings::work_dir("TraceDraw"))
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -4395,7 +4451,7 @@ impl App {
         // language that came from the installer or the system stays
         // free to follow them (docs/behavior/language.md).
         self.settings.shown_bars = Some(self.shown_bars());
-        self.settings.dockers = Some(self.docker_setup());
+        self.settings.dockers = Some(self.main_docker_setup());
     }
 
     /// The tool settings now (see [`crate::settings::ToolPrefs`]).
@@ -4814,6 +4870,16 @@ impl App {
         }
     }
 
+    /// The drawing's dockers: as they are now, or as they were left when
+    /// the image editing mode put its own in their place.
+    pub fn main_docker_setup(&self) -> crate::settings::DockerSetup {
+        self.pixel_edit
+            .as_ref()
+            .and_then(|pe| pe.main_dockers.as_ref())
+            .map(|m| m.0.clone())
+            .unwrap_or_else(|| self.docker_setup())
+    }
+
     /// Put the dockers back as `setup` says; names of no docker are
     /// skipped, and a docker named in two places keeps the first.
     pub fn set_docker_setup(&mut self, setup: &crate::settings::DockerSetup) {
@@ -4824,7 +4890,11 @@ impl App {
             } else {
                 k
             };
-            DockerTab::ALL.iter().copied().find(|t| t.key() == k)
+            DockerTab::ALL
+                .iter()
+                .chain(DockerTab::PIXEL.iter())
+                .copied()
+                .find(|t| t.key() == k)
         };
         let mut seen: Vec<DockerTab> = Vec::new();
         let mut take = |keys: &[String]| -> Vec<DockerTab> {
@@ -5161,6 +5231,14 @@ impl App {
                 self.set_docker_column(p, true, Some(tab));
             }
             Some(DockerPlace::Floating) => {}
+            None if self.closed_own_windows.iter().any(|f| f.tab == tab) => {
+                // Its window was closed: it opens there again.
+                if let Some(i) = self.closed_own_windows.iter().position(|f| f.tab == tab) {
+                    let mut f = self.closed_own_windows.remove(i);
+                    f.place = true;
+                    self.floating_dockers.push(f);
+                }
+            }
             Some(DockerPlace::Right) | None => {
                 if !self.open_dockers.contains(&tab) {
                     self.open_dockers.push(tab);
@@ -5187,6 +5265,11 @@ impl App {
             .find(|f| f.tab == tab)
             .map(|f| (f.own_window, f.desktop))
             .unwrap_or_default();
+        if let Some(p) = self.docker_place(tab).filter(|p| *p != DockerPlace::Floating) {
+            self.docked_before.retain(|(t, _)| *t != tab);
+            self.docked_before.push((tab, p));
+        }
+        self.closed_own_windows.retain(|f| f.tab != tab);
         self.take_docker(tab);
         match place {
             DockerPlace::Right => {
@@ -5315,7 +5398,30 @@ impl App {
     /// next one comes to the front (with none left the column closes), or
     /// its window closes.
     pub fn close_docker(&mut self, tab: DockerTab) {
+        // A panel in a window of its own is opened there again (#3950).
+        self.closed_own_windows.retain(|f| f.tab != tab);
+        if let Some(f) = self
+            .floating_dockers
+            .iter()
+            .find(|f| f.tab == tab && f.own_window)
+        {
+            self.closed_own_windows.push(*f);
+        }
         self.take_docker(tab);
+    }
+
+    /// Dock the panel `tab` back in the column it was last docked in (the
+    /// right one when it never was), out of its window of its own or from
+    /// floating (#3950).
+    pub fn dock_back(&mut self, tab: DockerTab) {
+        let place = self
+            .docked_before
+            .iter()
+            .find(|(t, _)| *t == tab)
+            .map(|(_, p)| *p)
+            .filter(|p| !p.is_inner() || self.docker_column(*p).0.iter().any(|t| *t != tab))
+            .unwrap_or(DockerPlace::Right);
+        self.move_docker(tab, place, None);
     }
 
     /// Once a frame, before the dockers draw: a docker brought to the
@@ -6674,6 +6780,10 @@ impl App {
             },
             Tool::GraphPaper => {
                 self.create_graph_paper(rect);
+                return;
+            }
+            Tool::ShapeGenerator => {
+                self.create_shape_gen_in(rect);
                 return;
             }
             Tool::ActionLines => {
@@ -10617,6 +10727,7 @@ impl App {
             dialog = dialog.add_filter(f.label(), &exts);
         }
         dialog
+            .set_title(crate::files::Dialog::command_title("menu.file.import"))
             .add_filter("HPGL plotter (*.plt, *.hpgl)", &["plt", "hpgl", "hgl"])
             .add_filter("Text (*.txt, *.rtf, *.docx)", &["txt", "rtf", "docx"])
             .add_filter(

@@ -370,6 +370,10 @@ fn place_menu(app: &mut App, ui: &mut Ui, tab: DockerTab) {
     if crate::ui::menus::check_if(ui, "docker.own_window", own, can || own) {
         app.set_docker_own_window(tab, !own);
     }
+    // Back to the column it was last docked in (#3950).
+    if own && crate::ui::menus::item(ui, "docker.dock_back", "", true) {
+        app.dock_back(tab);
+    }
 }
 
 /// Show Below in a docker's menus: ticked while `tab` is shown under the
@@ -1051,6 +1055,13 @@ pub(crate) fn tab_icon(tab: DockerTab) -> Option<TabIcon> {
             p.line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, 9.0)], s);
             p.circle_filled(c, 1.5, Tokens::icon());
         }),
+        DockerTab::PixelLayers
+        | DockerTab::PixelSelection
+        | DockerTab::PixelRetouch
+        | DockerTab::PixelDistort
+        | DockerTab::PixelEffects
+        | DockerTab::PixelImage
+        | DockerTab::PixelHistogram => crate::ui::pixel_mode::docker_icon(tab),
     }
 }
 
@@ -1400,7 +1411,13 @@ fn color_row(ui: &mut Ui, label: &str, c: &mut Color) -> bool {
 /// is shown, and the one picked goes to all of them.
 fn color_row_mixed(ui: &mut Ui, label: &str, c: &mut Color, mixed: bool) -> bool {
     ui.horizontal(|ui| {
-        ui.label(label);
+        // The label in the sections' label column, as the other rows.
+        let before = ui.cursor().min.x;
+        ui.label(egui::RichText::new(label).color(Tokens::text_dim()));
+        let used = ui.cursor().min.x - before;
+        if used < PROP_LABEL_W {
+            ui.add_space(PROP_LABEL_W - used);
+        }
         // The picker opens beside the swatch and keeps the colour's
         // model.
         let before = ui.cursor().min;
@@ -2090,9 +2107,11 @@ fn properties(app: &mut App, ui: &mut Ui) {
                 // them (not every frame).
                 let fetch = || app.pattern_library();
                 let mut pickers = PatternPickers::new(&fetch);
+                pickers.folder = app.settings.pattern_folder.clone();
                 let mut edited =
                     fill_editor_mixed(ui, &mut fill, &mix, &mut touched, Some(&mut pickers));
                 let action = pickers.action;
+                let folder_file = pickers.file.take();
                 // Where a fountain's nodes sit, in numbers (#1200).
                 if let (Fill::Fountain(f), Some(b)) = (&mut fill, base.as_ref()) {
                     if let Some(bounds) = app.doc().shape_on_page(b.id).map(|s| s.bounds()) {
@@ -2105,6 +2124,9 @@ fn properties(app: &mut App, ui: &mut Ui) {
                 let has = !matches!(fill, Fill::None) || mix.kind;
                 if let Some(action) = action {
                     app.run_pattern_action(action);
+                }
+                if let Some(f) = folder_file {
+                    app.import_pattern_bitmap(&f);
                 }
                 if edited {
                     // Dragging in the picker: one step, and the colour
@@ -2729,6 +2751,39 @@ fn group_heading(ui: &mut Ui, key: &str) {
             egui::Stroke::new(1.0, Tokens::border()),
         );
     }
+}
+
+/// The width of the label column in the Properties sections: every row
+/// of a section starts its controls at the same place.
+const PROP_LABEL_W: f32 = 62.0;
+
+/// A row's label in the Properties sections: the text of `key` (without
+/// the colon some have) in the dimmer text colour, in a column
+/// [`PROP_LABEL_W`] wide so the controls after it line up from row to
+/// row. A longer label takes the room it needs.
+fn prop_label(ui: &mut Ui, key: &str) {
+    let text = tr(key);
+    let text = text.trim_end_matches([':', '\u{ff1a}']).to_owned();
+    let before = ui.cursor().min.x;
+    ui.label(egui::RichText::new(text).color(Tokens::text_dim()));
+    let used = ui.cursor().min.x - before;
+    if used < PROP_LABEL_W {
+        ui.add_space(PROP_LABEL_W - used);
+    }
+}
+
+/// A button showing a line drawn with the dash pattern `dash`, for the
+/// Properties panel's Dash row: true when clicked.
+fn dash_button(ui: &mut Ui, dash: &[f64], on: bool, tip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 24.0), egui::Sense::click());
+    let resp = resp.rich_tip(tip);
+    crate::theme::paint_icon_button(ui.painter(), rect, resp.hovered(), on);
+    crate::ui::line_style::paint_dash(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), egui::vec2(28.0, 10.0)),
+        dash,
+    );
+    resp.clicked()
 }
 
 /// A Properties section's header: a bar with the open or closed triangle
@@ -3746,6 +3801,38 @@ pub(crate) fn pattern_editor(
                     {
                         action = Some(PatternAction::ImportBitmap);
                     }
+                    // A folder of pictures to take tiles from (#3323).
+                    if !vector {
+                        if let Some(dir) = pk.folder.clone() {
+                            ui.separator();
+                            let name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| dir.display().to_string());
+                            ui.label(trf("docker.pattern_folder_n", &[("f", &name)]))
+                                .rich_tip(dir.display().to_string());
+                            if let Some(f) = crate::ui::pattern_pick::folder_rows(ui, &dir) {
+                                pk.file = Some(f);
+                            }
+                        }
+                        let can = matches!(
+                            crate::files::FolderUse::PatternFolder.action(),
+                            crate::files::FolderAction::PickFolder(_)
+                        );
+                        let tip = crate::files::FolderUse::PatternFolder
+                            .tip()
+                            .unwrap_or("docker.pattern_folder_tip");
+                        if ui
+                            .add_enabled(
+                                can,
+                                egui::Button::selectable(false, tr("docker.pattern_folder")),
+                            )
+                            .rich_tip(tr(tip))
+                            .clicked()
+                        {
+                            action = Some(PatternAction::ChooseFolder);
+                        }
+                    }
                 });
         }
         if let Some(np) = pick {
@@ -4303,7 +4390,6 @@ fn outline_editor_mixed(
         // same editors: none takes the outline away, uniform is its
         // colour, the others its own fill.
         group_heading(ui, "docker.group_appearance");
-        ui.label(tr("docker.outline_fill"));
         let mut paint = outline_paint_of(s);
         let paint_mix = if mix.has(StrokeField::Paint) {
             FillMix {
@@ -4358,9 +4444,10 @@ fn outline_editor_mixed(
         if !hair || width_mixed {
             // The slider applies as it is dragged, one undo step (#3823);
             // the box takes any width typed (Enter or leaving it applies).
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 let width_tip =
                     crate::ui::tips::pair("toolbar.outline_width", "docker.outline_width_desc");
+                prop_label(ui, "fxp.width");
                 let r = ui
                     .add(
                         crate::ui::Slider::new(&mut s.width, 0.1..=25.0)
@@ -4401,50 +4488,70 @@ fn outline_editor_mixed(
             });
         }
         group_heading(ui, "docker.group_caps_corners");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.caps"));
+        // The choices of a row are pictures, as in the Outline Pen
+        // dialog, each named and described by its tip.
+        use crate::ui::outline_pen::{pic_button_tipped, Pic};
+        let choice_tip = |n: &str| {
+            format!(
+                "{}\n{}. {}",
+                tr(n),
+                tr(&format!("{n}_tip")),
+                tr(&format!("{n}_desc"))
+            )
+        };
+        ui.horizontal(|ui| {
+            prop_label(ui, "docker.caps");
+            ui.spacing_mut().item_spacing.x = 2.0;
             let mixed = mix.has(StrokeField::Cap);
-            for (c, n) in [
-                (tracedraw_core::LineCap::Butt, "docker.cap_butt"),
-                (tracedraw_core::LineCap::Round, "docker.cap_round"),
-                (tracedraw_core::LineCap::Square, "docker.cap_square"),
+            for (c, pic, n) in [
+                (tracedraw_core::LineCap::Butt, Pic::CapButt, "docker.cap_butt"),
+                (tracedraw_core::LineCap::Round, Pic::CapRound, "docker.cap_round"),
+                (tracedraw_core::LineCap::Square, Pic::CapSquare, "docker.cap_square"),
             ] {
-                if ui
-                    .selectable_label(!mixed && s.cap == c, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+                if pic_button_tipped(ui, pic, !mixed && s.cap == c, true, &choice_tip(n)) {
                     s.cap = c;
                     touched.push(StrokeField::Cap);
                     changed = true;
                 }
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.corners"));
+        ui.horizontal(|ui| {
+            prop_label(ui, "docker.corners");
+            ui.spacing_mut().item_spacing.x = 2.0;
             let mixed = mix.has(StrokeField::Join);
-            for (j, n) in [
-                (tracedraw_core::LineJoin::Miter, "docker.join_miter"),
-                (tracedraw_core::LineJoin::Round, "docker.join_round"),
-                (tracedraw_core::LineJoin::Bevel, "docker.join_bevel"),
+            for (j, pic, n) in [
+                (tracedraw_core::LineJoin::Miter, Pic::JoinMiter, "docker.join_miter"),
+                (tracedraw_core::LineJoin::Round, Pic::JoinRound, "docker.join_round"),
+                (tracedraw_core::LineJoin::Bevel, Pic::JoinBevel, "docker.join_bevel"),
             ] {
-                if ui
-                    .selectable_label(!mixed && s.join == j, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+                if pic_button_tipped(ui, pic, !mixed && s.join == j, true, &choice_tip(n)) {
                     s.join = j;
                     touched.push(StrokeField::Join);
                     changed = true;
                 }
             }
         });
+        if s.join == tracedraw_core::LineJoin::Miter {
+            ui.horizontal(|ui| {
+                ui.label(tr("docker.miter_limit"));
+                if ui
+                    .add(
+                        crate::ui::field::NumField::new(&mut s.miter_limit)
+                            .range(Stroke::MITER_LIMIT_RANGE)
+                            .speed(0.5)
+                            .max_decimals(1)
+                            .suffix("°")
+                            .width(56.0)
+                            .mixed(mix.has(StrokeField::MiterLimit)),
+                    )
+                    .rich_tip(tr("docker.miter_limit_tip"))
+                    .changed()
+                {
+                    touched.push(StrokeField::MiterLimit);
+                    changed = true;
+                }
+            });
+        }
         group_heading(ui, "docker.group_arrowheads");
         ui.horizontal_wrapped(|ui| {
             for (field, id, key) in [
@@ -4495,7 +4602,8 @@ fn outline_editor_mixed(
         });
         group_heading(ui, "docker.group_line_style");
         ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.dash"));
+            prop_label(ui, "docker.dash");
+            ui.spacing_mut().item_spacing.x = 2.0;
             let mixed = mix.has(StrokeField::Dash);
             for (d, n) in [
                 (vec![], "docker.dash_solid"),
@@ -4507,14 +4615,7 @@ fn outline_editor_mixed(
                     "docker.dash_round_dots",
                 ),
             ] {
-                if ui
-                    .selectable_label(!mixed && s.dash == d, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+                if dash_button(ui, &d, !mixed && s.dash == d, &choice_tip(n)) {
                     // Round dots take round caps (#3404).
                     if s.set_dash(&d) {
                         touched.push(StrokeField::Cap);
@@ -4527,7 +4628,7 @@ fn outline_editor_mixed(
         if !lib.dashes.is_empty() {
             // Custom dash patterns from Edit Line Style.
             ui.horizontal_wrapped(|ui| {
-                ui.label(tr("docker.dash_custom"));
+                prop_label(ui, "docker.dash_custom");
                 for d in &lib.dashes {
                     let r = ui
                         .push_id(
@@ -4575,31 +4676,28 @@ fn outline_editor_mixed(
             }
         });
         group_heading(ui, "docker.group_position");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.outline_position"));
-            for (pos, n) in [
+        ui.horizontal(|ui| {
+            prop_label(ui, "docker.outline_position");
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (pos, pic, n) in [
                 (
                     tracedraw_core::OutlinePosition::Outside,
+                    Pic::Outside,
                     "docker.position_outside",
                 ),
                 (
                     tracedraw_core::OutlinePosition::Center,
+                    Pic::Center,
                     "docker.position_center",
                 ),
                 (
                     tracedraw_core::OutlinePosition::Inside,
+                    Pic::Inside,
                     "docker.position_inside",
                 ),
             ] {
                 let shown = !mix.has(StrokeField::Position) && s.position == pos;
-                if ui
-                    .selectable_label(shown, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+                if pic_button_tipped(ui, pic, shown, true, &choice_tip(n)) {
                     s.position = pos;
                     touched.push(StrokeField::Position);
                     changed = true;
@@ -4628,41 +4726,15 @@ fn outline_editor_mixed(
         // common ones are found at a glance (#487): open at first when
         // one of them is set away from its default or differs between
         // the objects, so nothing set is hidden.
-        let advanced_set = s.miter_limit != Stroke::DEFAULT_MITER_LIMIT
-            || s.stretch != 1.0
+        let advanced_set = s.stretch != 1.0
             || s.nib_angle != 0.0
-            || [
-                StrokeField::MiterLimit,
-                StrokeField::Stretch,
-                StrokeField::NibAngle,
-            ]
-            .iter()
-            .any(|f| mix.has(*f));
+            || [StrokeField::Stretch, StrokeField::NibAngle]
+                .iter()
+                .any(|f| mix.has(*f));
         let advanced = egui::CollapsingHeader::new(tr("docker.outline_advanced"))
             .id_salt("docker_outline_advanced")
             .default_open(advanced_set)
             .show(ui, |ui| {
-                if s.join == tracedraw_core::LineJoin::Miter {
-                    ui.horizontal(|ui| {
-                        ui.label(tr("docker.miter_limit"));
-                        if ui
-                            .add(
-                                crate::ui::field::NumField::new(&mut s.miter_limit)
-                                    .range(Stroke::MITER_LIMIT_RANGE)
-                                    .speed(0.5)
-                                    .max_decimals(1)
-                                    .suffix("°")
-                                    .width(56.0)
-                                    .mixed(mix.has(StrokeField::MiterLimit)),
-                            )
-                            .rich_tip(tr("docker.miter_limit_tip"))
-                            .changed()
-                        {
-                            touched.push(StrokeField::MiterLimit);
-                            changed = true;
-                        }
-                    });
-                }
                 // The calligraphic nib (#1200): stretch as a percentage,
                 // the angle, and the nib itself, dragged to turn and
                 // flatten it, as in the Outline Pen dialog.
@@ -5633,6 +5705,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// A panel in a window of its own docks back in the column it came
+    /// from with Dock Back, and closing its window keeps the window for
+    /// when the panel is opened again (#3950).
+    #[test]
+    fn a_panel_in_its_own_window_docks_back_and_reopens_there() {
+        let mut app = App::headless();
+        app.show_welcome = false;
+        app.move_docker(DockerTab::Objects, DockerPlace::Left, None);
+        app.set_docker_own_window(DockerTab::Objects, true);
+        assert!(app.docker_in_own_window(DockerTab::Objects));
+        app.dock_back(DockerTab::Objects);
+        assert_eq!(app.docker_place(DockerTab::Objects), Some(DockerPlace::Left));
+        assert!(!app.docker_in_own_window(DockerTab::Objects));
+        // Closed in its window, opened again from the Window menu.
+        app.set_docker_own_window(DockerTab::Objects, true);
+        app.floating_dockers[0].desktop = Some(egui::pos2(2100.0, 80.0));
+        app.close_docker(DockerTab::Objects);
+        assert_eq!(app.docker_place(DockerTab::Objects), None);
+        app.toggle_docker(DockerTab::Objects);
+        assert!(app.docker_in_own_window(DockerTab::Objects));
+        assert_eq!(
+            app.floating_dockers[0].desktop,
+            Some(egui::pos2(2100.0, 80.0))
+        );
+        // Never docked before: Dock Back puts it in the right column.
+        app.close_docker(DockerTab::Hints);
+        app.set_docker_own_window(DockerTab::Hints, true);
+        app.docked_before.retain(|(t, _)| *t != DockerTab::Hints);
+        app.dock_back(DockerTab::Hints);
+        assert_eq!(app.docker_place(DockerTab::Hints), Some(DockerPlace::Right));
+        // A panel closed while docked opens docked as before.
+        app.close_docker(DockerTab::Hints);
+        app.open_docker(DockerTab::Hints);
+        assert_eq!(app.docker_place(DockerTab::Hints), Some(DockerPlace::Right));
+    }
+
     /// A panel given a window of its own (#2884) floats there, keeps it
     /// in the preferences with where the window was, and comes back to
     /// float in the main window. Where windows are embedded (here, as a
@@ -6552,33 +6660,24 @@ pub(crate) mod tests {
             out.shapes.iter().for_each(|c| walk(&c.shape, &mut texts));
             texts
         };
+        // The choices of Caps, Corners, Dash and Position are pictures
+        // (their names are in the tips), so only the rows' labels are
+        // text.
         let common = [
             "docker.hairline",
+            "fxp.width",
             "docker.caps",
-            "docker.cap_butt",
-            "docker.cap_round",
-            "docker.cap_square",
             "docker.corners",
-            "docker.join_miter",
-            "docker.join_round",
-            "docker.join_bevel",
+            "docker.miter_limit",
             "docker.dash",
-            "docker.dash_solid",
-            "docker.dash_dashed",
-            "docker.dash_dotted",
-            "docker.dash_dash_dot",
             "docker.align_dashes",
             "docker.edit_line_style",
             "docker.outline_position",
-            "docker.position_outside",
-            "docker.position_center",
-            "docker.position_inside",
             "docker.behind_fill",
             "docker.scale_with_object",
             "docker.outline_advanced",
         ];
         let advanced = [
-            "docker.miter_limit",
             "docker.nib_stretch",
             "docker.nib_angle_lc",
         ];

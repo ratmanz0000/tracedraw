@@ -2575,7 +2575,7 @@ fn title_width(ui: &Ui, label: &str) -> f32 {
     text + 2.0 * ui.spacing().button_padding.x
 }
 
-fn menu_bar_style(style: &mut egui::Style) {
+pub(crate) fn menu_bar_style(style: &mut egui::Style) {
     egui::containers::menu::menu_style(style);
     style.override_font_id = Some(egui::FontId::proportional(BAR_FONT));
     // An open or hovered title: light blue with a blue frame, square.
@@ -4060,6 +4060,18 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
                 columns: (n as f64).sqrt().ceil().max(1.0) as usize,
                 gap_x: app.units.from_mm(2.0),
                 gap_y: app.units.from_mm(2.0),
+                by_position: false,
+                compact: false,
+                align_x: 1,
+                align_y: 1,
+            };
+        }
+        // The smaller of two objects copied all over the inside of the
+        // larger, the copies counted (#3834).
+        if item(ui, "menu.object.fill_with_copies", "", app.selection.len() == 2) {
+            app.dialog = Dialog::FillWithCopies {
+                gap_x: app.units.from_mm(2.0),
+                gap_y: app.units.from_mm(2.0),
             };
         }
         sep(ui);
@@ -4246,6 +4258,8 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         app.dialog = Dialog::OutlineOffset {
             distance: app.units.from_mm(app.outline_offset_mm),
             outside: true,
+            join: app.outline_offset_join,
+            steps: app.outline_offset_steps.max(1),
         };
     }
     // The outline one step wider or narrower, for a key of one's own
@@ -4770,6 +4784,11 @@ fn text_menu(app: &mut App, ui: &mut Ui) {
         let linked = app.selection.iter().any(|id| app.is_linked_frame(*id));
         if item(ui, "menu.text.frame_unlink", "", linked) {
             app.unlink_text_frames();
+        }
+        // Text and a closed shape picked: the text goes inside the
+        // shape's outline (discussion #3238).
+        if item(ui, "menu.text.frame_inside_shape", "", app.selection.len() == 2) {
+            app.put_text_inside_shape();
         }
     });
     // Linked text content (#1568): texts that hold the same characters,

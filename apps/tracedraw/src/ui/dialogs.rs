@@ -559,6 +559,10 @@ pub struct PrintState {
     /// Pages keep their size on a fixed sheet: never shrunk to make room
     /// for the marks (#388).
     pub keep_size: bool,
+    /// Print range Selection: the selected objects keep their place on
+    /// the drawing's page, printed on a page of its size, instead of the
+    /// area they cover becoming the page (#3806).
+    pub selection_on_page: bool,
     /// Where the page information sits, moved from its place (mm, x and
     /// y) by a drag in Print Preview (#388).
     pub info_offset: (f64, f64),
@@ -968,6 +972,7 @@ impl Default for PrintState {
             mirror: false,
             back_side: false,
             keep_size: false,
+            selection_on_page: false,
             info_offset: (0.0, 0.0),
             art_offset: (0.0, 0.0),
             margins: [0.0; 4],
@@ -1368,12 +1373,31 @@ pub enum Dialog {
         columns: usize,
         gap_x: f64,
         gap_y: f64,
+        /// Fill the cells as text reads where the objects are now,
+        /// instead of in the order they were selected.
+        by_position: bool,
+        /// Columns and rows each as large as their largest object.
+        compact: bool,
+        /// Where an object sits in its cell (0, 1, 2: left, centre,
+        /// right; top, middle, bottom).
+        align_x: u8,
+        align_y: u8,
+    },
+    /// Object > Align and Distribute > Fill With Copies (#3834): the gaps
+    /// between the copies, in the drawing's units.
+    FillWithCopies {
+        gap_x: f64,
+        gap_y: f64,
     },
     /// Object > Outline Offset (#2622): the distance, in the drawing's
     /// units, and whether the new outline goes outside or inside.
     OutlineOffset {
         distance: f64,
         outside: bool,
+        /// How the new outline turns its corners.
+        join: tracedraw_core::shaping::Join,
+        /// How many outlines, each `distance` beyond the one before.
+        steps: u32,
     },
     /// View > Pages in Multipage View (#1440): every page, or the pages
     /// of `range` ("1-3, 7").
@@ -1410,6 +1434,10 @@ pub enum Dialog {
         width: f64,
         height: f64,
         locked: bool,
+        /// The box just opened: the Width box takes the keyboard, its
+        /// number selected to be typed over, so a shortcut, the numbers
+        /// and Enter resize without the mouse (#3890).
+        fresh: bool,
     },
     Options,
     PageNumberSettings,
@@ -1938,6 +1966,42 @@ pub(crate) fn window(_ctx: &Context, title: String) -> crate::ui::chrome::Window
     crate::ui::chrome::window(title)
 }
 
+/// Where an object sits in its cell, picked on a square of nine places:
+/// `x` 0 left, 1 centre, 2 right and `y` 0 top, 1 middle, 2 bottom.
+fn cell_align_picker(ui: &mut Ui, x: &mut u8, y: &mut u8) {
+    let cell = 15.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(cell * 3.0, cell * 3.0), egui::Sense::hover());
+    let ink = crate::theme::Tokens::icon();
+    ui.painter()
+        .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    for j in 0..3u8 {
+        for i in 0..3u8 {
+            let r = egui::Rect::from_min_size(
+                rect.min + egui::vec2(cell * f32::from(i), cell * f32::from(j)),
+                egui::vec2(cell, cell),
+            );
+            let resp = ui
+                .interact(r, ui.id().with(("cell_align", i, j)), egui::Sense::click())
+                .rich_tip(crate::ui::tips::pair(
+                    "dialog.arrange_grid_align",
+                    "dialog.arrange_grid_align_desc",
+                ));
+            let on = *x == i && *y == j;
+            if on {
+                ui.painter()
+                    .rect_filled(r.shrink(3.0), 1.5, crate::theme::Tokens::SELECTION);
+            } else {
+                let radius = if resp.hovered() { 2.6 } else { 1.6 };
+                ui.painter().circle_filled(r.center(), radius, ink);
+            }
+            if resp.clicked() {
+                *x = i;
+                *y = j;
+            }
+        }
+    }
+}
+
 /// OK and Cancel, 100 x 27 and aligned right; OK is the default button.
 /// Enter presses OK (unless a multi-line field has the focus); Esc is
 /// handled by the keyboard handler, which closes any dialog.
@@ -2078,6 +2142,18 @@ pub(crate) fn enter_pressed(ui: &Ui) -> bool {
 }
 
 fn unit_value(ui: &mut Ui, label: &str, tip: &str, mm: &mut f64, units: Units) -> bool {
+    unit_value_focus(ui, label, tip, mm, units, false)
+}
+
+/// [`unit_value`] whose box takes the keyboard focus now when `focus`.
+fn unit_value_focus(
+    ui: &mut Ui,
+    label: &str,
+    tip: &str,
+    mm: &mut f64,
+    units: Units,
+    focus: bool,
+) -> bool {
     let mut v = units.from_mm(*mm);
     let r = crate::ui::tips::tip_over(ui, tip, |ui| {
         ui.horizontal(|ui| {
@@ -2085,6 +2161,7 @@ fn unit_value(ui: &mut Ui, label: &str, tip: &str, mm: &mut f64, units: Units) -
             ui.add(
                 crate::ui::field::NumField::new(&mut v)
                     .speed(0.5)
+                    .focus(focus)
                     .suffix(format!(" {}", units.short())),
             )
             .changed()
@@ -2309,83 +2386,275 @@ pub fn show(app: &mut App, ctx: &Context) {
             columns,
             gap_x,
             gap_y,
+            by_position,
+            compact,
+            align_x,
+            align_y,
         } => {
             let u = app.units;
-            window(ctx, tr("dialog.arrange_grid")).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr("dialog.arrange_grid_columns"));
-                    ui.add(
-                        crate::ui::field::NumField::new(columns)
-                            .range(1..=1000)
-                            .speed(0.1),
-                    )
-                    .rich_tip(crate::ui::tips::pair(
-                        "dialog.arrange_grid_columns",
-                        "dialog.arrange_grid_columns_desc",
+            let mut preview = app.dialog_preview;
+            window(ctx, tr("dialog.arrange_grid"))
+                .beside_drawing()
+                .show(ctx, |ui| {
+                    egui::Grid::new("arrange_grid_fields")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(tr("dialog.arrange_grid_columns"));
+                            ui.add(
+                                crate::ui::field::NumField::new(columns)
+                                    .range(1..=1000)
+                                    .speed(0.1),
+                            )
+                            .rich_tip(crate::ui::tips::pair(
+                                "dialog.arrange_grid_columns",
+                                "dialog.arrange_grid_columns_desc",
+                            ));
+                            ui.end_row();
+                            for (label, desc, gap) in [
+                                (
+                                    "dialog.arrange_grid_gap_h",
+                                    "dialog.arrange_grid_gap_h_desc",
+                                    &mut *gap_x,
+                                ),
+                                (
+                                    "dialog.arrange_grid_gap_v",
+                                    "dialog.arrange_grid_gap_v_desc",
+                                    &mut *gap_y,
+                                ),
+                            ] {
+                                ui.label(tr(label));
+                                ui.add(
+                                    crate::ui::field::NumField::new(gap)
+                                        .range(0.0..=u.from_mm(1000.0))
+                                        .speed(0.1)
+                                        .suffix(format!(" {}", u.short())),
+                                )
+                                .rich_tip(crate::ui::tips::pair(label, desc));
+                                ui.end_row();
+                            }
+                            ui.label(tr("dialog.arrange_grid_order"));
+                            crate::ui::keynav::ComboBox::from_id_salt("arrange_grid_order")
+                                .selected_text(tr(if *by_position {
+                                    "dialog.arrange_grid_order_position"
+                                } else {
+                                    "dialog.arrange_grid_order_selected"
+                                }))
+                                .width(170.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        by_position,
+                                        false,
+                                        tr("dialog.arrange_grid_order_selected"),
+                                    );
+                                    ui.selectable_value(
+                                        by_position,
+                                        true,
+                                        tr("dialog.arrange_grid_order_position"),
+                                    );
+                                })
+                                .response
+                                .rich_tip(crate::ui::tips::pair(
+                                    "dialog.arrange_grid_order",
+                                    "dialog.arrange_grid_order_desc",
+                                ));
+                            ui.end_row();
+                            ui.label(tr("dialog.arrange_grid_cells"));
+                            crate::ui::keynav::ComboBox::from_id_salt("arrange_grid_cells")
+                                .selected_text(tr(if *compact {
+                                    "dialog.arrange_grid_cells_fitted"
+                                } else {
+                                    "dialog.arrange_grid_cells_same"
+                                }))
+                                .width(170.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        compact,
+                                        false,
+                                        tr("dialog.arrange_grid_cells_same"),
+                                    );
+                                    ui.selectable_value(
+                                        compact,
+                                        true,
+                                        tr("dialog.arrange_grid_cells_fitted"),
+                                    );
+                                })
+                                .response
+                                .rich_tip(crate::ui::tips::pair(
+                                    "dialog.arrange_grid_cells",
+                                    "dialog.arrange_grid_cells_desc",
+                                ));
+                            ui.end_row();
+                            ui.label(tr("dialog.arrange_grid_align"));
+                            cell_align_picker(ui, align_x, align_y);
+                            ui.end_row();
+                        });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut preview, tr("dialog.preview"))
+                        .rich_tip(crate::ui::tips::pair("dialog.preview", "dialog.preview_desc"));
+                    let n = app.selection.len();
+                    let cols = (*columns).clamp(1, n.max(1));
+                    ui.weak(crate::i18n::trf(
+                        "dialog.arrange_grid_info",
+                        &[
+                            ("n", &n.to_string()),
+                            ("rows", &n.div_ceil(cols).to_string()),
+                            ("cols", &cols.to_string()),
+                        ],
                     ));
+                    ui.add_space(4.0);
+                    if ok_cancel(ui, &mut close) {
+                        app.arrange_in_grid_with(&crate::ops::GridArrange {
+                            columns: *columns,
+                            gap_x: u.to_mm(*gap_x),
+                            gap_y: u.to_mm(*gap_y),
+                            by_position: *by_position,
+                            compact: *compact,
+                            align_x: *align_x,
+                            align_y: *align_y,
+                        });
+                    }
                 });
-                for (label, desc, gap) in [
-                    (
-                        "dialog.arrange_grid_gap_h",
-                        "dialog.arrange_grid_gap_h_desc",
-                        &mut *gap_x,
-                    ),
-                    (
-                        "dialog.arrange_grid_gap_v",
-                        "dialog.arrange_grid_gap_v_desc",
-                        &mut *gap_y,
-                    ),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.label(tr(label));
-                        ui.add(
-                            crate::ui::field::NumField::new(gap)
-                                .range(0.0..=u.from_mm(1000.0))
-                                .speed(0.1)
-                                .suffix(format!(" {}", u.short())),
-                        )
-                        .rich_tip(crate::ui::tips::pair(label, desc));
-                    });
-                }
-                if ok_cancel(ui, &mut close) {
-                    app.arrange_in_grid(*columns, u.to_mm(*gap_x), u.to_mm(*gap_y));
-                }
-            });
+            app.dialog_preview = preview;
         }
-        Dialog::OutlineOffset { distance, outside } => {
+        Dialog::FillWithCopies { gap_x, gap_y } => {
             let u = app.units;
-            window(ctx, tr("dialog.outline_offset")).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr("dialog.outline_offset_distance"));
-                    ui.add(
-                        crate::ui::field::NumField::new(distance)
-                            .range(0.0..=u.from_mm(1000.0))
-                            .speed(0.1)
-                            .suffix(format!(" {}", u.short())),
-                    )
-                    .rich_tip(crate::ui::tips::pair(
-                        "dialog.outline_offset_distance",
-                        "dialog.outline_offset_distance_desc",
+            let mut preview = app.dialog_preview;
+            window(ctx, tr("dialog.fill_with_copies"))
+                .beside_drawing()
+                .show(ctx, |ui| {
+                    egui::Grid::new("fill_with_copies_fields")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            for (label, desc, gap) in [
+                                (
+                                    "dialog.arrange_grid_gap_h",
+                                    "dialog.fill_with_copies_gap_desc",
+                                    &mut *gap_x,
+                                ),
+                                (
+                                    "dialog.arrange_grid_gap_v",
+                                    "dialog.fill_with_copies_gap_desc",
+                                    &mut *gap_y,
+                                ),
+                            ] {
+                                ui.label(tr(label));
+                                ui.add(
+                                    crate::ui::field::NumField::new(gap)
+                                        .range(0.0..=u.from_mm(1000.0))
+                                        .speed(0.1)
+                                        .suffix(format!(" {}", u.short())),
+                                )
+                                .rich_tip(crate::ui::tips::pair(label, desc));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut preview, tr("dialog.preview"))
+                        .rich_tip(crate::ui::tips::pair("dialog.preview", "dialog.preview_desc"));
+                    // How many copies OK makes, counted as the gaps change.
+                    let n = app
+                        .fill_with_copies_plan(u.to_mm(*gap_x), u.to_mm(*gap_y))
+                        .map_or(0, |(_, _, places)| places.len());
+                    ui.weak(crate::i18n::trf(
+                        "status.fill_with_copies",
+                        &[("n", &n.to_string())],
                     ));
+                    ui.add_space(4.0);
+                    if ok_cancel(ui, &mut close) {
+                        app.fill_with_copies(u.to_mm(*gap_x), u.to_mm(*gap_y));
+                    }
                 });
-                ui.horizontal(|ui| {
-                    ui.radio_value(outside, true, tr("dialog.outline_offset_outside"))
-                        .rich_tip(crate::ui::tips::pair(
-                            "dialog.outline_offset_outside",
-                            "dialog.outline_offset_outside_desc",
-                        ));
-                    ui.radio_value(outside, false, tr("dialog.outline_offset_inside"))
-                        .rich_tip(crate::ui::tips::pair(
-                            "dialog.outline_offset_inside",
-                            "dialog.outline_offset_inside_desc",
-                        ));
+            app.dialog_preview = preview;
+        }
+        Dialog::OutlineOffset {
+            distance,
+            outside,
+            join,
+            steps,
+        } => {
+            use tracedraw_core::shaping::Join;
+            let u = app.units;
+            let mut preview = app.dialog_preview;
+            window(ctx, tr("dialog.outline_offset"))
+                .beside_drawing()
+                .show(ctx, |ui| {
+                    egui::Grid::new("outline_offset_fields")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(tr("dialog.outline_offset_distance"));
+                            ui.add(
+                                crate::ui::field::NumField::new(distance)
+                                    .range(0.0..=u.from_mm(1000.0))
+                                    .speed(0.1)
+                                    .suffix(format!(" {}", u.short())),
+                            )
+                            .rich_tip(crate::ui::tips::pair(
+                                "dialog.outline_offset_distance",
+                                "dialog.outline_offset_distance_desc",
+                            ));
+                            ui.end_row();
+                            ui.label(tr("dialog.outline_offset_side"));
+                            ui.horizontal(|ui| {
+                                ui.radio_value(outside, true, tr("dialog.outline_offset_outside"))
+                                    .rich_tip(crate::ui::tips::pair(
+                                        "dialog.outline_offset_outside",
+                                        "dialog.outline_offset_outside_desc",
+                                    ));
+                                ui.radio_value(outside, false, tr("dialog.outline_offset_inside"))
+                                    .rich_tip(crate::ui::tips::pair(
+                                        "dialog.outline_offset_inside",
+                                        "dialog.outline_offset_inside_desc",
+                                    ));
+                            });
+                            ui.end_row();
+                            ui.label(tr("dialog.outline_offset_corners"));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                use crate::ui::outline_pen::{pic_button_tipped, Pic};
+                                for (j, pic, name) in [
+                                    (Join::Miter, Pic::JoinMiter, "docker.join_miter"),
+                                    (Join::Round, Pic::JoinRound, "docker.join_round"),
+                                    (Join::Bevel, Pic::JoinBevel, "docker.join_bevel"),
+                                ] {
+                                    let tip = format!(
+                                        "{}\n{}",
+                                        tr(name),
+                                        tr("dialog.outline_offset_corners_desc")
+                                    );
+                                    if pic_button_tipped(ui, pic, *join == j, true, &tip) {
+                                        *join = j;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(tr("dialog.outline_offset_steps"));
+                            ui.add(
+                                crate::ui::field::NumField::new(steps)
+                                    .range(1..=crate::tools2::OUTLINE_OFFSET_STEPS)
+                                    .speed(0.1),
+                            )
+                            .rich_tip(crate::ui::tips::pair(
+                                "dialog.outline_offset_steps",
+                                "dialog.outline_offset_steps_desc",
+                            ));
+                            ui.end_row();
+                        });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut preview, tr("dialog.preview"))
+                        .rich_tip(crate::ui::tips::pair("dialog.preview", "dialog.preview_desc"));
+                    ui.add_space(4.0);
+                    if ok_cancel(ui, &mut close) {
+                        let mm = u.to_mm(*distance);
+                        app.outline_offset_mm = mm;
+                        app.outline_offset_join = *join;
+                        app.outline_offset_steps = *steps;
+                        app.outline_offset_with(mm, *outside, *join, *steps);
+                    }
                 });
-                if ok_cancel(ui, &mut close) {
-                    let mm = u.to_mm(*distance);
-                    app.outline_offset_mm = mm;
-                    app.outline_offset(mm, *outside);
-                }
-            });
+            app.dialog_preview = preview;
         }
         Dialog::MultipagePages { all, range } => {
             let count = app.doc().pages.len();
@@ -2605,12 +2874,17 @@ pub fn show(app: &mut App, ctx: &Context) {
             width,
             height,
             locked,
+            fresh,
         } => {
             window(ctx, tr("dialog.object_size")).show(ctx, |ui| {
                 let u = app.units;
                 let (w0, h0) = (*width, *height);
                 let tip = crate::ui::tips::pair("dialog.width", "toolbar.object_width_desc");
-                if unit_value(ui, &tr("dialog.width"), &tip, width, u) && *locked && w0 > 1e-9 {
+                let focus = std::mem::take(fresh);
+                if unit_value_focus(ui, &tr("dialog.width"), &tip, width, u, focus)
+                    && *locked
+                    && w0 > 1e-9
+                {
                     *height = h0 * *width / w0;
                 }
                 let tip = crate::ui::tips::pair("dialog.height", "toolbar.object_height_desc");
@@ -2714,7 +2988,7 @@ pub fn show(app: &mut App, ctx: &Context) {
             window(ctx, title)
                 .resizable(egui::vec2(640.0, 440.0), egui::vec2(460.0, 300.0))
                 .show(ctx, |ui| {
-                asked = edit_text_box(ui, text, spans, *ink, align);
+                asked = edit_text_box(app, ui, text, spans, *ink, align);
                 if ok_cancel(ui, &mut close) || alt_ok {
                     close = true;
                     app.set_edit_text(*shape, spans.clone(), *align);
@@ -4176,6 +4450,7 @@ pub fn object_size_dialog(app: &App) -> Option<Dialog> {
         width: b.width(),
         height: b.height(),
         locked: app.scale_locked,
+        fresh: true,
     })
 }
 
@@ -4953,7 +5228,9 @@ pub fn export_format_of(path: &std::path::Path) -> Option<usize> {
 fn export_save_dialog(app: &App, st: &ExportState) -> crate::files::Dialog {
     let (name, ext) = EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)];
     let stem = app.export_stem();
-    let mut dialog = crate::files::Dialog::new().add_filter(name, &export_extensions(ext));
+    let mut dialog = crate::files::Dialog::new()
+        .set_title(crate::files::Dialog::command_title("menu.file.export"))
+        .add_filter(name, &export_extensions(ext));
     for (other, e) in EXPORT_FORMATS.iter() {
         if *e != ext {
             dialog = dialog.add_filter(*other, &export_extensions(e));
@@ -6582,7 +6859,7 @@ pub(crate) fn print_layout_fields(app: &App, ui: &mut Ui, st: &mut PrintState) {
 /// count these, so a booklet of pages 1 to 20 of a hundred reports twenty
 /// pages, not a hundred (#788).
 pub(crate) fn printed_page_sizes(app: &App, st: &PrintState) -> Vec<Size> {
-    if st.range == 3 {
+    if st.range == 3 && !st.selection_on_page {
         if let Some(size) = selection_print_size(app) {
             return vec![size];
         }
@@ -7121,6 +7398,12 @@ fn print_tab_general(app: &App, ui: &mut Ui, st: &mut PrintState) -> Option<Stri
                         .rich_tip(crate::ui::tips::keyed("print.range_selection"))
                         .rich_disabled_tip(crate::ui::tips::keyed("print.range_selection"));
                 });
+                if st.range == 3 {
+                    ui.indent("print_selection_on_page", |ui| {
+                        ui.checkbox(&mut st.selection_on_page, tr("print.selection_on_page"))
+                            .rich_tip(crate::ui::tips::keyed("print.selection_on_page"));
+                    });
+                }
                 parity_combo(ui, st, "print_parity");
             });
         });
@@ -9329,6 +9612,45 @@ pub(crate) mod tests {
         assert!(object_size_dialog(&app).is_none());
     }
 
+    /// The Object Size box opens with the Width box taking the keyboard,
+    /// its number selected: the numbers typed and Enter resize without
+    /// the mouse (#3890).
+    #[test]
+    fn object_size_box_takes_the_width_typed_and_enter() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let id = app
+            .new_shape(tracedraw_core::ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(10.0, 10.0, 50.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rectangle");
+        app.select(vec![id]);
+        app.units = Units::Millimeters;
+        app.scale_locked = true;
+        app.dialog = object_size_dialog(&app).expect("the Object Size dialog");
+        frame(&ctx, &mut app, false);
+        assert!(ctx.memory(|m| m.focused()).is_some(), "the Width box has the keyboard");
+        assert!(matches!(app.dialog, Dialog::ObjectSize { fresh: false, .. }));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events: vec![egui::Event::Text("70".into())],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| show(&mut app, &ui.ctx().clone()));
+        out.textures_delta.clear();
+        frame(&ctx, &mut app, true);
+        frame(&ctx, &mut app, false);
+        assert!(matches!(app.dialog, Dialog::None), "Enter applies and closes");
+        let b = app.selection_bounds().expect("bounds");
+        assert!((b.width() - 70.0).abs() < 0.5, "{b:?}");
+        assert!((b.height() - 35.0).abs() < 0.5, "kept in proportion: {b:?}");
+    }
+
     /// The Page Size dialog opens with Apply to all pages off, so a new
     /// size changes only the current page; once ticked and confirmed, it
     /// opens ticked the next time, and unticked again after that (#2696).
@@ -9482,11 +9804,17 @@ pub(crate) mod tests {
             Dialog::OutlineOffset {
                 distance: 2.0,
                 outside: true,
+                join: Default::default(),
+                steps: 1,
             },
             Dialog::ArrangeGrid {
                 columns: 3,
                 gap_x: 2.0,
                 gap_y: 2.0,
+                by_position: false,
+                compact: false,
+                align_x: 1,
+                align_y: 1,
             },
             Dialog::GatherPages {
                 gap: 5.0,
@@ -10000,6 +10328,8 @@ pub(crate) mod tests {
             app.dialog = Dialog::OutlineOffset {
                 distance: 2.0,
                 outside,
+                join: Default::default(),
+                steps: 1,
             };
             frame(&ctx, &mut app, false);
             frame(&ctx, &mut app, true);
@@ -11016,6 +11346,7 @@ mod layout_preset_tests {
 /// that sets those for the selected characters (all of them when none
 /// are selected).
 fn edit_text_box(
+    app: &mut App,
     ui: &mut Ui,
     text: &mut String,
     spans: &mut Vec<tracedraw_core::TextSpan>,
@@ -11027,14 +11358,15 @@ fn edit_text_box(
     let id = egui::Id::new("edit_text_dialog_box");
     crate::ops2::retext_keeping_styles(spans, text);
     let total = spans_char_count(spans);
-    let (from, to) = egui::TextEdit::load_state(ui.ctx(), id)
+    let live = egui::TextEdit::load_state(ui.ctx(), id)
         .and_then(|s| s.cursor.char_range())
         .map(|r| {
             let (a, b) = (r.primary.index.0, r.secondary.index.0);
             (a.min(b).min(total), a.max(b).min(total))
         })
-        .filter(|(a, b)| a < b)
-        .unwrap_or((0, total));
+        .filter(|(a, b)| a < b);
+    let focused = ui.memory(|m| m.has_focus(id));
+    let (from, to) = edit_text_range(ui.ctx(), id, live, focused, total);
     if let Some(first) = span_at(spans, from).cloned() {
         ui.horizontal(|ui| {
             let b = egui::RichText::new("B").font(crate::theme::bold(15.0));
@@ -11098,15 +11430,32 @@ fn edit_text_box(
             {
                 spans_apply(spans, from, to, |s| s.size_pt = size);
             }
-            let mut c = span_color(&first, ink);
-            if ui.color_edit_button_srgba(&mut c).changed() {
-                let color = tracedraw_core::Color::rgb8(c.r(), c.g(), c.b());
+            // The colour as it is defined (a CMYK or spot colour stays
+            // one), in the program's own picker.
+            let mut color = span_ink(&first, ink);
+            if crate::ui::color_picker::color_button(ui, &mut color) {
                 spans_apply(spans, from, to, |s| {
                     s.fill = Some(tracedraw_core::Fill::Solid(color))
                 });
             }
             ui.separator();
-            ui.weak(&first.font_family);
+            // The font of the selected characters, changed from the list.
+            let (pick, _) = crate::ui::font_list::font_list_live(
+                app,
+                ui,
+                "edit_text_font",
+                &first.font_family,
+                180.0,
+            );
+            if let Some(pick) = pick {
+                spans_apply(spans, from, to, |s| {
+                    s.font_family = pick.family.clone();
+                    if let Some((bold, italic)) = pick.style {
+                        s.bold = bold;
+                        s.italic = italic;
+                    }
+                });
+            }
         });
     }
     // The second row (#3270): the text's alignment, the case of the
@@ -11229,6 +11578,38 @@ fn edit_text_box(
     asked
 }
 
+/// The characters the Edit Text box's row acts on. The selection in the
+/// box (`live`) while there is one; it is also remembered, because the
+/// box drops its selection as soon as another control takes the keys
+/// (the size box, the colour picker, the font list), and the row then
+/// changed every character instead of the selected ones (#2366). A click
+/// in the box that selects nothing forgets it; with no selection at all,
+/// every character.
+fn edit_text_range(
+    ctx: &Context,
+    id: egui::Id,
+    live: Option<(usize, usize)>,
+    focused: bool,
+    total: usize,
+) -> (usize, usize) {
+    let kept_id = id.with("kept_selection");
+    let kept = ctx.data(|d| d.get_temp::<(usize, usize)>(kept_id));
+    let range = match live {
+        Some(r) => Some(r),
+        None if focused => None,
+        None => kept.filter(|(a, b)| a < b && *b <= total),
+    };
+    ctx.data_mut(|d| match range {
+        Some(r) => {
+            d.insert_temp(kept_id, r);
+        }
+        None => {
+            d.remove::<(usize, usize)>(kept_id);
+        }
+    });
+    range.unwrap_or((0, total))
+}
+
 /// What the Edit Text box asks of the program (#3270).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditTextAsk {
@@ -11322,6 +11703,19 @@ fn span_at(spans: &[tracedraw_core::TextSpan], at: usize) -> Option<&tracedraw_c
         seen += n;
     }
     spans.last()
+}
+
+/// The colour of a span's characters as it is defined: their own solid
+/// fill, else the object's (`ink`), else black.
+fn span_ink(
+    span: &tracedraw_core::TextSpan,
+    ink: Option<tracedraw_core::Color>,
+) -> tracedraw_core::Color {
+    match &span.fill {
+        Some(tracedraw_core::Fill::Solid(c)) => *c,
+        Some(_) => tracedraw_core::Color::BLACK,
+        None => ink.unwrap_or(tracedraw_core::Color::BLACK),
+    }
 }
 
 /// The colour a span's characters show in the Edit Text box.
@@ -11610,6 +12004,43 @@ mod edit_text_tests {
             panic!("text");
         };
         assert_eq!((tracedraw_core::spans_text(&spans), align), ("Hello".to_string(), TextAlign::Left));
+    }
+
+    /// The row of the Edit Text box acts on the characters selected in
+    /// the box also after the box gave its selection up to the size box,
+    /// the colour picker or the font list: every character took the new
+    /// colour (#2366). A click in the box that selects nothing forgets
+    /// them.
+    #[test]
+    fn the_edit_text_row_keeps_the_selection_the_box_dropped() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("edit_text_range_test");
+        // Nothing selected yet: every character.
+        assert_eq!(edit_text_range(&ctx, id, None, false, 10), (0, 10));
+        // Characters 2 to 5 selected in the box.
+        assert_eq!(edit_text_range(&ctx, id, Some((2, 5)), true, 10), (2, 5));
+        // Another control has the keys: the box shows no selection.
+        assert_eq!(edit_text_range(&ctx, id, None, false, 10), (2, 5));
+        assert_eq!(edit_text_range(&ctx, id, None, false, 10), (2, 5));
+        // Characters deleted meanwhile: a range past the end is dropped.
+        assert_eq!(edit_text_range(&ctx, id, None, false, 4), (0, 4));
+        // Back in the box with only a caret: every character again.
+        assert_eq!(edit_text_range(&ctx, id, Some((1, 3)), true, 10), (1, 3));
+        assert_eq!(edit_text_range(&ctx, id, None, true, 10), (0, 10));
+        assert_eq!(edit_text_range(&ctx, id, None, false, 10), (0, 10));
+    }
+
+    /// The colour the Edit Text box's picker starts from is the one the
+    /// characters have, in its own model: a CMYK colour came up as RGB
+    /// (#2366).
+    #[test]
+    fn the_edit_text_colour_keeps_its_model() {
+        let cmyk = tracedraw_core::Color::cmyk_pct(0.0, 100.0, 100.0, 0.0);
+        let mut span = TextSpan::new("a", "Sans", 12.0);
+        assert_eq!(span_ink(&span, None), tracedraw_core::Color::BLACK);
+        assert_eq!(span_ink(&span, Some(cmyk)), cmyk);
+        span.fill = Some(tracedraw_core::Fill::Solid(cmyk));
+        assert_eq!(span_ink(&span, None), cmyk);
     }
 
     /// Change Case in the box changes only the selected characters, each

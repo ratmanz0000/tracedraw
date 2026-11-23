@@ -154,7 +154,7 @@ fn std_arrow(ui: &mut Ui, id: &str, enabled: bool) -> egui::Response {
 }
 
 /// A thin vertical separator between button groups.
-fn std_sep(ui: &mut Ui) {
+pub(crate) fn std_sep(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, std_btn()), egui::Sense::hover());
     let x = rect.center().x.round() + 0.5;
     ui.painter().vline(
@@ -294,6 +294,10 @@ fn zoom_box(app: &mut App, ui: &mut Ui, id: &str, width: f32) {
 }
 
 pub fn standard_toolbar(app: &mut App, ui: &mut Ui) {
+    if app.pixel_edit.is_some() {
+        crate::ui::pixel_mode::standard_bar(app, ui);
+        return;
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
         ui.set_min_height(std_btn());
@@ -1535,6 +1539,10 @@ fn unit_value(ui: &mut Ui, app: &App, label: &str, mm: &mut f64, speed: f64) -> 
 }
 
 pub fn property_bar(app: &mut App, ui: &mut Ui) {
+    if app.pixel_edit.is_some() {
+        crate::ui::pixel_mode::property_bar(app, ui);
+        return;
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.set_min_height(crate::ui::propbar::BAR_H);
@@ -1641,6 +1649,14 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
             }
             Tool::Pick | Tool::FreeformPick => {
                 object_properties(app, ui);
+                // Several objects: grouping, combining and shaping them
+                // come right after the object fields, before the fields
+                // of single objects, so they stay in view when the bar
+                // is longer than the window (#3973).
+                let many = shapes.len() >= 2;
+                if many {
+                    crate::ui::propbar::arrange_part(app, ui);
+                }
                 crate::ui::propbar::sep(ui);
                 if crate::ui::propbar::kind_part(app, ui) {
                     crate::ui::propbar::sep(ui);
@@ -1648,9 +1664,11 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                 crate::ui::propbar::outline_part(app, ui);
                 crate::ui::propbar::sep(ui);
                 crate::ui::propbar::order_part(app, ui);
-                // Several objects, a group or a curve of several parts:
-                // group, combine and shape them.
-                crate::ui::propbar::arrange_part(app, ui);
+                // A group or a curve of several parts: ungroup it or
+                // break it apart.
+                if !many {
+                    crate::ui::propbar::arrange_part(app, ui);
+                }
             }
             Tool::Zoom | Tool::Pan => crate::ui::propbar::zoom_bar(app, ui),
             Tool::Rectangle | Tool::ThreePointRectangle => {
@@ -1864,6 +1882,7 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                     });
                 }
             }
+            Tool::ShapeGenerator => crate::shape_gen_tool::shape_gen_bar(app, ui),
             Tool::ActionLines => action_lines_bar(app, ui),
             Tool::CommonShapes => common_shapes_bar(app, ui),
             Tool::Balloon => balloon_bar(app, ui),
@@ -1975,6 +1994,11 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                     tr("toolbar.sample_after_apply"),
                 )
                 .rich_tip(crate::ui::tips::keyed("toolbar.sample_after_apply"));
+                ui.checkbox(
+                    &mut app.settings.eyedropper_pick_after_apply,
+                    tr("toolbar.pick_after_apply"),
+                )
+                .rich_tip(crate::ui::tips::keyed("toolbar.pick_after_apply"));
                 // The next click anywhere in the window, the panels and
                 // bars too, samples the colour shown there (#3040).
                 if ui

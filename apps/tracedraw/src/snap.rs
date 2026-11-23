@@ -329,6 +329,20 @@ impl App {
                 if near.is_none_or(|m| faces(b.x0, b.x1, m.x0, m.x1)) {
                     ys.extend([b.y0, b.y1, b.center().y]);
                 }
+                // Its straight upright and level sides inside the box
+                // too: the inner edges of a frame or of a shape with a
+                // hole hold a moved box as its outer edges do (#3970).
+                if matches!(sh.kind, ShapeKind::Path { .. }) {
+                    inner_sides(sh, b, &mut |upright, at, lo, hi| {
+                        if upright {
+                            if near.is_none_or(|m| faces(lo, hi, m.y0, m.y1)) {
+                                xs.push(at);
+                            }
+                        } else if near.is_none_or(|m| faces(lo, hi, m.x0, m.x1)) {
+                            ys.push(at);
+                        }
+                    });
+                }
             }
         }
         (xs, ys)
@@ -540,19 +554,23 @@ impl App {
             .or_else(|| self.dimension_points.last().copied())
     }
 
+    /// Whether the active tool is one of the dimension tools.
+    pub fn is_dimension_tool(&self) -> bool {
+        use crate::tools::Tool;
+        matches!(
+            self.tool,
+            Tool::ParallelDimension
+                | Tool::HorizontalVerticalDimension
+                | Tool::SegmentDimension
+                | Tool::AngularDimension
+        )
+    }
+
     /// Objects are snapped to: Snap To Objects is on, or a dimension tool
     /// is measuring, which always takes the objects' ends and edges so a
     /// dimension starts and ends on them (live test of 0.41).
     pub fn snaps_to_objects(&self) -> bool {
-        use crate::tools::Tool;
-        self.snap.objects
-            || matches!(
-                self.tool,
-                Tool::ParallelDimension
-                    | Tool::HorizontalVerticalDimension
-                    | Tool::SegmentDimension
-                    | Tool::AngularDimension
-            )
+        self.snap.objects || self.is_dimension_tool()
     }
 
     /// Snapping geometry of the page and of the objects whose bounds come
@@ -859,6 +877,12 @@ impl App {
                 self.snap_mark.set(Some(t));
                 return t.point;
             }
+            if self.is_dimension_tool() {
+                if let Some(t) = self.object_snap(p, exclude, own, false, true) {
+                    self.snap_mark.set(Some(t));
+                    return t.point;
+                }
+            }
         }
         if let Some(q) = self.live_guide_point(p, exclude, enabled) {
             return q;
@@ -1143,10 +1167,10 @@ impl App {
                 return t.point - src;
             }
         }
-        let mut snapped = if enabled {
-            self.snap_move(bounds, d)
+        let (mut snapped, mut caught) = if enabled {
+            self.snap_move_caught(bounds, d)
         } else {
-            d
+            (d, false)
         };
         // The grabbed point (a node under the pointer) lands on a
         // guideline, a baseline or a grid line it comes near, on each
@@ -1166,16 +1190,24 @@ impl App {
             }
             if hit {
                 self.mark_axis_snap(q, src + snapped);
+                caught = true;
             }
         }
-        self.live_guide_move(source, bounds, d, snapped)
+        self.live_guide_move(source, bounds, d, snapped, caught)
     }
 
     /// Alignment guides on a move (edges, centres, margins and equal
     /// gaps, which win over the grid and guidelines on their axis), else
     /// a dynamic guide for the grabbed point (the selection's snap point,
     /// else its centre); the guides to draw at the place reached.
-    fn live_guide_move(&self, source: Option<Point>, bounds: Rect, d: Vec2, snapped: Vec2) -> Vec2 {
+    fn live_guide_move(
+        &self,
+        source: Option<Point>,
+        bounds: Rect,
+        d: Vec2,
+        snapped: Vec2,
+        caught: bool,
+    ) -> Vec2 {
         let o = &self.settings.snap.align;
         let tol = self.snap_tolerance();
         let mut out = snapped;
@@ -1200,7 +1232,10 @@ impl App {
                 aligned = true;
             }
         }
-        if !aligned && self.dynamic_guides_on() {
+        // A move already caught by a guideline, the grid or an edge on
+        // either axis stays there: a dynamic guide would pull it off a
+        // guideline crossing onto a slanted line (#3952).
+        if !aligned && !caught && self.dynamic_guides_on() {
             let grab = source.unwrap_or_else(|| bounds.center());
             let mut anchors = self.dynamic_anchors();
             live_guides::acquire(&mut anchors, grab, MAX_ANCHORS + 1);
@@ -1510,6 +1545,13 @@ impl App {
         if !self.snap_enabled() {
             return d;
         }
+        self.snap_move_caught(bounds, d).0
+    }
+
+    /// [`App::snap_move`], and whether an edge or the centre lies on a
+    /// candidate on either axis (also when the pointer put it exactly
+    /// there).
+    fn snap_move_caught(&self, bounds: Rect, d: Vec2) -> (Vec2, bool) {
         let moved = bounds + d;
         let (xs, ys) = self.snap_candidates_near(&self.selection, true, true, Some(moved));
         let mut best_dx: Option<f64> = None;
@@ -1530,7 +1572,10 @@ impl App {
                 }
             }
         }
-        Vec2::new(d.x + best_dx.unwrap_or(0.0), d.y + best_dy.unwrap_or(0.0))
+        (
+            Vec2::new(d.x + best_dx.unwrap_or(0.0), d.y + best_dy.unwrap_or(0.0)),
+            best_dx.is_some() || best_dy.is_some(),
+        )
     }
 
     /// All snapping off: Alt+Q, or Q held down on its own for the
@@ -1654,6 +1699,34 @@ fn circle_crossing(
     }
     best.map(|(_, x)| x)
         .filter(|x| x.x.is_finite() && x.y.is_finite())
+}
+
+/// The straight upright (`true`, at an x) and level (`false`, at a y)
+/// sides of `s` on the page that lie inside its box `b`, with the span
+/// they cover across: what a moved box snaps to besides the box (#3970).
+/// Outlines of very many segments are left to their box.
+fn inner_sides(s: &Shape, b: Rect, out: &mut impl FnMut(bool, f64, f64, f64)) {
+    use tracedraw_core::geometry::PathSeg;
+    let path = s.page_path();
+    if path.elements().len() > 2000 {
+        return;
+    }
+    let eps = 1e-6 * (1.0 + b.width().max(b.height()));
+    for seg in path.segments() {
+        let PathSeg::Line(l) = seg else { continue };
+        let (a, z) = (l.p0, l.p1);
+        if (a.x - z.x).abs() <= eps && (a.y - z.y).abs() > eps {
+            if a.x > b.x0 + eps && a.x < b.x1 - eps {
+                out(true, a.x, a.y.min(z.y), a.y.max(z.y));
+            }
+        } else if (a.y - z.y).abs() <= eps
+            && (a.x - z.x).abs() > eps
+            && a.y > b.y0 + eps
+            && a.y < b.y1 - eps
+        {
+            out(false, a.y, a.x.min(z.x), a.x.max(z.x));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1862,6 +1935,43 @@ mod tests {
         assert!((b.x1 + d.x - 50.0).abs() < 1e-9, "{d:?}");
     }
 
+    /// A box moved into the corner of a vertical and a horizontal
+    /// guideline lands on both, also with dynamic guides on: a slanted
+    /// dynamic guide through an earlier snap point no longer pulls it
+    /// off the crossing onto one line, or onto none (#3952).
+    #[test]
+    fn a_box_lands_on_two_crossing_guidelines_at_once() {
+        let mut app = app();
+        let page = app.page;
+        app.snap.dynamic_guides = true;
+        app.run(Command::AddGuide {
+            page,
+            guide: Guide::vertical(175.0),
+        });
+        app.run(Command::AddGuide {
+            page,
+            guide: Guide::horizontal(130.0),
+        });
+        let id = rect(&mut app, 20.0, 20.0, 120.0, 80.0);
+        app.select(vec![id]);
+        // Points snapped to before, which dynamic guides start from.
+        app.guide_anchors
+            .borrow_mut()
+            .extend([Point::new(50.0, 200.0), Point::new(178.0, 20.0)]);
+        let b = app.selection_bounds().unwrap();
+        let corner = Point::new(b.x1, b.y1);
+        for grab in [None, Some(corner), Some(b.center())] {
+            for (ox, oy) in [(0.0, 0.0), (-5.0, 3.0), (6.0, -4.0), (-2.0, -7.0)] {
+                let d = Vec2::new(175.0 - b.x1 + ox, 130.0 - b.y1 + oy);
+                let m = b + app.snap_move_from(grab, b, d, None);
+                assert!(
+                    (m.x1 - 175.0).abs() < 1e-9 && (m.y1 - 130.0).abs() < 1e-9,
+                    "{grab:?} {ox} {oy}: {m:?}"
+                );
+            }
+        }
+    }
+
     /// At first objects snap as the page does, within 10 px: a node
     /// 9 px from the pointer catches it, one 11 px away leaves it alone;
     /// with snapping to objects turned off, only the page does (#1814).
@@ -1961,6 +2071,47 @@ mod tests {
         app.snap_mark.set(None);
         let q = app.snap_point(Point::new(103.0, 118.0));
         assert_ne!(q, Point::new(100.0, 120.0));
+    }
+
+    /// A box moved inside a frame (a rectangle with a rectangular hole,
+    /// made by Combine) snaps to the inner edges, not only to the frame's
+    /// outer box (#3970).
+    #[test]
+    fn a_moved_box_snaps_to_the_inner_edges_of_a_frame() {
+        use tracedraw_core::BezPath;
+        let mut app = app();
+        app.settings.snap.threshold_px = 3.0;
+        app.snap = SnapSettings {
+            grid: false,
+            guides: false,
+            objects: true,
+            page: false,
+            pixels: false,
+            baseline_grid: false,
+            alignment_guides: false,
+            dynamic_guides: false,
+            off: false,
+        };
+        let mut path = BezPath::new();
+        for (x0, y0, x1, y1) in [(100.0, 100.0, 200.0, 200.0), (120.0, 120.0, 180.0, 180.0)] {
+            path.move_to((x0, y0));
+            path.line_to((x1, y0));
+            path.line_to((x1, y1));
+            path.line_to((x0, y1));
+            path.close_path();
+        }
+        app.new_shape(ShapeKind::Path { path, closed: true })
+            .expect("frame");
+        let small = rect(&mut app, 140.0, 140.0, 150.0, 150.0);
+        app.select(vec![small]);
+        let b = Rect::new(140.0, 140.0, 150.0, 150.0);
+        // Its left side brought within a millimetre of the inner left edge,
+        // its bottom near the inner bottom edge.
+        let d = app.snap_move(b, Vec2::new(-19.0, -18.5));
+        assert_eq!(d, Vec2::new(-20.0, -20.0));
+        // The inner right edge, by its right side.
+        let d = app.snap_move(b, Vec2::new(29.2, 0.0));
+        assert!((d.x - 30.0).abs() < 1e-9, "{d:?}");
     }
 
     /// The centre of rotation snaps to the centre, the corners and the

@@ -58,7 +58,9 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::PageSpacing { .. } => "pages-layout/multipage-view#page-spacing",
         Dialog::OutlineOffset { .. } => "lines-shapes/shaping#outline-offset",
         Dialog::GatherPages { .. } => "pages-layout/pages",
-        Dialog::ArrangeGrid { .. } => "objects/align-distribute#grid",
+        Dialog::ArrangeGrid { .. } | Dialog::FillWithCopies { .. } => {
+            "objects/align-distribute#grid"
+        }
         Dialog::MultipagePages { .. } => "pages-layout/multipage-view#choose-pages",
         Dialog::InsertPage { .. } => "pages-layout/pages#insert-page",
         Dialog::DeletePage { .. } => "pages-layout/pages#delete-page",
@@ -227,6 +229,13 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::Scripts => "customize/scripts",
         DockerTab::Macros => "customize/scripts#macros",
         DockerTab::PrintMerge => "printing/print-merge#docker",
+        DockerTab::PixelLayers
+        | DockerTab::PixelSelection
+        | DockerTab::PixelRetouch
+        | DockerTab::PixelDistort
+        | DockerTab::PixelEffects
+        | DockerTab::PixelImage
+        | DockerTab::PixelHistogram => "bitmaps/resample-and-straighten#other",
         DockerTab::Palettes => "color/palettes",
         DockerTab::Lens => "effects/lens",
         DockerTab::Blend => "effects/blend",
@@ -307,6 +316,7 @@ pub fn tool_topic(t: Tool) -> &'static str {
         Tool::ActionLines => "lines-shapes/polygons-stars-spirals#action-lines",
         Tool::Balloon => "lines-shapes/polygons-stars-spirals#speech-balloons",
         Tool::GraphPaper => "lines-shapes/polygons-stars-spirals#graph-paper",
+        Tool::ShapeGenerator => "objects/shape-generator#tool",
         Tool::Text => "text/adding-text",
         Tool::Table => "objects/tables",
         Tool::ParallelDimension => "lines-shapes/dimensions#parallel",

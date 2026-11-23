@@ -122,6 +122,59 @@ fn nearest_line(v: f64, origin: f64, step: f64) -> f64 {
     origin + ((v - origin) / step).round() * step
 }
 
+/// How Object > Align and Distribute > Arrange in Grid lays the selected
+/// objects out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridArrange {
+    /// Objects in a row.
+    pub columns: usize,
+    /// The room between the columns and between the rows, mm.
+    pub gap_x: f64,
+    pub gap_y: f64,
+    /// The cells are filled as text reads where the objects are now (top
+    /// row first, left to right) instead of in the order the objects
+    /// were selected.
+    pub by_position: bool,
+    /// Each column is as wide as its widest object and each row as tall
+    /// as its tallest, instead of every cell being the size of the
+    /// largest object.
+    pub compact: bool,
+    /// Where an object sits in its cell: 0 left, 1 centre, 2 right.
+    pub align_x: u8,
+    /// 0 top, 1 middle, 2 bottom.
+    pub align_y: u8,
+}
+
+impl Default for GridArrange {
+    fn default() -> Self {
+        GridArrange {
+            columns: 1,
+            gap_x: 0.0,
+            gap_y: 0.0,
+            by_position: false,
+            compact: false,
+            align_x: 1,
+            align_y: 1,
+        }
+    }
+}
+
+fn gap_x_of(g: &GridArrange) -> f64 {
+    if g.gap_x.is_finite() {
+        g.gap_x.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn gap_y_of(g: &GridArrange) -> f64 {
+    if g.gap_y.is_finite() {
+        g.gap_y.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 impl App {
     /// The box Align and Distribute use for `s`: its bounds, grown by
     /// half its outline width with Use Outline.
@@ -357,40 +410,210 @@ impl App {
     /// widest object and as tall as the tallest, `gap_x` and `gap_y` (mm)
     /// apart, and each object sits at its cell's centre. One undo step.
     pub fn arrange_in_grid(&mut self, columns: usize, gap_x: f64, gap_y: f64) {
+        self.arrange_in_grid_with(&GridArrange {
+            columns,
+            gap_x,
+            gap_y,
+            ..GridArrange::default()
+        });
+    }
+
+    /// Where Arrange in Grid set as `g` puts each selected object: its
+    /// id, the box it is laid out by and how far it moves. Empty with
+    /// fewer than two objects. The dialog's preview draws this and
+    /// [`App::arrange_in_grid_with`] carries it out.
+    pub fn arrange_grid_plan(&self, g: &GridArrange) -> Vec<(tracedraw_core::ShapeId, Rect, Vec2)> {
         let shapes = self.selected_shapes();
-        if shapes.len() < 2 || columns == 0 {
-            return;
+        if shapes.len() < 2 || g.columns == 0 {
+            return Vec::new();
         }
-        let boxes: Vec<(tracedraw_core::ShapeId, Rect)> = shapes
+        let mut boxes: Vec<(tracedraw_core::ShapeId, Rect)> = shapes
             .iter()
             .map(|s| (s.id, self.align_box(s)))
             .filter(|(_, b)| b.is_finite())
             .collect();
         if boxes.len() < 2 {
-            return;
+            return Vec::new();
         }
-        let (gap_x, gap_y) = (gap_x.max(0.0), gap_y.max(0.0));
+        let (gap_x, gap_y) = (gap_x_of(g), gap_y_of(g));
         let cell_w = boxes.iter().map(|(_, b)| b.width()).fold(0.0, f64::max);
         let cell_h = boxes.iter().map(|(_, b)| b.height()).fold(0.0, f64::max);
         let all = boxes.iter().skip(1).fold(boxes[0].1, |a, (_, b)| a.union(*b));
-        // y grows upwards: the first row is at the top.
-        let (left, top) = (all.x0, all.y1);
-        let mut cmds = Vec::new();
-        for (i, (id, b)) in boxes.iter().enumerate() {
-            let (col, row) = ((i % columns) as f64, (i / columns) as f64);
-            let cx = left + col * (cell_w + gap_x) + cell_w / 2.0;
-            let cy = top - row * (cell_h + gap_y) - cell_h / 2.0;
-            let d = Vec2::new(cx - b.center().x, cy - b.center().y);
-            if d.hypot() > 1e-9 {
-                cmds.push(Command::TransformShapes {
-                    shapes: vec![*id],
-                    transform: Affine::translate(d),
-                });
+        if g.by_position {
+            // As text reads where the objects are now: bands of objects
+            // about level with each other, top band first, each band
+            // left to right.
+            boxes.sort_by(|a, b| b.1.center().y.total_cmp(&a.1.center().y));
+            let mut bands: Vec<Vec<(tracedraw_core::ShapeId, Rect)>> = Vec::new();
+            for item in boxes {
+                match bands.last_mut() {
+                    Some(band) if (band[0].1.center().y - item.1.center().y) <= cell_h / 2.0 => {
+                        band.push(item)
+                    }
+                    _ => bands.push(vec![item]),
+                }
+            }
+            for band in &mut bands {
+                band.sort_by(|a, b| a.1.center().x.total_cmp(&b.1.center().x));
+            }
+            boxes = bands.into_iter().flatten().collect();
+        }
+        let rows = boxes.len().div_ceil(g.columns);
+        let cols = g.columns.min(boxes.len());
+        // The size of each column and row: all alike, or each its own.
+        let mut widths = vec![cell_w; cols];
+        let mut heights = vec![cell_h; rows];
+        if g.compact {
+            widths = vec![0.0; cols];
+            heights = vec![0.0; rows];
+            for (i, (_, b)) in boxes.iter().enumerate() {
+                let (c, r) = (i % g.columns, i / g.columns);
+                widths[c] = widths[c].max(b.width());
+                heights[r] = heights[r].max(b.height());
             }
         }
+        // y grows upwards: the first row is at the top.
+        let (left, top) = (all.x0, all.y1);
+        let (ax, ay) = (
+            f64::from(g.align_x.min(2)) / 2.0,
+            f64::from(g.align_y.min(2)) / 2.0,
+        );
+        boxes
+            .iter()
+            .enumerate()
+            .map(|(i, (id, b))| {
+                let (c, r) = (i % g.columns, i / g.columns);
+                let x0 = left + widths[..c].iter().sum::<f64>() + gap_x * c as f64;
+                let y1 = top - heights[..r].iter().sum::<f64>() - gap_y * r as f64;
+                let x = x0 + (widths[c] - b.width()) * ax;
+                let y = y1 - (heights[r] - b.height()) * ay;
+                (*id, *b, Vec2::new(x - b.x0, y - b.y1))
+            })
+            .collect()
+    }
+
+    /// Arrange in Grid with every option of its dialog (see
+    /// [`GridArrange`]). One undo step.
+    pub fn arrange_in_grid_with(&mut self, g: &GridArrange) {
+        let cmds: Vec<Command> = self
+            .arrange_grid_plan(g)
+            .into_iter()
+            .filter(|(_, _, d)| d.hypot() > 1e-9)
+            .map(|(id, _, d)| Command::TransformShapes {
+                shapes: vec![id],
+                transform: Affine::translate(d),
+            })
+            .collect();
         if !cmds.is_empty() {
             let _ = self.run_batch_keeping_lines("Arrange in Grid", &cmds);
         }
+    }
+
+    /// Where Fill With Copies with these gaps (mm) puts the copies: the
+    /// smaller object's id and box and, for each place where a whole
+    /// copy fits inside the larger, how far the object moves to it (top
+    /// row first, left to right). None unless two objects are selected;
+    /// no places when none fits.
+    pub fn fill_with_copies_plan(
+        &self,
+        gap_x: f64,
+        gap_y: f64,
+    ) -> Option<(tracedraw_core::ShapeId, Rect, Vec<Vec2>)> {
+        use tracedraw_core::geometry::Shape as _;
+        let shapes = self.selected_shapes();
+        if shapes.len() != 2 {
+            return None;
+        }
+        let area = |s: &Shape| {
+            let b = s.page_path().bounding_box();
+            b.width() * b.height()
+        };
+        let (frame, item) = if area(&shapes[0]) >= area(&shapes[1]) {
+            (&shapes[0], &shapes[1])
+        } else {
+            (&shapes[1], &shapes[0])
+        };
+        let fp = frame.page_path();
+        let fb = fp.bounding_box();
+        let ib = item.page_path().bounding_box();
+        let (w, h) = (ib.width(), ib.height());
+        let (gx, gy) = (gap_x.max(0.0), gap_y.max(0.0));
+        if !(w > 1e-6 && h > 1e-6 && fb.is_finite() && ib.is_finite()) {
+            return None;
+        }
+        let cols = ((fb.width() + gx) / (w + gx)).floor() as usize;
+        let rows = ((fb.height() + gy) / (h + gy)).floor() as usize;
+        if cols == 0 || rows == 0 || cols.saturating_mul(rows) > 20_000 {
+            return Some((item.id, ib, Vec::new()));
+        }
+        let x0 = fb.x0 + (fb.width() - (cols as f64 * (w + gx) - gx)) / 2.0;
+        let y1 = fb.y1 - (fb.height() - (rows as f64 * (h + gy) - gy)) / 2.0;
+        // A place fits when points all over the copy's box, a hair inside
+        // its edges, are inside the larger object.
+        let fits = |r: Rect| {
+            let e = 1e-6 * (1.0 + w.max(h));
+            let r = Rect::new(r.x0 + e, r.y0 + e, r.x1 - e, r.y1 - e);
+            (0..=4).all(|i| {
+                (0..=4).all(|j| {
+                    fp.contains(Point::new(
+                        r.x0 + r.width() * f64::from(i) / 4.0,
+                        r.y0 + r.height() * f64::from(j) / 4.0,
+                    ))
+                })
+            })
+        };
+        // Top row first, left to right, as text reads.
+        let places: Vec<Vec2> = (0..rows)
+            .flat_map(|row| (0..cols).map(move |col| (row, col)))
+            .filter_map(|(row, col)| {
+                let x = x0 + col as f64 * (w + gx);
+                let y = y1 - row as f64 * (h + gy) - h;
+                let r = Rect::new(x, y, x + w, y + h);
+                fits(r).then(|| Vec2::new(r.x0 - ib.x0, r.y0 - ib.y0))
+            })
+            .collect();
+        Some((item.id, ib, places))
+    }
+
+    /// Object > Align and Distribute > Fill With Copies (#3834): of the
+    /// two selected objects, the smaller goes in a grid of copies, `gap_x`
+    /// by `gap_y` mm apart and centred, over every place inside the larger
+    /// where a whole copy fits; the object itself takes the first place.
+    /// They become the selection, and the status line tells how many
+    /// there are, which this returns (0: none fit).
+    pub fn fill_with_copies(&mut self, gap_x: f64, gap_y: f64) -> usize {
+        let Some(layer) = self.active_layer() else {
+            return 0;
+        };
+        let Some((item_id, _, places)) = self.fill_with_copies_plan(gap_x, gap_y) else {
+            return 0;
+        };
+        let n = places.len();
+        self.status = crate::i18n::trf("status.fill_with_copies", &[("n", &n.to_string())]);
+        let Some(first) = places.first() else {
+            return 0;
+        };
+        let Some(item) = self.selected_shapes().into_iter().find(|s| s.id == item_id) else {
+            return 0;
+        };
+        let mut cmds = vec![Command::TransformShapes {
+            shapes: vec![item.id],
+            transform: Affine::translate(*first),
+        }];
+        let mut ids = vec![item.id];
+        for d in &places[1..] {
+            let id = self.engine.new_shape_id();
+            let mut copy = crate::app::reid_pub(item.clone(), id, &mut self.engine);
+            copy.transform_by(Affine::translate(*d));
+            ids.push(id);
+            cmds.push(Command::AddShape { layer, shape: copy });
+        }
+        if let Err(e) = self.engine.run_batch("Fill With Copies", &cmds) {
+            self.status = e.to_string();
+            return 0;
+        }
+        self.select(ids);
+        n
     }
 
     /// Copies of the selection right on top of it, which become the
@@ -1203,7 +1426,11 @@ impl App {
         }
         // Print-size pictures too (#2000); a CMYK JPEG or TIFF keeps its
         // inks and shows them as the drawing's CMYK colours show (#2163).
-        let picture = match crate::bitmap_file::read(&bytes) {
+        // A plain JPEG is taken apart once, its pixels the JPEG's own
+        // (#3914: it was taken apart a second time to see that they were).
+        let plain = plain_jpeg(&bytes);
+        let jpeg_pixels = plain.is_some();
+        let picture = match plain.map_or_else(|| crate::bitmap_file::read(&bytes), Ok) {
             Ok(p) => p,
             Err(e) => {
                 self.status = crate::i18n::trf(
@@ -1231,13 +1458,17 @@ impl App {
             }
         });
         let planes = picture.planes;
-        // A JPEG whose pixels came straight from the file (not turned by
-        // its Exif orientation, not CMYK) is kept, so a packed .tdraw
-        // saves the JPEG instead of a PNG two to three times its size
-        // (#2849). There is nothing to check: it was decoded once, to
-        // these very pixels.
+        // A JPEG whose pixels are the picture's (not turned by its Exif
+        // orientation, not CMYK) is kept, so a packed .tdraw saves the
+        // JPEG instead of a PNG two to three times its size (#2849).
+        // One already decoded straight to these pixels (`jpeg_pixels`,
+        // `from_jpeg`) needs no second decode to check; any other is
+        // checked by decoding it again.
         let (w, h) = picture.rgba.dimensions();
-        let keep_jpeg = planes.is_none() && picture.from_jpeg;
+        let keep_jpeg = jpeg_pixels
+            || picture.from_jpeg
+            || (planes.is_none()
+                && tracedraw_core::jpeg_source::decodes_to(&bytes, w, h, picture.rgba.as_raw()));
         // A 1-bit, grayscale or indexed file keeps its colour mode; all
         // came in as RGB (#3025).
         let placed = if planes.is_none() && picture.mode != crate::bitmap_file::FileMode::Rgb {
@@ -2422,6 +2653,30 @@ impl App {
         };
         self.select(vec![ids[next]]);
     }
+}
+
+/// A JPEG that is not CMYK and that its Exif orientation leaves as
+/// stored, read once with the decoder a kept JPEG is read with, so its
+/// pixels are the JPEG's own (#3914). `None` for any other file, and
+/// for one larger than pictures may be.
+fn plain_jpeg(bytes: &[u8]) -> Option<crate::bitmap_file::ReadPicture> {
+    use image::metadata::Orientation;
+    if !tracedraw_core::jpeg_source::is_jpeg(bytes) {
+        return None;
+    }
+    let (orientation, w, h) = crate::files::picture_header(bytes)?;
+    if orientation != Orientation::NoTransforms
+        || u64::from(w) * u64::from(h) * 4 > crate::files::picture_decode_limit()
+    {
+        return None;
+    }
+    let (w, h, px) = tracedraw_core::jpeg_source::decode_rgba(bytes)?;
+    Some(crate::bitmap_file::ReadPicture {
+        rgba: image::RgbaImage::from_raw(w, h, px)?,
+        planes: None,
+        mode: crate::bitmap_file::file_mode(bytes),
+        from_jpeg: true,
+    })
 }
 
 #[cfg(test)]

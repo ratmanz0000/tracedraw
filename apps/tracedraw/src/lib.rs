@@ -97,6 +97,7 @@ mod file_presence;
 mod files;
 mod fill_page;
 mod shape3d;
+mod dialog_preview;
 mod shape_gen;
 mod shape_gen_bg;
 mod shape_gen_cells;
@@ -104,6 +105,7 @@ mod shape_gen_curves;
 mod shape_gen_fill;
 mod shape_gen_growth;
 mod shape_gen_slice;
+mod shape_gen_tool;
 mod shape_gen_warp;
 mod fill_tool;
 mod pattern_fill_tool;
@@ -213,9 +215,14 @@ mod cut_tools;
 mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
+mod pixel_adjust;
 mod pixel_edit;
 mod pixel_edit_app;
 mod pixel_light;
+mod pixel_liquify;
+mod pixel_paint;
+mod pixel_surface;
+mod pixel_view;
 mod pixel_warp;
 mod placeholder;
 mod plugins;
@@ -1169,8 +1176,8 @@ impl eframe::App for Shell {
         // What the browser could not keep (#1414).
         app.tell_storage_refusals();
         app.sync_document_colors();
-        // File dialogs that finished in the background (browser build).
-        files::run_finished(app);
+        // File dialogs that finished in the background.
+        files::run_finished(app, ui.ctx());
         // Pictures, files and text a browser handed over for a paste.
         app.take_handed_pastes();
         // Files a later start handed over (one try_recv when none came).

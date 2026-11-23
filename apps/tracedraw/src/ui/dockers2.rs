@@ -70,6 +70,13 @@ pub fn show(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         DockerTab::Macros => crate::ui::macros_ui::manager(app, ui),
         DockerTab::PrintMerge => crate::ui::print_merge_docker::print_merge(app, ui),
         DockerTab::Gk42 => crate::map_gk42::panel(app, ui),
+        DockerTab::PixelLayers
+        | DockerTab::PixelSelection
+        | DockerTab::PixelRetouch
+        | DockerTab::PixelDistort
+        | DockerTab::PixelEffects
+        | DockerTab::PixelImage
+        | DockerTab::PixelHistogram => crate::ui::pixel_mode::docker_body(app, ui, tab),
         _ => {}
     }
 }

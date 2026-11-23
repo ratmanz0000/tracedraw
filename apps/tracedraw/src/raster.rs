@@ -1424,7 +1424,7 @@ impl Raster {
                 .key
                 .as_ref()
                 .is_some_and(|old| old.zoom != key.zoom && old.same_but_view(&key, false));
-        if keep {
+        if keep && self.texture.is_some() {
             if let (Some(old), Some(k), Some(r)) =
                 (self.texture.take(), self.key.take(), self.page_rect)
             {

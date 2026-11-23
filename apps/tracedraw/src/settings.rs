@@ -189,6 +189,9 @@ pub struct Settings {
     #[serde(default)]
     pub bitmap_editor: String,
     pub last_dir: Option<PathBuf>,
+    /// The folder of pictures the bitmap pattern picker lists as tiles
+    /// (#3323).
+    pub pattern_folder: Option<PathBuf>,
     /// The folder exported to last: File > Export's dialog opens there
     /// (#1817).
     pub last_export_dir: Option<PathBuf>,
@@ -426,6 +429,10 @@ pub struct Settings {
     pub selection_bar_mouse: bool,
     #[serde(default = "default_true")]
     pub preview_page_border: bool,
+    /// Options > Display > Full-screen preview: the colour round the page
+    /// in the full-screen preview (F9), white at first (#3930).
+    #[serde(default = "default_preview_background")]
+    pub preview_background: [u8; 3],
     /// Options > Document > Page size: how the page's shadow and border
     /// look on screen (#3078).
     #[serde(default, skip_serializing_if = "PageLook::is_default")]
@@ -643,6 +650,10 @@ pub struct Settings {
     /// (the default dockers then show).
     #[serde(default)]
     pub dockers: Option<DockerSetup>,
+    /// The image editing mode's panels as they were left (Bitmaps > Edit
+    /// Inside); none until it is first used (its default panels show).
+    #[serde(default)]
+    pub pixel_dockers: Option<DockerSetup>,
     /// The font lists' fonts used last, newest first.
     #[serde(default)]
     pub recent_fonts: Vec<String>,
@@ -814,6 +825,11 @@ pub struct Settings {
     /// applied to ("Sample again after applying" on their bars, #2380).
     #[serde(default)]
     pub eyedropper_sample_after_apply: bool,
+    /// The Color Eyedropper hands over to the Pick tool once a colour it
+    /// sampled went onto the selected objects ("Pick tool after applying
+    /// to the selection" on its bar, #3995).
+    #[serde(default)]
+    pub eyedropper_pick_after_apply: bool,
     /// Text fitted to a path: a drag off the path moves the text away
     /// from it in steps of `path_tick_mm` (tick snapping).
     #[serde(default)]
@@ -972,6 +988,10 @@ fn default_system_save_dialog() -> bool {
 /// Translucent menus start at 85 % opacity.
 fn default_menu_opacity() -> f32 {
     0.85
+}
+
+fn default_preview_background() -> [u8; 3] {
+    [255, 255, 255]
 }
 
 fn default_true() -> bool {
@@ -2412,6 +2432,7 @@ impl Default for Settings {
             command_icons: Vec::new(),
             bitmap_editor: String::new(),
             last_dir: None,
+            pattern_folder: None,
             last_export_dir: None,
             folder_bookmarks: Vec::new(),
             color: ColorPrefs::default(),
@@ -2442,6 +2463,7 @@ impl Default for Settings {
             touch_selection_bar: true,
             selection_bar_mouse: false,
             preview_page_border: true,
+            preview_background: default_preview_background(),
             page_look: PageLook::default(),
             constrain_angle: default_constrain_angle(),
             symmetry_show_lines: true,
@@ -2531,6 +2553,7 @@ impl Default for Settings {
             defaults: crate::defaults::DefaultsPrefs::default(),
             shown_bars: None,
             dockers: None,
+            pixel_dockers: None,
             recent_fonts: Vec::new(),
             font_filter_open: false,
             font_english_names: true,
@@ -2576,6 +2599,7 @@ impl Default for Settings {
             curves: Default::default(),
             show_text_frames: true,
             eyedropper_sample_after_apply: false,
+            eyedropper_pick_after_apply: false,
             path_tick_snap: false,
             path_tick_mm: default_path_tick(),
             screen_margins: crate::ui::screen_margins::ScreenMargins::default(),
@@ -2599,6 +2623,23 @@ pub const PORTABLE_DIR: &str = "tracedraw-settings";
 pub fn portable_dir(exe: &std::path::Path) -> Option<PathBuf> {
     let dir = exe.parent()?.join(PORTABLE_DIR);
     dir.is_dir().then_some(dir)
+}
+
+/// The folder of TraceDraw's own working files called `name` (bitmaps
+/// out for editing, auto-backups): in a portable copy inside its
+/// `tracedraw-settings` folder, so it leaves nothing on the computer
+/// (#3908); else in the system's temporary folder.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn work_dir(name: &str) -> PathBuf {
+    work_dir_beside(std::env::current_exe().ok().as_deref(), name)
+}
+
+/// [`work_dir`] for the program `exe`.
+#[cfg(not(target_arch = "wasm32"))]
+fn work_dir_beside(exe: Option<&std::path::Path>, name: &str) -> PathBuf {
+    exe.and_then(portable_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(name)
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -2639,6 +2680,7 @@ impl Settings {
         Settings {
             recent_files: self.recent_files.clone(),
             last_dir: self.last_dir.clone(),
+            pattern_folder: self.pattern_folder.clone(),
             last_export_dir: self.last_export_dir.clone(),
             folder_bookmarks: self.folder_bookmarks.clone(),
             window_maximized: self.window_maximized,
@@ -3587,6 +3629,12 @@ mod tests {
         assert_eq!(portable_dir(&exe), None);
         std::fs::create_dir_all(base.join(PORTABLE_DIR)).expect("dir");
         assert_eq!(portable_dir(&exe), Some(base.join(PORTABLE_DIR)));
+        // Its working files stay in that folder too, not in the system's
+        // temporary folder (#3908).
+        assert_eq!(
+            work_dir_beside(Some(&exe), "tracedraw-edit"),
+            base.join(PORTABLE_DIR).join("tracedraw-edit")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

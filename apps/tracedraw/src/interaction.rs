@@ -1963,6 +1963,19 @@ impl App {
             let up = !response.ctx.input(|i| i.pointer.primary_down());
             let boxing = matches!(self.drag, Drag::Box { .. });
             let released = (self.transforming() || boxing) && up;
+            // A finger lifted from a guideline it dragged takes the
+            // pointer with it (PointerGone), so the release seemed to be
+            // outside the window and the guideline went (#3867): where it
+            // let go stands in.
+            let guide = matches!(
+                self.drag,
+                Drag::MoveGuide { .. } | Drag::RotateGuide { .. } | Drag::GuidePivot
+            );
+            if guide && response.drag_stopped() {
+                if let Some(at) = response.interact_pointer_pos() {
+                    self.pointer_page = Some(self.view.to_page(at));
+                }
+            }
             if response.drag_stopped() || released {
                 self.end_drag();
             }
@@ -3552,6 +3565,11 @@ impl App {
                 ..Default::default()
             });
             c.nodes.push((p, None));
+            // Options > Tools > Freehand/Bézier: the second click ends
+            // the line, one straight segment (#3848).
+            if self.settings.curves.freehand_click_ends && c.nodes.len() >= 2 {
+                self.finish_curve();
+            }
             return;
         }
         if response.drag_started_by(PointerButton::Primary) {
@@ -3810,7 +3828,13 @@ impl App {
                     } else {
                         c.alt_from = None;
                         if let Some(last) = c.nodes.last_mut() {
-                            last.1 = Some(p);
+                            // A slight tremor on a trackpad tap starts a
+                            // drag in egui without an intentional handle
+                            // pull: keep the node a crisp corner until the
+                            // handle is pulled at least 3 screen pixels out.
+                            let pulled =
+                                (p - last.0).hypot() * self.view.zoom.max(1e-6) as f64 >= 3.0;
+                            last.1 = pulled.then_some(p);
                         }
                     }
                 }
@@ -4992,7 +5016,11 @@ impl App {
                             modifiers,
                             ..
                         } => {
-                            modifiers.command
+                            // A function key types nothing in a field
+                            // either: F4 with the zoom box or a docker's
+                            // number field holding the keyboard did
+                            // nothing (#3931). It goes to the drawing.
+                            (modifiers.command || function_key(*key))
                                 && !modifiers.alt
                                 && !field_editing_key(*key)
                                 && !crate::shortcuts::is_modifier(*key)
@@ -6113,6 +6141,25 @@ fn text_command_key(key: Key, mods: Modifiers) -> bool {
 /// select all, copy, cut, paste, undo, redo, and the moves and deletes by
 /// word. A field with the keyboard keeps these; other Ctrl shortcuts are
 /// commands for the drawing.
+/// F1 to F12, which no field types or edits with (#3931).
+fn function_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+    )
+}
+
 fn field_editing_key(key: Key) -> bool {
     matches!(
         key,
