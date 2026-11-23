@@ -38,6 +38,10 @@ pub struct ParseReport {
     pub layers: usize,
     pub shapes: usize,
     pub skipped_objects: usize,
+    /// Best-effort labels of objects left out because they could not be
+    /// read ("Name (type 0x...)", or just "type 0x..." when unnamed). The
+    /// few first are kept for the note after opening (#local).
+    pub skipped_names: Vec<String>,
     pub warnings: Vec<String>,
     /// The chunk tags and `loda` argument types the reader left
     /// uninterpreted, with their counts (RIFF files only; see
@@ -1233,6 +1237,27 @@ impl<'a> Ctx<'a> {
         } else {
             Some(name)
         }
+    }
+
+    /// A best-effort label of an object the reader left out, for the
+    /// note after opening: its name when the file gives one, otherwise
+    /// the `loda` kind. Objects that fail before their `loda` is read
+    /// only count, since no more can be said about them.
+    fn unread_label(&mut self, c: &Chunk) -> Option<String> {
+        let loda = self.own_loda(c)?;
+        let d = self.data(loda);
+        let l = self.read_loda(d)?;
+        let name = l
+            .args
+            .iter()
+            .find(|a| a.ty == ARG_NAME)
+            .and_then(|a| d.get(a.off..a.end))
+            .map(|b| self.read_name(b))
+            .filter(|s| !s.is_empty());
+        Some(match name {
+            Some(n) => format!("{n} (type {:#06x})", l.kind),
+            None => format!("type {:#06x}", l.kind),
+        })
     }
 
     /// A page's own name: argument 1000 of its `loda` (in its `lgob` in
@@ -5244,7 +5269,14 @@ impl<'a> Ctx<'a> {
                     }
                     None if std::mem::take(&mut self.last_was_guide) => {}
                     None if std::mem::take(&mut self.last_drew_nothing) => {}
-                    None => self.report.skipped_objects += 1,
+                    None => {
+                        self.report.skipped_objects += 1;
+                        if self.report.skipped_names.len() < 32 {
+                            if let Some(label) = self.unread_label(c) {
+                                self.report.skipped_names.push(label);
+                            }
+                        }
+                    }
                 }
             } else if c.is(b"grp ") {
                 let hidden = self.shape_hidden(c);

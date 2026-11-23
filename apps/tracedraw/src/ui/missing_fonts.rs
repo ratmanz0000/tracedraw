@@ -267,6 +267,7 @@ pub fn dialog(app: &mut App, ctx: &Context, st: &mut MissingFontsState, close: &
         app.dialog = crate::ui::dialogs::Dialog::OpenNotes(crate::ui::dialogs::OpenNotes {
             name: st.name.clone(),
             unread: st.unread,
+            unread_names: std::mem::take(&mut app.open_unread_names),
             fonts: Vec::new(),
             shrunk: st.shrunk.clone(),
             limits: None,

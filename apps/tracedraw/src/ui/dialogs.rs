@@ -1243,6 +1243,8 @@ pub struct OpenNotes {
     /// Objects left out because they could not be read (0: none, or the
     /// warning is off).
     pub unread: usize,
+    /// Best-effort labels of the objects left out; shown under the count.
+    pub unread_names: Vec<String>,
     /// Fonts the drawing uses that are not installed (empty: none, or the
     /// warning is off).
     pub fonts: Vec<String>,
@@ -1282,6 +1284,12 @@ impl OpenNotes {
             parts.push(trf(
                 "notes.unread_objects",
                 &[("n", &self.unread.to_string()), ("name", &self.name)],
+            ));
+        }
+        if !self.unread_names.is_empty() {
+            parts.push(trf(
+                "notes.unread_list",
+                &[("names", &self.unread_names.join("\n"))],
             ));
         }
         if !self.fonts.is_empty() {
@@ -9551,6 +9559,25 @@ pub(crate) fn palette_entry_color(name: &str, c: Color, spot: bool) -> Color {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// The note after opening lists the objects the reader left out
+    /// under the count, one per line (local only).
+    #[test]
+    fn open_notes_lists_the_unread_objects() {
+        crate::i18n::with_thread_language("en", || {
+            let notes = OpenNotes {
+                name: "map.cdr".into(),
+                unread: 2,
+                unread_names: vec!["Logo (type 0x000a)".into(), "type 0x0021".into()],
+                ..Default::default()
+            };
+            let text = notes.text();
+            assert!(text.contains("2 objects"), "{text}");
+            assert!(text.contains("Logo (type 0x000a)"), "{text}");
+            assert!(text.contains("type 0x0021"), "{text}");
+            assert!(text.contains("Logo (type 0x000a)\ntype 0x0021"), "{text}");
+        });
+    }
 
     /// #3183: the Data Merge dialog's button that opens the docker reads
     /// Continue, as the merge is still to be made there.

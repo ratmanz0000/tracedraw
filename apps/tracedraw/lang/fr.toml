@@ -11164,3 +11164,4 @@ docker.kashida_off = "Désactivé" # mt
 docker.kashida_low = "Faible" # mt
 docker.kashida_medium = "Moyen" # mt
 docker.kashida_high = "Élevé" # mt
+notes.unread_list = "Lecture impossible :\n{names}"

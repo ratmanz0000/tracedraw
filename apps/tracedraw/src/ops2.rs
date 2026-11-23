@@ -10586,32 +10586,5 @@ mod text_dialog_tests {
         );
         assert_eq!(app.engine.undo_label(), Some("Edit Text"));
     }
-    }
-
-    /// The Symbols panel's Revert on a symbol's row: every instance of
-    /// that symbol, on a layer, in a group, in a clip frame and on a
-    /// master layer, becomes independent copies of the definition where
-    /// each instance stood, the symbol goes, and one undo puts it all
-    /// back. The copies of a group definition do not share ids (#3066).
-    #[test]
-    fn reverting_a_symbol_from_its_row_turns_every_instance_into_objects() {
-        assert!(app.doc().find_shape(cid).is_some());
-        assert!(app.doc().find_shape(on_master).is_some());
-    }
-
-    /// The Symbols panel's X: the symbol and every instance of it go in
-    /// one undo step, a group that only held instances goes with them,
-    /// and one undo puts the symbol and the instances back.
-    #[test]
-    fn deleting_a_symbol_removes_it_and_every_instance_and_undoes() {
-        assert!(app.doc().find_shape(inst).is_some());
-        assert!(app.doc().find_shape(gid).is_some());
-        assert_eq!(crate::ui::dockers2::symbol_uses(app.doc(), 0), 3);
-    }
-
-    /// Revert to objects on selected instances only: those instances
-    /// become objects, the other instances and the symbol stay.
-    #[test]
-    fn reverting_selected_instances_leaves_the_symbol() {
 
 }

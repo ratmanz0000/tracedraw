@@ -1721,6 +1721,9 @@ pub struct App {
     /// What the file just opened could not give, for the message after
     /// opening (a desktop publishing file's layout, #2822).
     pub open_limits: Option<String>,
+    /// Best-effort labels of objects the file just opened could not read,
+    /// for the list in the note after opening (local only).
+    pub(crate) open_unread_names: Vec<String>,
     /// Where a drag for the new frame of a flow began.
     pub text_link_drag: Option<Point>,
     /// The pending link came from a frame's top tab: the frame clicked
@@ -3556,6 +3559,7 @@ impl App {
             pdf_open_picture: None,
             pdf_shrunk: Vec::new(),
             open_limits: None,
+            open_unread_names: Vec::new(),
             text_link_drag: None,
             text_link_incoming: false,
             text_link_from_tab: false,
@@ -9091,6 +9095,7 @@ impl App {
         }
         // Objects of a `.cdr` file left out because they could not be read.
         let mut unread = 0usize;
+        let mut unread_names = Vec::new();
         let mut shrunk = Vec::new();
         // A PDF opened as pictures, at this resolution (#2570).
         let mut pictures: Option<f64> = None;
@@ -9498,6 +9503,7 @@ impl App {
                         doc,
                         *report,
                         &mut unread,
+                        &mut unread_names,
                         &mut cdr_version,
                         &mut opened_version,
                     );
@@ -9509,6 +9515,7 @@ impl App {
                         doc,
                         report,
                         &mut unread,
+                        &mut unread_names,
                         &mut cdr_version,
                         &mut opened_version,
                     );
@@ -9611,6 +9618,7 @@ impl App {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 self.pdf_shrunk = shrunk;
+                self.open_unread_names = unread_names;
                 self.show_open_notes(name, unread);
                 // A symbol library shows its symbols (#2709).
                 if is_symbol_library_path(&path) {
@@ -10510,6 +10518,7 @@ impl App {
         let notes = crate::ui::dialogs::OpenNotes {
             name,
             unread: if w.unread_objects { unread } else { 0 },
+            unread_names: std::mem::take(&mut self.open_unread_names),
             fonts: if w.missing_fonts && !accepted {
                 self.missing_fonts.clone()
             } else {
@@ -11017,6 +11026,7 @@ impl App {
         doc: tracedraw_core::Document,
         report: tracedraw_cdr::ParseReport,
         unread: &mut usize,
+        unread_names: &mut Vec<String>,
         cdr_version: &mut Option<u16>,
         opened_version: &mut Option<u16>,
     ) -> (tracedraw_core::Document, String) {
@@ -11025,6 +11035,7 @@ impl App {
             log::warn!("cdr: {w}");
         }
         *unread = report.skipped_objects;
+        *unread_names = report.skipped_names.clone();
         *cdr_version = report.version.map(|v| writable_cdr_version(v.0));
         *opened_version = report.version.map(|v| v.0);
         let mut msg = crate::i18n::trf(

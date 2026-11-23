@@ -11164,3 +11164,4 @@ docker.kashida_off = "Desligado" # mt
 docker.kashida_low = "Baixo" # mt
 docker.kashida_medium = "Médio" # mt
 docker.kashida_high = "Alto" # mt
+notes.unread_list = "Não foi possível ler:\n{names}"

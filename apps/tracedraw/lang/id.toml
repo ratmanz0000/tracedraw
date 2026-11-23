@@ -11164,3 +11164,4 @@ docker.kashida_off = "Mati" # mt
 docker.kashida_low = "Rendah" # mt
 docker.kashida_medium = "Sedang" # mt
 docker.kashida_high = "Tinggi" # mt
+notes.unread_list = "Tidak dapat dibaca:\n{names}"

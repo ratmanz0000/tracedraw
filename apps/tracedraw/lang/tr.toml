@@ -11164,3 +11164,4 @@ docker.kashida_off = "Kapalı" # mt
 docker.kashida_low = "Düşük" # mt
 docker.kashida_medium = "Orta" # mt
 docker.kashida_high = "Yüksek" # mt
+notes.unread_list = "Okunamadı:\n{names}"

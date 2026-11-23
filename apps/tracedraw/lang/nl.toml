@@ -11164,3 +11164,4 @@ docker.kashida_off = "Uit" # mt
 docker.kashida_low = "Laag" # mt
 docker.kashida_medium = "Gemiddeld" # mt
 docker.kashida_high = "Hoog" # mt
+notes.unread_list = "Kan niet lezen:\n{names}"

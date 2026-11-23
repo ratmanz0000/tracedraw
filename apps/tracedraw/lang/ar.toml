@@ -11164,3 +11164,4 @@ docker.kashida_off = "إيقاف" # mt
 docker.kashida_low = "منخفض" # mt
 docker.kashida_medium = "متوسط" # mt
 docker.kashida_high = "مرتفع" # mt
+notes.unread_list = "تعذّرت قراءة:\n{names}"
