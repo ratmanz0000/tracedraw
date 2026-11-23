@@ -3181,10 +3181,21 @@ pub(crate) fn symbol_uses(doc: &tracedraw_core::Document, index: usize) -> usize
 }
 
 fn symbols(app: &mut App, ui: &mut Ui) {
+    // A pick or an inline rename holds a symbol index; once the drawing
+    // changes under it (undo, another merge) the index may point at a
+    // different symbol, so drop it rather than act on the wrong one.
+    if app.symbol_pick_rev != app.engine.revision() {
+        app.symbol_replace_source = None;
+        app.symbol_rename = None;
+        app.symbol_pick_rev = app.engine.revision();
+    }
     let has = !app.selection.is_empty();
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.new_symbol")))
+            .add_enabled(
+                has && app.clip_frame_edit.is_none(),
+                egui::Button::new(tr("docker.new_symbol")),
+            )
             .rich_tip(crate::ui::tips::keyed("docker.new_symbol"))
             .rich_disabled_tip(crate::ui::tips::keyed("docker.new_symbol"))
             .clicked()
@@ -3194,7 +3205,10 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         // Every group copying the selected one becomes an instance where
         // it stood, labels staying text (#2343).
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.symbolize_similar")))
+            .add_enabled(
+                has && app.clip_frame_edit.is_none(),
+                egui::Button::new(tr("docker.symbolize_similar")),
+            )
             .rich_tip(tr("docker.symbolize_similar_tip"))
             .rich_disabled_tip(tr("docker.symbolize_similar_tip"))
             .clicked()
@@ -3226,19 +3240,10 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         .collect();
     let editing = app.symbol_edit_index();
     let count = syms.len();
-    // A symbol being edited on the clean sheet is not reverted or
-    // deleted from under the edit.
-    let busy = app.clip_frame_edit.is_some();
     let mut thumbs = std::mem::take(&mut app.symbol_thumbs);
     thumbs.begin_frame();
     let drawing = (app.engine.instance(), app.engine.revision());
-    // A Revert or X on a row takes a symbol out of the panel: the indices
-    // after it shift, so the rest of the list waits for the next frame.
-    let mut acted = false;
     for (i, name) in syms {
-        if acted {
-            break;
-        }
         ui.horizontal(|ui| {
             // What the symbol draws, beside its name (#3249).
             symbol_picture(app, ui, &mut thumbs, drawing, i);
@@ -3265,6 +3270,7 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                 let resp = ui.label(&name).rich_tip(tr("docker.rename_symbol_tip"));
                 if resp.double_clicked() {
                     app.symbol_rename = Some((i, name.clone()));
+                    app.symbol_pick_rev = app.engine.revision();
                 }
             }
             if ui
@@ -3345,33 +3351,14 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                         app.merge_symbols(src, i);
                         app.symbol_replace_source = None;
                     }
-                    None => app.symbol_replace_source = Some(i),
+                    None => {
+                        app.symbol_replace_source = Some(i);
+                        app.symbol_pick_rev = app.engine.revision();
+                    }
                 }
             }
             let uses = symbol_uses(app.doc(), i);
             dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
-            // Revert every copy of this symbol to ordinary objects,
-            // where each stands, and take the symbol out of the panel.
-            if ui
-                .add_enabled(!busy, egui::Button::new(tr("docker.revert_symbol")).small())
-                .rich_tip(tr("docker.revert_symbol_tip"))
-                .clicked()
-            {
-                app.revert_symbol_instances_of(Some(i));
-                acted = true;
-            }
-            // Delete the symbol and every copy of it, at the far right
-            // of the row.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("x").small())
-                    .rich_tip(tr("docker.delete_symbol_tip"))
-                    .clicked()
-                {
-                    app.delete_symbol(i);
-                    acted = true;
-                }
-            });
         });
     }
     thumbs.trim(crate::object_thumbs::MAX_BYTES / 4);

@@ -431,7 +431,6 @@ impl App {
             .enumerate()
             .map(|(i, p)| (i, p.id))
             .collect();
-        let count = pages.len();
         let active = self.page;
         let master = self
             .active_layer()
@@ -493,7 +492,7 @@ impl App {
             let i = pages
                 .iter()
                 .position(|(_, p)| *p == active)
-                .filter(|i| scope.applies(*i) && self.page_numbers.field().numbers_in(*i, count))
+                .filter(|i| scope.applies(*i) && self.page_numbers.field().numbers(*i))
                 .or_else(|| {
                     let first = self.page_numbers.first_page.max(1) - 1;
                     (first..pages.len())
@@ -520,7 +519,7 @@ impl App {
             };
             // Covers and other pages before the first numbered page get
             // no number (#2127).
-            if !wanted || !self.page_numbers.field().numbers_in(i, count) {
+            if !wanted || !self.page_numbers.field().numbers(i) {
                 continue;
             }
             let Ok(page) = self.doc().page(pid) else {
@@ -544,9 +543,8 @@ impl App {
     /// page number settings say.
     fn page_number_text(&mut self, i: usize, size: tracedraw_core::geometry::Size) -> Shape {
         let id = self.engine.new_shape_id();
-        let count = self.doc().pages.len();
         let pn = &self.page_numbers;
-        let text = pn.field().label_in(i, count);
+        let text = pn.label(i);
         let em = pn.size_pt * 25.4 / 72.0;
         let margin = 10.0;
         // Outer corner: left on even (left-hand) pages, right on odd pages.
@@ -6112,6 +6110,12 @@ impl App {
     }
 
     pub fn create_symbol_from_selection(&mut self) {
+        // The edit's temporary objects are on the page: replacing them
+        // would write the replacement back as the definition on Finish.
+        if self.clip_frame_edit.is_some() {
+            self.status = crate::i18n::tr("status.symbol_merge_finish_edit");
+            return;
+        }
         let shapes = self.selected_shapes();
         if shapes.is_empty() {
             return;
@@ -6162,6 +6166,12 @@ impl App {
     /// instance of one symbol where the group stood; the group's labels
     /// stay text beside the instance (#2343). One undo step.
     pub fn symbolize_similar(&mut self) {
+        // The edit's temporary objects are on the page: replacing them
+        // would write the replacement back as the definition on Finish.
+        if self.clip_frame_edit.is_some() {
+            self.status = crate::i18n::tr("status.symbol_merge_finish_edit");
+            return;
+        }
         let shapes = self.selected_shapes();
         // The sample: a selected group, else a selected instance's
         // definition, else the selected non-text objects themselves.
@@ -6280,124 +6290,32 @@ impl App {
     /// Symbols docker > Revert to objects: replace selected instances by
     /// copies of their definition.
     pub fn revert_symbol_instances(&mut self) {
-        self.revert_symbol_instances_of(None);
-    }
-
-    /// Revert instances to ordinary objects: the selected ones, or, when
-    /// `only` is a symbol, every instance of that symbol, on any page or
-    /// master layer, in groups and clip frames too. Each copy takes the
-    /// instance's place and transform, with ids of its own for the
-    /// objects inside a group definition (#3066). A symbol named by
-    /// `only` is taken out of the panel once its copies have gone. One
-    /// undo step.
-    pub fn revert_symbol_instances_of(&mut self, only: Option<usize>) {
-        if only.is_some() && self.clip_frame_edit.is_some() {
-            return;
-        }
         let symbols = self.doc().symbols.clone();
-        let mut instances: Vec<Shape> = Vec::new();
-        match only {
-            Some(index) => {
-                if index >= symbols.len() {
-                    return;
-                }
-                fn walk(s: &Shape, index: usize, out: &mut Vec<Shape>) {
-                    match &s.kind {
-                        ShapeKind::SymbolInstance { index: i } if *i == index => out.push(s.clone()),
-                        ShapeKind::Group { children } => {
-                            children.iter().for_each(|c| walk(c, index, out));
-                        }
-                        ShapeKind::ClipFrame { frame, contents } => {
-                            walk(frame, index, out);
-                            contents.iter().for_each(|c| walk(c, index, out));
-                        }
-                        _ => {}
-                    }
-                }
-                for l in self.doc().all_layers() {
-                    for s in &l.shapes {
-                        walk(s, index, &mut instances);
-                    }
-                }
-            }
-            None => {
-                for s in self.selected_shapes() {
-                    if let ShapeKind::SymbolInstance { index } = s.kind {
-                        if symbols.get(index).is_some() {
-                            instances.push(s);
-                        }
-                    }
-                }
-            }
-        }
-        let mut replacements = Vec::with_capacity(instances.len());
-        let mut new_sel = Vec::with_capacity(instances.len());
-        for s in instances {
-            let ShapeKind::SymbolInstance { index } = s.kind else {
-                continue;
-            };
-            let Some(def) = symbols.get(index) else {
-                continue;
-            };
-            // New ids for the objects inside a group definition
-            // too: each instance reverted brought the same ones (#3066).
-            let id = self.engine.new_shape_id();
-            let mut copy = crate::app::reid_pub(def.shape.clone(), id, &mut self.engine);
-            copy.absorb(s.transform);
-            new_sel.push(copy.id);
-            replacements.push((s.id, copy));
-        }
         let mut cmds = Vec::new();
-        if !replacements.is_empty() {
-            cmds.push(Command::ReplaceShapes { replacements });
+        let mut new_sel = Vec::new();
+        for s in self.selected_shapes() {
+            if let ShapeKind::SymbolInstance { index } = s.kind {
+                let Some(def) = symbols.get(index) else {
+                    continue;
+                };
+                let Ok((layer, _)) = self.doc().shape(s.id) else {
+                    continue;
+                };
+                let layer = layer.id;
+                // New ids for the objects inside a group definition
+                // too: each instance reverted brought the same ones (#3066).
+                let id = self.engine.new_shape_id();
+                let mut copy = crate::app::reid_pub(def.shape.clone(), id, &mut self.engine);
+                copy.absorb(s.transform);
+                new_sel.push(copy.id);
+                cmds.push(Command::DeleteShapes { shapes: vec![s.id] });
+                cmds.push(Command::AddShape { layer, shape: copy });
+            }
         }
-        if let Some(index) = only {
-            // The definition is unused once its copies have gone.
-            cmds.push(Command::DeleteSymbol { index });
+        if !cmds.is_empty() {
+            let _ = self.engine.run_batch("Revert Symbol", &cmds);
+            self.selection = new_sel;
         }
-        if cmds.is_empty() {
-            return;
-        }
-        if let Err(e) = self.engine.run_batch("Revert Symbol", &cmds) {
-            self.status = e.to_string();
-            return;
-        }
-        let reverted = new_sel.len();
-        self.selection = new_sel;
-        if let Some(index) = only {
-            self.symbol_replace_source = None;
-            let name = symbols
-                .get(index)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            self.status = trf(
-                "status.symbol_reverted",
-                &[("n", &reverted.to_string()), ("name", &name)],
-            );
-        }
-    }
-
-    /// The Symbols docker's X: delete symbol `index` and every instance
-    /// of it, on any page or master layer, in groups and clip frames too;
-    /// one undo step.
-    pub fn delete_symbol(&mut self, index: usize) {
-        if self.clip_frame_edit.is_some() {
-            return;
-        }
-        let Some(name) = self.doc().symbols.get(index).map(|s| s.name.clone()) else {
-            return;
-        };
-        let n = crate::ui::dockers2::symbol_uses(self.doc(), index);
-        let had = self.doc().symbols.len();
-        self.run(Command::DeleteSymbol { index });
-        if self.doc().symbols.len() >= had {
-            return;
-        }
-        self.symbol_replace_source = None;
-        self.status = trf(
-            "status.symbol_deleted",
-            &[("name", &name), ("n", &n.to_string())],
-        );
     }
 
     /// The symbol whose objects are being edited (Edit Symbol), when the
@@ -7687,283 +7605,6 @@ mod tests {
         assert!(app.doc().symbols.is_empty());
         app.redo();
         assert_eq!(app.doc().symbols.len(), 1);
-    }
-
-    /// The Symbols panel's Revert on a symbol's row: every instance of
-    /// that symbol, on a layer, in a group, in a clip frame and on a
-    /// master layer, becomes independent copies of the definition where
-    /// each instance stood, the symbol goes, and one undo puts it all
-    /// back. The copies of a group definition do not share ids (#3066).
-    #[test]
-    fn reverting_a_symbol_from_its_row_turns_every_instance_into_objects() {
-        let mut app = App::headless();
-        let rect = |x0: f64, y0: f64| {
-            Shape::new(
-                ShapeId(0),
-                ShapeKind::Rect {
-                    rect: kurbo::Rect::new(x0, y0, x0 + 10.0, y0 + 5.0),
-                    radius: 0.0,
-                    corners: None,
-                },
-            )
-        };
-        app.run(Command::AddSymbol {
-            symbol: tracedraw_core::Symbol {
-                name: "Pair".into(),
-                shape: Shape::new(
-                    ShapeId(0),
-                    ShapeKind::Group {
-                        children: vec![rect(0.0, 0.0), rect(0.0, 5.0)],
-                    },
-                ),
-            },
-        });
-        let layer = app.active_layer().expect("layer");
-        let instance = |app: &mut App, t: Affine| {
-            let id = app.engine.new_shape_id();
-            let mut s = Shape::new(id, ShapeKind::SymbolInstance { index: 0 });
-            s.transform = t;
-            app.run(Command::AddShape { layer, shape: s });
-            id
-        };
-        let plain = instance(&mut app, Affine::translate((10.0, 0.0)));
-        // One in a group.
-        let mut nested = Shape::new(
-            app.engine.new_shape_id(),
-            ShapeKind::SymbolInstance { index: 0 },
-        );
-        nested.transform = Affine::translate((0.0, 20.0));
-        let group = Shape::new(
-            app.engine.new_shape_id(),
-            ShapeKind::Group {
-                children: vec![nested],
-            },
-        );
-        let gid = group.id;
-        app.run(Command::AddShape { layer, shape: group });
-        // One inside a clip frame.
-        let frame = Shape::new(
-            app.engine.new_shape_id(),
-            ShapeKind::Rect {
-                rect: kurbo::Rect::new(0.0, 40.0, 20.0, 60.0),
-                radius: 0.0,
-                corners: None,
-            },
-        );
-        let mut held = Shape::new(
-            app.engine.new_shape_id(),
-            ShapeKind::SymbolInstance { index: 0 },
-        );
-        held.transform = Affine::translate((0.0, 40.0));
-        let clip = Shape::new(
-            app.engine.new_shape_id(),
-            ShapeKind::ClipFrame {
-                frame: Box::new(frame),
-                contents: vec![held],
-            },
-        );
-        let cid = clip.id;
-        app.run(Command::AddShape { layer, shape: clip });
-        // One on a master layer.
-        app.run(Command::AddMasterLayer {
-            name: "Master".into(),
-            scope: tracedraw_core::MasterScope::All,
-        });
-        let master = app.doc().master[0].id;
-        let on_master = {
-            let id = app.engine.new_shape_id();
-            let mut s = Shape::new(id, ShapeKind::SymbolInstance { index: 0 });
-            s.transform = Affine::translate((30.0, 30.0));
-            app.run(Command::AddShape { layer: master, shape: s });
-            id
-        };
-        let uses = |app: &App| crate::ui::dockers2::symbol_uses(app.doc(), 0);
-        assert_eq!(uses(&app), 4, "the group and the clip frame hold one too");
-        let symbols = app.doc().symbols.len();
-
-        app.revert_symbol_instances_of(Some(0));
-        assert!(app.doc().symbols.is_empty(), "the unused definition goes");
-        assert_eq!(
-            app.status,
-            trf("status.symbol_reverted", &[("n", "4"), ("name", "Pair")],)
-        );
-        assert_eq!(app.engine.undo_label(), Some("Revert Symbol"));
-        fn instances(s: &Shape, out: &mut Vec<ShapeId>) {
-            match &s.kind {
-                ShapeKind::SymbolInstance { .. } => out.push(s.id),
-                ShapeKind::Group { children } => {
-                    children.iter().for_each(|c| instances(c, out));
-                }
-                ShapeKind::ClipFrame { frame, contents } => {
-                    instances(frame, out);
-                    contents.iter().for_each(|c| instances(c, out));
-                }
-                _ => {}
-            }
-        }
-        let mut left = Vec::new();
-        for l in app.doc().all_layers() {
-            for s in &l.shapes {
-                instances(s, &mut left);
-            }
-        }
-        assert!(left.is_empty(), "{left:?}");
-        // Each of the four copies is a group of two rectangles, with ids
-        // of their own, sitting where its instance did. The copy takes
-        // the instance's place, not its id.
-        fn groups(s: &Shape, skip: ShapeId, out: &mut Vec<ShapeId>) {
-            match &s.kind {
-                ShapeKind::Group { children } => {
-                    if s.id != skip {
-                        out.push(s.id);
-                    }
-                    for c in children {
-                        groups(c, skip, out);
-                    }
-                }
-                ShapeKind::ClipFrame { frame, contents } => {
-                    groups(frame, skip, out);
-                    for c in contents {
-                        groups(c, skip, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut copies = Vec::new();
-        for l in app.doc().all_layers() {
-            for s in &l.shapes {
-                groups(s, gid, &mut copies);
-            }
-        }
-        assert_eq!(copies.len(), 4, "{copies:?}");
-        let mut child_ids = Vec::new();
-        let mut moved_tx = None;
-        for id in &copies {
-            let s = app.doc().find_shape(*id).expect("copy");
-            let ShapeKind::Group { children } = &s.kind else {
-                panic!("copy {:?} is {:?}", s.id, s.kind);
-            };
-            assert_eq!(children.len(), 2);
-            child_ids.extend(children.iter().map(|c| c.id));
-            let c = s.transform.as_coeffs();
-            if (c[4] - 10.0).abs() < 1e-9 {
-                moved_tx = Some(c[4]);
-            }
-        }
-        assert_eq!(child_ids.len(), 8);
-        let unique: std::collections::HashSet<_> = child_ids.iter().copied().collect();
-        assert_eq!(unique.len(), 8, "no two copies share a child id");
-        assert_eq!(moved_tx, Some(10.0), "the copy sits where its instance did");
-        // The group and the clip frame still hold a copy, not an instance.
-        let ShapeKind::Group { children } = &app.doc().find_shape(gid).expect("group").kind else {
-            panic!("group");
-        };
-        assert!(matches!(children[0].kind, ShapeKind::Group { .. }));
-        let ShapeKind::ClipFrame { contents, .. } = &app.doc().find_shape(cid).expect("clip").kind
-        else {
-            panic!("clip");
-        };
-        assert!(matches!(contents[0].kind, ShapeKind::Group { .. }));
-        // The master layer holds a copy too.
-        assert_eq!(app.doc().master[0].shapes.len(), 1);
-        assert!(matches!(
-            app.doc().master[0].shapes[0].kind,
-            ShapeKind::Group { .. }
-        ));
-
-        app.undo();
-        assert_eq!(app.doc().symbols.len(), symbols);
-        assert_eq!(uses(&app), 4);
-        assert!(matches!(
-            app.doc().find_shape(plain).expect("instance").kind,
-            ShapeKind::SymbolInstance { index: 0 }
-        ));
-        assert!(app.doc().find_shape(gid).is_some());
-        assert!(app.doc().find_shape(cid).is_some());
-        assert!(app.doc().find_shape(on_master).is_some());
-    }
-
-    /// The Symbols panel's X: the symbol and every instance of it go in
-    /// one undo step, a group that only held instances goes with them,
-    /// and one undo puts the symbol and the instances back.
-    #[test]
-    fn deleting_a_symbol_removes_it_and_every_instance_and_undoes() {
-        let mut app = App::headless();
-        let inst = symbol_of(&mut app, kurbo::Rect::new(0.0, 0.0, 10.0, 10.0));
-        let layer = app.active_layer().expect("layer");
-        let second = {
-            let id = app.engine.new_shape_id();
-            let s = Shape::new(id, ShapeKind::SymbolInstance { index: 0 });
-            app.run(Command::AddShape { layer, shape: s });
-            id
-        };
-        // A group holding another instance: with the instance gone the
-        // empty group goes too.
-        let third = {
-            let id = app.engine.new_shape_id();
-            let s = Shape::new(id, ShapeKind::SymbolInstance { index: 0 });
-            app.run(Command::AddShape { layer, shape: s });
-            id
-        };
-        app.select(vec![second, third]);
-        app.group_selection();
-        let gid = app.selection[0];
-        assert_eq!(crate::ui::dockers2::symbol_uses(app.doc(), 0), 3);
-        let name = app.doc().symbols[0].name.clone();
-
-        app.delete_symbol(0);
-        assert!(app.doc().symbols.is_empty());
-        assert_eq!(
-            app.status,
-            trf("status.symbol_deleted", &[("name", &name), ("n", "3")]),
-        );
-        assert!(app.doc().find_shape(inst).is_none());
-        assert!(app.doc().find_shape(gid).is_none(), "the empty group goes");
-        assert_eq!(app.engine.undo_label(), Some("Delete Symbol"));
-
-        app.undo();
-        assert_eq!(app.doc().symbols.len(), 1);
-        assert!(app.doc().find_shape(inst).is_some());
-        assert!(app.doc().find_shape(gid).is_some());
-        assert_eq!(crate::ui::dockers2::symbol_uses(app.doc(), 0), 3);
-    }
-
-    /// Revert to objects on selected instances only: those instances
-    /// become objects, the other instances and the symbol stay.
-    #[test]
-    fn reverting_selected_instances_leaves_the_symbol() {
-        let mut app = App::headless();
-        let a = symbol_of(&mut app, kurbo::Rect::new(0.0, 0.0, 10.0, 10.0));
-        let layer = app.active_layer().expect("layer");
-        let b = {
-            let id = app.engine.new_shape_id();
-            let mut s = Shape::new(id, ShapeKind::SymbolInstance { index: 0 });
-            s.transform = Affine::translate((20.0, 0.0));
-            app.run(Command::AddShape { layer, shape: s });
-            id
-        };
-        app.select(vec![a]);
-        app.revert_symbol_instances();
-        assert_eq!(app.doc().symbols.len(), 1, "the symbol stays in use");
-        // The copy takes the instance's place under a new id.
-        assert_eq!(app.selection.len(), 1);
-        let copy = app.selection[0];
-        assert_ne!(copy, a);
-        assert!(matches!(
-            app.doc().find_shape(copy).expect("reverted").kind,
-            ShapeKind::Rect { .. }
-        ));
-        assert!(matches!(
-            app.doc().find_shape(b).expect("still an instance").kind,
-            ShapeKind::SymbolInstance { index: 0 }
-        ));
-        app.undo();
-        assert!(matches!(
-            app.doc().find_shape(a).expect("instance again").kind,
-            ShapeKind::SymbolInstance { index: 0 }
-        ));
-        assert!(app.doc().find_shape(copy).is_none());
     }
 
     /// An instance copied in one drawing and pasted in another brings its

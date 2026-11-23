@@ -56,10 +56,6 @@ pub struct PageNumberSettings {
     /// 0 bottom centre, 1 bottom outer corner, 2 top centre, 3 top outer corner.
     pub position: u8,
     pub size_pt: f64,
-    /// The last pages, this many, get no number (#3789).
-    pub skip_last: usize,
-    /// Pages ("5, 9-10") that get no number, not counted (#3789).
-    pub skip: String,
 }
 
 impl Default for PageNumberSettings {
@@ -72,8 +68,6 @@ impl Default for PageNumberSettings {
             style: 0,
             position: 0,
             size_pt: 12.0,
-            skip_last: 0,
-            skip: String::new(),
         }
     }
 }
@@ -87,8 +81,6 @@ impl PageNumberSettings {
             style: self.style,
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
-            skip_last: self.skip_last,
-            skip: self.skip.clone(),
         }
     }
 
@@ -1846,12 +1838,6 @@ pub struct App {
     /// typed into, so the page beneath stays cached without re-rendering
     /// on each keystroke (#3904).
     pub text_edit_overlay: std::cell::RefCell<crate::text_editing::TextEditOverlay>,
-    /// The last text layout made for the text being edited (the caret, a
-    /// click in it, its non-printing marks) and the overflow of a
-    /// paragraph frame, keyed by engine instance and revision, shape, tab
-    /// spacing, transform and fonts: laying text out on every frame and
-    /// every pointer move was slow (#3904).
-    pub text_layout_cache: std::cell::RefCell<Option<crate::text_editing::CachedTextLayout>>,
     /// What the backdrop covers (see [`Self::backdrop_area`]), with the
     /// revision, page and page box it was worked out for.
     backdrop_area: std::cell::Cell<Option<(u64, PageId, Rect, Rect)>>,
@@ -2044,6 +2030,10 @@ pub struct App {
     /// The Replace Symbol pick: the source symbol whose instances will
     /// move; the next press on another symbol's Replace button merges.
     pub symbol_replace_source: Option<usize>,
+    /// The drawing revision when the Replace pick / inline rename began;
+    /// a change (undo, another merge) drops the stale index so it cannot
+    /// point at a different symbol.
+    pub symbol_pick_rev: u64,
     /// The symbol name being edited inline: (index, draft text).
     pub symbol_rename: Option<(usize, String)>,
     /// The Symbols list's search text.
@@ -3544,7 +3534,6 @@ impl App {
             page_rasters: Default::default(),
             page_snapshot: Default::default(),
             text_edit_overlay: Default::default(),
-            text_layout_cache: Default::default(),
             backdrop_area: Default::default(),
             view_mode: ViewMode::Enhanced,
             proof_colors: false,
@@ -3638,6 +3627,7 @@ impl App {
             symbol_thumbs: Default::default(),
             symbolize_report: None,
             symbol_replace_source: None,
+            symbol_pick_rev: 0,
             symbol_rename: None,
             symbol_filter: String::new(),
             objects_master_closed: false,
