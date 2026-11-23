@@ -857,15 +857,22 @@ fn read_cmyk_tiff(bytes: &[u8]) -> Result<Option<ReadPicture>, String> {
         tiff::decoder::DecodingResult::U8(data) => data,
         _ => return Ok(None),
     };
-    let n = (w as usize).checked_mul(h as usize)?;
-    if data.len() < n.checked_mul(step)? {
+    let n = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| "the CMYK TIFF is too large".to_string())?;
+    if data.len() < n
+        .checked_mul(step)
+        .ok_or_else(|| "the CMYK TIFF is too large".to_string())?
+    {
         return Err("the CMYK TIFF is short of its pixels".into());
     }
     let px = data.chunks_exact(step).take(n).map(|px| {
         let a = if step == 5 { px[4] } else { 255 };
         ([px[0], px[1], px[2], px[3]], a)
     });
-    let (rgba, planes) = inks_to_picture(w, h, px)?;
+    let Some((rgba, planes)) = inks_to_picture(w, h, px) else {
+        return Err("the CMYK TIFF did not decode".into());
+    };
     picture_with_planes(rgba, planes).ok_or_else(|| "the CMYK TIFF did not decode".into())
 }
 
@@ -1361,30 +1368,25 @@ mod tests {
             image::Rgb([x as u8, (y * 8) as u8, 128])
         });
         let mut bytes = Vec::new();
-        image::ImageEncoder::write_image(
-            &image::TiffEncoder::new(std::io::Cursor::new(&mut bytes)),
-            img.as_raw(),
-            40,
-            30,
-            image::ExtendedColorType::Rgb8,
-        )
-        .expect("tiff");
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Tiff)
+            .expect("tiff");
         let e = crate::files::decode_picture_within(&bytes, 40 * 30 * 3 - 1)
             .expect_err("the limit");
         assert!(is_memory_limit(&e), "{e}");
-        let read = read_tiff_pixels(&bytes).expect("tiff pixels");
-        assert_eq!(read.dimensions(), (40, 30));
-        assert_eq!(read.get_pixel(10, 20).0, [10, 160, 128, 255]);
+        let got = read_tiff_pixels(&bytes).expect("tiff pixels");
+        assert_eq!(got.dimensions(), (40, 30));
+        assert_eq!(got.get_pixel(10, 20).0, [10, 160, 128, 255]);
         // The whole file still reads as a picture.
-        let read = read(&bytes).expect("read");
-        assert!(read.planes.is_none());
-        assert_eq!(read.rgba.dimensions(), (40, 30));
+        let back = read(&bytes).expect("read");
+        assert!(back.planes.is_none());
+        assert_eq!(back.rgba.dimensions(), (40, 30));
     }
 
     /// A grey 16-bit TIFF through the same fallback, samples to 8 bits.
     #[test]
     fn a_grey16_tiff_at_the_memory_limit_is_read_by_the_tiff_crate() {
-        let img = image::Gray16Image::from_fn(20, 10, |x, _| u16::from(x) * 3000);
+        let img = image::ImageBuffer::from_fn(20, 10, |x, _| image::Luma([u16::from(x) * 3000]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageLuma16(img)
             .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Tiff)
@@ -1392,9 +1394,9 @@ mod tests {
         let e = crate::files::decode_picture_within(&bytes, 20 * 10 * 2 - 1)
             .expect_err("the limit");
         assert!(is_memory_limit(&e), "{e}");
-        let read = read_tiff_pixels(&bytes).expect("tiff pixels");
-        assert_eq!(read.dimensions(), (20, 10));
-        let p = read.get_pixel(5, 0).0;
+        let got = read_tiff_pixels(&bytes).expect("tiff pixels");
+        assert_eq!(got.dimensions(), (20, 10));
+        let p = got.get_pixel(5, 0).0;
         let want = to_u8(u16::from(5) * 3000);
         assert_eq!(p, [want, want, want, 255], "{p:?}");
     }
