@@ -10328,13 +10328,13 @@ fn letters_beyond_u_ffff_round_trip_with_their_runs() {
     }
 }
 
-/// A drawing's symbol instances are saved as groups of the definition's
-/// objects, not as live `sytr`/`symb` records: that layout was checked
-/// only with our own reader and the other program hangs opening a file
-/// that holds it. No live definition is written; opened again, every
-/// instance is an ordinary group where it stood.
+/// A drawing's symbols are saved as symbols (#3250): the definition once
+/// in the document's `LIST sytr` and the table naming it, each instance
+/// a `LIST symb` placing it. Opened again, the symbol is there with its
+/// name and the instances stand where they stood; they used to be
+/// written as groups of the definition's objects.
 #[test]
-fn symbol_instances_are_saved_as_groups_that_open_elsewhere() {
+fn symbols_are_saved_as_symbols_and_their_instances() {
     use tracedraw_core::document::Symbol;
     let mut doc = Document::new("w", Size::new(200.0, 100.0));
     let mut ids = doc.ids().clone();
@@ -10381,12 +10381,24 @@ fn symbol_instances_are_saved_as_groups_that_open_elsewhere() {
         .collect();
     for v in [14, 27] {
         let bytes = document_to_cdr_version(&doc, v);
+        assert!(has_live_symbol_chunks(&bytes), "version {v}");
+        let (catalog, rows) = symbol_tables(&bytes);
+        assert!(catalog, "version {v}: the syst catalog is written");
+        assert_eq!(rows.len(), 3, "version {v}: one sblk row per instance");
+        assert!(rows.iter().all(|r| r[0] == 0), "version {v}: {rows:?}");
+        let instances = symbol_spnds(&bytes, b"symb");
+        let definitions = symbol_spnds(&bytes, b"sytr");
+        assert_eq!(instances.len(), 3, "version {v}");
+        assert_eq!(definitions.len(), 1, "version {v}");
+        let distinct: std::collections::HashSet<u32> = rows.iter().map(|r| r[1]).collect();
+        assert_eq!(distinct.len(), 3, "version {v}: unique instance numbers");
+        for row in &rows {
+            assert!(instances.contains(&row[1]), "version {v}: {row:?}");
+            assert_eq!(row[2], definitions[0], "version {v}: {row:?}");
+        }
         let (back, _) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
-        assert!(back.symbols.is_empty(), "version {v}: no live definition");
-        assert!(
-            !has_live_symbol_chunks(&bytes),
-            "version {v}: no sytr or symb written"
-        );
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
         let shapes: Vec<&Shape> = back
             .pages
             .iter()
@@ -10397,11 +10409,21 @@ fn symbol_instances_are_saved_as_groups_that_open_elsewhere() {
         let mut after: Vec<Rect> = Vec::new();
         for s in &shapes {
             assert!(
-                matches!(s.kind, ShapeKind::Group { .. }),
+                matches!(s.kind, ShapeKind::SymbolInstance { index: 0 }),
                 "version {v}: {:?}",
                 s.kind
             );
-            after.push(s.bounds());
+            let b = s
+                .expand(&back.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn");
+            after.push(b);
         }
         for b in &before {
             assert!(
@@ -10416,17 +10438,16 @@ fn symbol_instances_are_saved_as_groups_that_open_elsewhere() {
 }
 
 /// Symbols made the way Symbolize Similar and New Symbol make them are
-/// saved as groups of the definition's objects, not as live `sytr`/
-/// `symb` records: that layout was checked only with our own reader and
-/// the other program hangs opening a file that holds it. The definition
-/// is a group (its children shifted so a corner sits at the origin), an
-/// instance may carry a label in a group, and an instance may lie
-/// inside a clip frame. No live definition is written; opened again,
-/// every instance is an ordinary group where it stood, the label in its
-/// group is still there, and nothing is skipped.
+/// saved as symbols (#3250): the definition is a group (its children
+/// shifted so a corner sits at the origin), an instance may carry a
+/// label in a group, and an instance may lie inside a clip frame. The
+/// definition's objects are the `sytr` group's own (not a group around
+/// them), and the definition keeps its `usdn` even when the first
+/// instance written is the one in the clip. Opened again, the symbol
+/// and every instance are there where they stood.
 #[test]
-fn symbolize_similar_instances_are_saved_as_groups_that_open_elsewhere() {
-    use tracedraw_core::{symbols, Command};
+fn symbolize_similar_symbols_are_saved_with_their_instances() {
+    use tracedraw_core::{Command, symbols};
     fn part(ids: &mut tracedraw_core::id::IdSource, x: f64, y: f64) -> Shape {
         let mut r = Shape::new(
             ids.shape(),
@@ -10440,7 +10461,12 @@ fn symbolize_similar_instances_are_saved_as_groups_that_open_elsewhere() {
         r.stroke = None;
         r
     }
-    fn group(ids: &mut tracedraw_core::id::IdSource, x: f64, y: f64, extra: Vec<Shape>) -> Shape {
+    fn group(
+        ids: &mut tracedraw_core::id::IdSource,
+        x: f64,
+        y: f64,
+        extra: Vec<Shape>,
+    ) -> Shape {
         let mut children = vec![part(ids, x, y), part(ids, x, y + 20.0)];
         children.extend(extra);
         Shape::new(ids.shape(), ShapeKind::Group { children })
@@ -10516,20 +10542,17 @@ fn symbolize_similar_instances_are_saved_as_groups_that_open_elsewhere() {
         let bytes = document_to_cdr_version(&doc, v);
         let (back, rep) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
         assert_eq!(rep.skipped_objects, 0, "version {v}: {:?}", rep.warnings);
-        assert!(back.symbols.is_empty(), "version {v}: no live definition");
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
         assert!(
-            !has_symbol_instance(&back),
-            "version {v}: every instance is an ordinary shape or group"
+            matches!(
+                back.symbols[0].shape.kind,
+                ShapeKind::Group { .. }
+            ),
+            "version {v}: the definition is the group of its objects"
         );
-        assert!(
-            !has_live_symbol_chunks(&bytes),
-            "version {v}: no sytr or symb written"
-        );
-        let after = group_boxes(&back);
-        assert!(
-            after.len() >= before.len(),
-            "version {v}: a group where each instance stood: {after:?}"
-        );
+        let after = instances_boxes(&back);
+        assert_eq!(after.len(), 4, "version {v}: every instance is back");
         for b in &before {
             assert!(
                 after.iter().any(|a| (a.x0 - b.x0).abs() < 0.05
@@ -10539,11 +10562,25 @@ fn symbolize_similar_instances_are_saved_as_groups_that_open_elsewhere() {
                 "version {v}: {b:?} not among {after:?}"
             );
         }
-        let texts = all_texts(&back);
+        // The definition's objects are the sytr group's own, as the
+        // version 15 file holds them, and the definition keeps its
+        // static id even when the clip's instance was written first.
+        let (_, tree, _) = chunk_ids(&bytes);
+        let mut saw_objects = false;
+        let mut saw_usdn = false;
+        tree.root.walk(&mut |c, _| {
+            if c.is(b"sytr") {
+                if let Some(def) = c.children.iter().find(|g| g.is(b"grp ")) {
+                    saw_objects = def.children.iter().any(|k| k.is(b"obj "));
+                    saw_usdn = def.find(b"usdn").is_some();
+                }
+            }
+        });
         assert!(
-            texts.iter().any(|t| t == "Label"),
-            "version {v}: the label is still there: {texts:?}"
+            saw_objects,
+            "version {v}: the sytr group holds the definition's objects"
         );
+        assert!(saw_usdn, "version {v}: the sytr group has its usdn");
     }
 }
 
@@ -10676,6 +10713,59 @@ fn has_live_symbol_chunks(bytes: &[u8]) -> bool {
         }
     });
     live
+}
+
+/// The document's `syst` catalog and its `sblk` rows. In a file the other
+/// program reads, each row is (0, instance `spnd`, definition `spnd`), one
+/// for every instance, and the catalog names the definitions (#4036).
+fn symbol_tables(bytes: &[u8]) -> (bool, Vec<[u32; 3]>) {
+    let (_, tree, main) = chunk_ids(bytes);
+    let mut catalog = false;
+    let mut rows = Vec::new();
+    tree.root.walk(&mut |c, _| {
+        if c.is(b"syst") {
+            catalog = true;
+        }
+        if c.is(b"sblk") {
+            let d = tree.data(&main, c);
+            for r in d.chunks_exact(12) {
+                let word = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap_or([0; 4]));
+                rows.push([word(0), word(4), word(8)]);
+            }
+        }
+    });
+    (catalog, rows)
+}
+
+/// The `spnd` numbers of the `sytr` definitions or `symb` instances of a
+/// written file.
+fn symbol_spnds(bytes: &[u8], list: &[u8; 4]) -> Vec<u32> {
+    let (_, tree, main) = chunk_ids(bytes);
+    let mut out = Vec::new();
+    tree.root.walk(&mut |c, _| {
+        if !c.is(list) {
+            return;
+        }
+        let groups: Vec<_> = if list == b"sytr" {
+            c.children.iter().filter(|k| k.is(b"grp ")).collect()
+        } else {
+            Vec::new()
+        };
+        let nodes: Vec<_> = if groups.is_empty() {
+            vec![c]
+        } else {
+            groups
+        };
+        for node in nodes {
+            if let Some(sp) = node.find(b"spnd") {
+                let d = tree.data(&main, sp);
+                if d.len() >= 4 {
+                    out.push(u32::from_le_bytes([d[0], d[1], d[2], d[3]]));
+                }
+            }
+        }
+    });
+    out
 }
 
 /// The document palette with its names, the spot inks, the colour styles

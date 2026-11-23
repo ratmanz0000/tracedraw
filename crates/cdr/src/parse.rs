@@ -11192,7 +11192,7 @@ pub(crate) mod tests {
         let ink: Vec<u8> = (0..100u8).map(|i| i | 1).collect();
         bmp.splice(40..40, ink);
         bmp[20..24].copy_from_slice(&(32u32 + 100).to_le_bytes());
-        match decode_bitmap(&bmp, 20, None) {
+        match decode_bitmap(&bmp, 20, None, 1.0) {
             Some(Ok((id, def))) => {
                 assert_eq!(id, 34);
                 assert_eq!((def.width_px, def.height_px), (2, 2));

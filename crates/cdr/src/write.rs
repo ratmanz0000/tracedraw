@@ -750,6 +750,34 @@ fn guid(seed: u64, n: u64) -> [u8; 16] {
     out
 }
 
+/// The u32 the version 15 file holds at byte 0 of `ARG_SYMBOL` and byte
+/// 1560 of `syms`, the same in all 13 of its symbols: a library marker,
+/// not an id per symbol (#4036).
+const SYMBOL_MARKER: u32 = 0x5973_93de;
+
+/// The id a symbol carries in its definition (`ARG_SYMBOL`): stable for
+/// the same symbol in one drawing.
+fn symbol_id(seed: u64, index: usize) -> [u8; 16] {
+    guid(seed, 0x8000_0000_0000_0000 | index as u64)
+}
+
+/// The tiny 24-bit device-independent bitmap of a symbol's preview for
+/// its `symi` record. A symbol drawn from scratch has no rendered
+/// thumbnail here; a valid one-pixel picture keeps the catalog readable.
+fn symbol_thumbnail() -> Vec<u8> {
+    let mut b = Vec::with_capacity(44);
+    for word in [40u32, 1, 1] {
+        b.extend_from_slice(&word.to_le_bytes());
+    }
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    for word in [0u32, 4, 0, 0, 0, 0] {
+        b.extend_from_slice(&word.to_le_bytes());
+    }
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b
+}
+
 // ---- chunk tree --------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -4131,6 +4159,10 @@ struct Writer<'a> {
     symbol_groups: Vec<Node>,
     symbol_numbers: HashMap<usize, (u32, Rect)>,
     symbols_writing: Vec<usize>,
+    /// The `sblk` rows of the instances written: (instance `spnd`, the
+    /// `spnd` of its definition). A real file has one row per instance,
+    /// with distinct numbers, not one row per definition (#4036).
+    symbol_links: Vec<(u32, u32)>,
     /// The faces the text uses, with their font files (see
     /// [`Previews::fonts`]), and what [`fonts::split_family`] said for
     /// each family named with a weight.
@@ -4275,6 +4307,7 @@ impl<'a> Writer<'a> {
             symbol_groups: Vec::new(),
             symbol_numbers: HashMap::new(),
             symbols_writing: Vec::new(),
+            symbol_links: Vec::new(),
             next_object: 1,
             graded: std::collections::HashMap::new(),
             next_fill: 1,
@@ -4543,6 +4576,9 @@ impl<'a> Writer<'a> {
             out.push(chunk(b"fver", fver.done()));
         }
         out.push(chunk(b"vrsn", (v.0 * 100).to_le_bytes().to_vec()));
+        if !self.symbol_groups.is_empty() {
+            out.push(self.symbol_catalog());
+        }
         if !self.bitmaps.is_empty() {
             let bmps = std::mem::take(&mut self.bitmaps)
                 .into_iter()
@@ -4624,6 +4660,20 @@ impl<'a> Writer<'a> {
             }
             docl.push(list(b"fntt", fonts));
         }
+        // The table naming each instance's `spnd` and the `spnd` of its
+        // definition, as the version 15 file holds it: after `fntt` and
+        // before the fills, one row per instance (#4036).
+        if !self.symbol_links.is_empty() {
+            let mut links = std::mem::take(&mut self.symbol_links);
+            links.sort_unstable();
+            let mut table = Vec::with_capacity(links.len() * 12);
+            for (instance, definition) in links {
+                table.extend_from_slice(&0u32.to_le_bytes());
+                table.extend_from_slice(&instance.to_le_bytes());
+                table.extend_from_slice(&definition.to_le_bytes());
+            }
+            docl.push(chunk(b"sblk", table));
+        }
         // Every object refers to a fill and an outline, and the styles to
         // the fills of text (black) and graphics (none) and to no outline.
         let uses = StyleUses {
@@ -4657,20 +4707,11 @@ impl<'a> Writer<'a> {
         if !self.clip_groups.is_empty() {
             docl.push(list(b"clpt", std::mem::take(&mut self.clip_groups)));
         }
-        // The symbols' definitions and the table naming each symbol's
-        // group (#3250): entries of a zero, the symbol's number and its
-        // group's `spnd` (the same number here), as the reader takes them.
+        // The symbols' definitions (#3250), after the style table as the
+        // version 15 file holds them. The `sblk` table of their instances
+        // is written just after `fntt`.
         if !self.symbol_groups.is_empty() {
             docl.push(list(b"sytr", std::mem::take(&mut self.symbol_groups)));
-            let mut numbers: Vec<u32> = self.symbol_numbers.values().map(|(n, _)| *n).collect();
-            numbers.sort_unstable();
-            let mut table = Vec::with_capacity(numbers.len() * 12);
-            for n in numbers {
-                table.extend_from_slice(&0u32.to_le_bytes());
-                table.extend_from_slice(&n.to_le_bytes());
-                table.extend_from_slice(&n.to_le_bytes());
-            }
-            docl.push(chunk(b"sblk", table));
         }
         if !v.zip() {
             // RIFF files (before version 14) end the document tables
@@ -5437,6 +5478,35 @@ impl<'a> Writer<'a> {
         Placed { nodes, bounds }
     }
 
+    /// The document's `LIST syst` catalog: one `syse` per definition,
+    /// with its `syms` name and identifier and a small `symi` preview.
+    /// The version 15 file the layout comes from has the catalog before
+    /// the document's tables; without it the other program has no symbol
+    /// to attach the `symb` records to (#4036).
+    fn symbol_catalog(&self) -> Node {
+        let entries: Vec<Node> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.symbol_numbers.contains_key(i))
+            .map(|(_, s)| {
+                let mut syms = vec![0u8; 8];
+                syms[..4].copy_from_slice(&1u32.to_le_bytes());
+                for u in s.name.encode_utf16().take(255).chain([0]) {
+                    syms.extend_from_slice(&u.to_le_bytes());
+                }
+                syms.resize(1560, 0);
+                syms.extend_from_slice(&SYMBOL_MARKER.to_le_bytes());
+                syms.resize(1580, 0);
+                list(
+                    b"syse",
+                    vec![chunk(b"syms", syms), chunk(b"symi", symbol_thumbnail())],
+                )
+            })
+            .collect();
+        list(b"syst", vec![cmpr(&entries)])
+    }
+
     /// The number of symbol `index` (#3250), its definition written
     /// into the document's `LIST sytr` the first time: a group numbered
     /// by its `spnd`, the symbol's name in argument 19201 (a UTF-16 name
@@ -5488,7 +5558,17 @@ impl<'a> Writer<'a> {
         };
         let number = self.next_spnd;
         self.next_spnd += 1;
-        let mut record = vec![0u8; 548];
+        // The identifiers of the version 15 file seen: a u32 at byte 520
+        // (repeated in the symbol's `syms` record) and a 16-byte id at
+        // byte 528, the name at 548. A zero-filled head is not a symbol
+        // registration the other program can follow (#4036).
+        let id = symbol_id(self.guid_seed, index);
+        let mut record = vec![0u8; 520];
+        record[..4].copy_from_slice(&1u32.to_le_bytes());
+        record.extend_from_slice(&SYMBOL_MARKER.to_le_bytes());
+        record.resize(528, 0);
+        record.extend_from_slice(&id);
+        record.resize(548, 0);
         for u in name.encode_utf16().take(255).chain([0]) {
             record.extend_from_slice(&u.to_le_bytes());
         }
@@ -5521,7 +5601,13 @@ impl<'a> Writer<'a> {
         centre: Point,
         depth: usize,
     ) -> Option<Placed> {
-        let (number, def_box) = self.symbol_number(index, centre, depth)?;
+        let (definition, def_box) = self.symbol_number(index, centre, depth)?;
+        // An instance has a `spnd` of its own. The document's `sblk` maps
+        // that number to the definition's; in a real file no two records
+        // share one, and one row is written for every instance (#4036).
+        let number = self.next_spnd;
+        self.next_spnd += 1;
+        self.symbol_links.push((number, definition));
         let to_file = Affine::translate(-centre.to_vec2());
         let own = to_file * s.transform * to_file.inverse();
         let b = s.transform.transform_rect_bbox(def_box);
@@ -6267,13 +6353,21 @@ impl<'a> Writer<'a> {
                     .collect();
                 return self.group(&kids, s.name.as_deref(), centre, depth);
             }
-            // Live sytr/symb records are written from the layout of one
-            // version 15 file, checked only with our own reader: the
-            // other program hangs on a file that holds them. Write every
-            // instance as the group of the definition's objects, as
-            // before #3250, so such files open there. The reader still
-            // takes live symbols from files we are given.
-            ShapeKind::SymbolInstance { .. } => {
+            ShapeKind::SymbolInstance { index } if v.zip() && s.effects.is_empty() => {
+                if let Some(placed) = self.symbol_instance(s, *index, centre, depth) {
+                    return placed;
+                }
+                let kids: Vec<Shape> = s
+                    .expand(self.symbols)
+                    .into_iter()
+                    .map(|mut c| {
+                        c.absorb(s.transform);
+                        c
+                    })
+                    .collect();
+                return self.group(&kids, s.name.as_deref(), centre, depth);
+            }
+            ShapeKind::Table(_) | ShapeKind::SymbolInstance { .. } => {
                 let kids: Vec<Shape> = s
                     .expand(self.symbols)
                     .into_iter()
