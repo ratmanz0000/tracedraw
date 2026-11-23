@@ -26,7 +26,7 @@ default = []
 # The window on wgpu (Direct3D 12, Vulkan, Metal) and GPU shadow blur.
 # Desktop default is OpenGL (glow): the page is CPU tiny-skia, the past
 # frame is a GPU quad. Android always draws with wgpu (the activity).
-gpu = ["eframe/wgpu", "dep:pollster"]
+gpu = ["eframe/wgpu"]
 
 [dependencies]
 tracedraw-core.workspace = true
@@ -91,7 +91,7 @@ rfd.workspace = true
 # The window drawn with OpenGL (glow). wgpu is the optional `gpu`
 # feature: the graphics card chosen in Options, or its software adapter
 # (#445, #439), and GPU shadow blur.
-pollster = { version = "0.4", optional = true }
+pollster = "0.4"
 # AI Drawing: HTTPS requests to the AI service the user sets up.
 ureq = { version = "3", features = ["platform-verifier"] }
 # Lossy WebP export (libwebp, BSD licence): the pure-Rust encoder writes
