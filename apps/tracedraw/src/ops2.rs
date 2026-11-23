@@ -3460,6 +3460,12 @@ impl App {
                     _ => Default::default(),
                 },
             };
+            // Editing a text puts the properties docker into its text
+            // mode, as the property panel does for the object being
+            // edited, with the character section open.
+            self.show_dockers = true;
+            self.docker_tab = crate::app::DockerTab::Properties;
+            self.settings.properties_closed.retain(|s| s != "character");
         }
     }
 
@@ -10511,6 +10517,16 @@ mod text_dialog_tests {
             .expect("text");
         app.select(vec![id]);
         app.open_edit_text_dialog();
+        assert!(app.show_dockers, "the properties docker is shown");
+        assert_eq!(
+            app.docker_tab,
+            crate::app::DockerTab::Properties,
+            "the docker follows the text being edited"
+        );
+        assert!(
+            !app.settings.properties_closed.iter().any(|s| s == "character"),
+            "the character section is open"
+        );
         let Dialog::EditText { shape, text, .. } = &app.dialog else {
             panic!("no dialog: {:?}", std::mem::discriminant(&app.dialog));
         };

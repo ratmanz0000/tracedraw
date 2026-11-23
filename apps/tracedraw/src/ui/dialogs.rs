@@ -11483,6 +11483,49 @@ fn edit_text_box(
                     }
                 });
             }
+            // The character outline beside the other character settings,
+            // as the property bar of the text being edited has it.
+            ui.separator();
+            let outline = first.outline.clone().filter(|o| o.width > 0.0);
+            let mut pt = outline.as_ref().map_or(0.0, |o| o.width * 72.0 / 25.4);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut pt)
+                        .range(0.0..=40.0)
+                        .speed(0.05)
+                        .max_decimals(2)
+                        .suffix(" pt"),
+                )
+                .on_hover_text(tr("docker.text_outline_width_desc"))
+                .changed()
+            {
+                let mm = pt * 25.4 / 72.0;
+                spans_apply(spans, from, to, |s| {
+                    let mut st = s
+                        .outline
+                        .clone()
+                        .filter(|o| o.width > 0.0)
+                        .unwrap_or_else(|| {
+                            tracedraw_core::Stroke::new(app.current_colors.1, 0.2)
+                        });
+                    st.width = mm;
+                    s.outline = Some(st);
+                });
+            }
+            let mut color = outline.as_ref().map_or(app.current_colors.1, |o| o.color);
+            if crate::ui::color_picker::color_button(ui, &mut color) {
+                spans_apply(spans, from, to, |s| {
+                    let mut st = s
+                        .outline
+                        .clone()
+                        .filter(|o| o.width > 0.0)
+                        .unwrap_or_else(|| {
+                            tracedraw_core::Stroke::new(app.current_colors.1, 0.2)
+                        });
+                    st.color = color;
+                    s.outline = Some(st);
+                });
+            }
         });
     }
     // The second row (#3270): the text's alignment, the case of the

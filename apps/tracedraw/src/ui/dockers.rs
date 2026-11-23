@@ -2237,6 +2237,30 @@ fn properties(app: &mut App, ui: &mut Ui) {
                             u.short(),
                             styles
                         ));
+                        let outline = sp.outline.clone().filter(|o| o.width > 0.0);
+                        let mut pt = outline.as_ref().map_or(0.0, |o| o.width * 72.0 / 25.4);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut pt)
+                                    .range(0.0..=40.0)
+                                    .speed(0.05)
+                                    .max_decimals(2)
+                                    .suffix(" pt"),
+                            )
+                            .on_hover_text(tr("docker.text_outline_width_desc"))
+                            .changed()
+                        {
+                            let mm = pt * 25.4 / 72.0;
+                            if app.text_selection_active() || app.chosen_chars_active() {
+                                app.text_apply_outline_width(mm);
+                            } else {
+                                app.apply_outline_width(mm);
+                            }
+                        }
+                        let mut color = outline.as_ref().map_or(app.current_colors.1, |o| o.color);
+                        if crate::ui::color_picker::color_button(ui, &mut color) {
+                            app.apply_outline_color(Some(color));
+                        }
                     }
                     ui.label(
                         egui::RichText::new(tr("docker.edit_with_text_tool"))
