@@ -2097,6 +2097,11 @@ pub struct App {
     /// while it is one of the current page's layers or a master layer
     /// showing on it, visible and unlocked (see [`App::active_layer`]).
     pub picked_layer: Option<LayerId>,
+    /// The layers picked in the Objects docker with Ctrl or Shift
+    /// (#3966): the eye, printer, padlock, Delete and the layer menu
+    /// then act on all of them together. Empty means only
+    /// [`App::picked_layer`] is picked.
+    pub selected_layers: Vec<LayerId>,
     pub navigator_tex: Option<egui::TextureHandle>,
     pub options_label_index: usize,
     pub options_current_only: bool,
@@ -3720,6 +3725,7 @@ impl App {
             symbol_filter: String::new(),
             objects_master_closed: false,
             picked_layer: None,
+            selected_layers: Vec::new(),
             navigator_tex: None,
             options_label_index: 0,
             options_current_only: false,
@@ -6640,6 +6646,8 @@ impl App {
             if !locked.is_empty() {
                 ids.retain(|id| !locked.contains(id));
             }
+            // Objects picked on the canvas: a layer selection is let go.
+            self.selected_layers.clear();
         }
         self.selection = ids;
         self.shadow_picked = None;
@@ -11630,6 +11638,7 @@ impl App {
             self.page = p.id;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11660,6 +11669,7 @@ impl App {
         };
         self.page = new;
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11780,6 +11790,7 @@ impl App {
             self.page = p.id;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11811,6 +11822,7 @@ impl App {
             self.page = p;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11877,6 +11889,7 @@ impl App {
         }
         self.page = new;
         self.selection.clear();
+        self.selected_layers.clear();
         match self.page_views.get(&new) {
             Some(v) => self.view = *v,
             None => self.centre_page_at_zoom(),
