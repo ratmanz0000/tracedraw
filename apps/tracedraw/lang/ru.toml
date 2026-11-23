@@ -10900,6 +10900,8 @@ docker.replace_pick = "Выберите целевой символ или на�
 
 docker.rename_symbol_tip = "Двойной клик по имени — переименовать символ."
 
+docker.inline_rename_tip = "Enter или щелчок в другом месте сохраняет новое имя, Escape отменяет."
+
 docker.gk42 = "ГК-42"
 toolbar.gk42 = "Калибровка ГК-42"
 gk42.place_points = "Выставить точки"

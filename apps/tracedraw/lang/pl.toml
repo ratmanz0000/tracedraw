@@ -10900,6 +10900,8 @@ docker.replace_pick = "Wybierz symbol docelowy lub Esc, aby anulować." # mt
 
 docker.rename_symbol_tip = "Kliknij dwukrotnie nazwę, aby zmienić nazwę symbolu." # mt
 
+docker.inline_rename_tip = "Enter lub kliknięcie gdzie indziej zachowuje nową nazwę, Escape anuluje."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "Kalibracja GK-42"
 toolbar.gk42_desc = "Wiąże milimetry arkusza z prawdziwymi metrami GK-42 za pomocą trzech znaczników odniesienia; kliknięcia na arkuszu je umieszczają i pobierają punkty."

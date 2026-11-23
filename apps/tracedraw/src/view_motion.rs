@@ -140,7 +140,7 @@ impl ZoomGlide {
         };
         let share = 1.0 - 0.1f32.powf(dt / glide);
         let mut d = self.left * share;
-        if (self.left - d).abs() < 1e-4 {
+        if (self.left - d).abs() < 1.5e-3 {
             d = self.left;
         }
         self.left -= d;

@@ -10900,6 +10900,8 @@ docker.replace_pick = "対象シンボルを選択するか、Esc でキャン�
 
 docker.rename_symbol_tip = "名前をダブルクリックでシンボル名を変更。" # mt
 
+docker.inline_rename_tip = "Enter または他の場所のクリックで新しい名前を確定し、Escape でキャンセルします。"
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42 キャリブレーション"
 toolbar.gk42_desc = "3 つの基準マーカーでシートのミリメートルを実際の GK-42 メートルに結び付けます。シートをクリックしてマーカーを置き、点を取得します。"

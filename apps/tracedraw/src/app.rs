@@ -1092,6 +1092,16 @@ impl App {
     }
 }
 
+/// What the Objects docker renames in place: a page, a layer or an
+/// object (a group among them). A double click on the row's name starts
+/// the edit, held as [`App::inline_rename`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenameTarget {
+    Page(PageId),
+    Layer(LayerId),
+    Shape(ShapeId),
+}
+
 /// The text fields of the property bar as read from a text object (see
 /// [`App::text_shown`]). A field set to `None` was picked again by hand
 /// (the font list, the size list), so it goes to every selected text even
@@ -2047,6 +2057,13 @@ pub struct App {
     pub symbol_pick_rev: u64,
     /// The symbol name being edited inline: (index, draft text).
     pub symbol_rename: Option<(usize, String)>,
+    /// The page, layer or object name being typed in place in the Objects
+    /// docker: the target and the draft text. `inline_rename_rev` is the
+    /// drawing revision when the edit began; a change under the edit
+    /// (undo, redo) drops it, so it cannot rename the wrong page, layer
+    /// or object (the same guard as `symbol_pick_rev` / `symbol_rename`).
+    pub inline_rename: Option<(RenameTarget, String)>,
+    pub inline_rename_rev: u64,
     /// The Symbols list's search text.
     pub symbol_filter: String,
     /// When `autosave_settings` last wrote the preferences, and the
@@ -3641,6 +3658,8 @@ impl App {
             symbol_replace_source: None,
             symbol_pick_rev: 0,
             symbol_rename: None,
+            inline_rename: None,
+            inline_rename_rev: 0,
             symbol_filter: String::new(),
             objects_master_closed: false,
             picked_layer: None,
@@ -6318,6 +6337,23 @@ impl App {
             Some(own) => own.own_visual_bounds(),
             None => s.own_visual_bounds(),
         }
+    }
+
+    /// The draft text of the inline rename of `target` in the Objects
+    /// docker, when that is the row being edited.
+    pub fn inline_rename_of(&self, target: RenameTarget) -> Option<String> {
+        self.inline_rename
+            .as_ref()
+            .filter(|(t, _)| *t == target)
+            .map(|(_, s)| s.clone())
+    }
+
+    /// Start renaming `target` from `name` in place: the drawing revision
+    /// is taken now, so undo, redo or any other change drops the edit
+    /// instead of renaming whatever that id then points at.
+    pub fn start_inline_rename(&mut self, target: RenameTarget, name: String) {
+        self.inline_rename = Some((target, name));
+        self.inline_rename_rev = self.engine.revision();
     }
 
     pub fn run(&mut self, cmd: Command) {

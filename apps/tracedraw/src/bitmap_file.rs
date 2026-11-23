@@ -222,6 +222,9 @@ pub struct ReadPicture {
     pub planes: Option<Vec<u8>>,
     /// The colour mode the file stores its pixels in (#3025).
     pub mode: FileMode,
+    /// The JPEG was decoded straight to these pixels, so its bytes can
+    /// stand for them and no second decode is needed to check.
+    pub from_jpeg: bool,
 }
 
 impl ReadPicture {
@@ -257,6 +260,9 @@ pub fn read(bytes: &[u8]) -> Result<ReadPicture, String> {
     if let Some(p) = read_lab_tiff(bytes) {
         return Ok(p);
     }
+    if let Some(p) = read_jpeg_direct(bytes) {
+        return Ok(p);
+    }
     let rgba = crate::files::decode_picture(bytes)
         .map_err(|e| e.to_string())?
         .into_rgba8();
@@ -264,6 +270,116 @@ pub fn read(bytes: &[u8]) -> Result<ReadPicture, String> {
         rgba,
         planes: None,
         mode: file_mode(bytes),
+        from_jpeg: false,
+    })
+}
+
+/// A PNG kept byte for byte, as (width, height), when the drawing can
+/// store the file itself instead of what a decoder makes of it: the
+/// signature and every chunk parse and their CRCs match, and no EXIF
+/// orientation asks the pixels to move. A Lab picture (whose pixels the
+/// drawing cannot draw as stored) and one over the decoder's own limit
+/// fall back to the general reader.
+pub fn kept_png(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    if crate::bitmap_fx::png_is_lab(bytes) {
+        return None;
+    }
+    if crate::files::picture_needs_transform(bytes) {
+        return None;
+    }
+    const IHDR: &[u8; 4] = b"IHDR";
+    const IDAT: &[u8; 4] = b"IDAT";
+    const IEND: &[u8; 4] = b"IEND";
+    let mut at = 8usize;
+    let mut size = None;
+    let mut seen_idat = false;
+    let mut seen_iend = false;
+    while at.checked_add(12)? <= bytes.len() {
+        let len = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        let kind: &[u8; 4] = bytes.get(at + 4..at + 8)?.try_into().ok()?;
+        let data_end = at.checked_add(8)?.checked_add(len)?;
+        let crc_end = data_end.checked_add(4)?;
+        if crc_end > bytes.len() {
+            return None;
+        }
+        let stored = u32::from_be_bytes(bytes.get(data_end..crc_end)?.try_into().ok()?);
+        if png_crc32(bytes.get(at + 4..data_end)?) != stored {
+            return None;
+        }
+        match kind {
+            IHDR => {
+                if size.is_some() {
+                    return None;
+                }
+                let w = u32::from_be_bytes(bytes.get(at + 8..at + 12)?.try_into().ok()?);
+                let h = u32::from_be_bytes(bytes.get(at + 12..at + 16)?.try_into().ok()?);
+                if w == 0 || h == 0 {
+                    return None;
+                }
+                if u64::from(w) * u64::from(h) > tracedraw_io::pdf_import::FULL_PICTURE_PIXELS {
+                    return None;
+                }
+                size = Some((w, h));
+            }
+            IDAT => seen_idat = true,
+            IEND => {
+                seen_iend = true;
+                break;
+            }
+            _ => {}
+        }
+        at = crc_end;
+    }
+    let size = size?;
+    if !seen_idat || !seen_iend {
+        return None;
+    }
+    Some(size)
+}
+
+/// The CRC-32 of PNG chunks (IEEE 802.3, the polynomial PNG uses).
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *slot = c;
+    }
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// A JPEG decoded straight to the pixels it stores, when nothing has to
+/// move: the drawing then keeps the file's bytes as the source instead
+/// of decoding twice. CMYK goes through the ink readers above; a file
+/// whose orientation asks the pixels to move goes the general way.
+fn read_jpeg_direct(bytes: &[u8]) -> Option<ReadPicture> {
+    if !tracedraw_core::jpeg_source::is_jpeg(bytes) {
+        return None;
+    }
+    if crate::files::picture_needs_transform(bytes) {
+        return None;
+    }
+    let (w, h, px) = tracedraw_core::jpeg_source::decode_rgba(bytes)?;
+    let rgba = image::RgbaImage::from_raw(w, h, px)?;
+    let mode = if jpeg_components(bytes) == Some(1) {
+        FileMode::Gray
+    } else {
+        FileMode::Rgb
+    };
+    Some(ReadPicture {
+        rgba,
+        planes: None,
+        mode,
+        from_jpeg: true,
     })
 }
 
@@ -543,6 +659,7 @@ fn read_palette_tiff(bytes: &[u8]) -> Option<ReadPicture> {
         rgba,
         planes: None,
         mode: FileMode::Indexed,
+        from_jpeg: false,
     })
 }
 
@@ -679,6 +796,7 @@ fn read_lab_tiff(bytes: &[u8]) -> Option<ReadPicture> {
         rgba,
         planes: None,
         mode: FileMode::Lab,
+        from_jpeg: false,
     })
 }
 
@@ -771,6 +889,7 @@ fn picture_with_planes(rgba: image::RgbaImage, planes: image::GrayImage) -> Opti
         rgba,
         planes: Some(png.into_inner()),
         mode: FileMode::Rgb,
+        from_jpeg: false,
     })
 }
 
@@ -2020,6 +2139,52 @@ mod tests {
         let cmyk = include_bytes!("../testdata/progressive-cmyk.jpg");
         let s = imported(&mut app, &d, "progressive-cmyk.jpg", cmyk);
         assert!(s.cmyk_bitmap && s.picture_inks.is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A plain PNG is stored as the file's own bytes, byte for byte, so a
+    /// large import never decodes and re-encodes. A byte flipped inside
+    /// the picture data breaks the CRC of its chunk, and the file is not
+    /// kept: it goes the general way and fails to read.
+    #[test]
+    fn a_plain_png_is_kept_byte_for_byte() {
+        let d = dir("kept-png");
+        let bytes = image::RgbaImage::from_fn(37, 23, |x, y| {
+            image::Rgba([
+                (x * 7) as u8,
+                (y * 11) as u8,
+                (x + y) as u8,
+                if x < 10 { 120 } else { 255 },
+            ])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(
+                bytes.as_raw(),
+                bytes.width(),
+                bytes.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode");
+        let bytes = out.into_inner();
+        assert_eq!(super::kept_png(&bytes), Some((37, 23)));
+        // Flip one byte inside IDAT: the chunk CRC no longer matches.
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"IDAT")
+            .expect("an IDAT chunk");
+        let mut bad = bytes.clone();
+        bad[at + 6] ^= 0x40;
+        assert_eq!(super::kept_png(&bad), None);
+        assert!(super::read(&bad).is_err(), "a corrupt PNG is not read");
+        // Imported, the drawing keeps the file as it is.
+        let path = d.join("kept.png");
+        std::fs::write(&path, &bytes).expect("write");
+        let mut app = App::headless();
+        app.import_bitmap(&path);
+        let id = app.selection[0];
+        assert_eq!(png_of(&app, id), bytes, "the file is kept as it is");
         let _ = std::fs::remove_dir_all(&d);
     }
 

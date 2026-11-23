@@ -1169,6 +1169,38 @@ impl App {
                 return;
             }
         };
+        // A PNG kept byte for byte: no decode and no re-encode, whatever
+        // its size; the thumbnails and the renderer read the same bytes.
+        // Everything a picture needs to land on the page is read from
+        // the header (a picture whose orientation asks the pixels to
+        // move, or a Lab picture, goes the general way).
+        if let Some((w, h)) = crate::bitmap_file::kept_png(&bytes) {
+            // A picture dragged in from another program (#2349) lies in a
+            // file of the drag's own: no name and no link to it.
+            let dropped = is_dropped_picture(path);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .filter(|_| !dropped);
+            // Kept files never need a turn: the dpi is read as stored.
+            let dpi = crate::image_dpi::resolution(&bytes);
+            let placed = self.place_png_at(bytes, w, h, name, dpi);
+            let Some(id) = placed else {
+                return;
+            };
+            // Remember where it came from: Image > Update from Link
+            // re-reads it. Options > Global > File Formats can embed it
+            // only (#3089).
+            if !dropped && self.settings.formats.import_link_pictures {
+                self.run(Command::SetObjectData {
+                    shape: id,
+                    data: vec![("bitmap.link".into(), path.display().to_string())],
+                });
+            }
+            self.select(vec![id]);
+            return;
+        }
         // Print-size pictures too (#2000); a CMYK JPEG or TIFF keeps its
         // inks and shows them as the drawing's CMYK colours show (#2163).
         let picture = match crate::bitmap_file::read(&bytes) {
@@ -1199,12 +1231,13 @@ impl App {
             }
         });
         let planes = picture.planes;
-        // A JPEG whose pixels are the picture's (not turned by its Exif
-        // orientation, not CMYK) is kept, so a packed .tdraw saves the
-        // JPEG instead of a PNG two to three times its size (#2849).
+        // A JPEG whose pixels came straight from the file (not turned by
+        // its Exif orientation, not CMYK) is kept, so a packed .tdraw
+        // saves the JPEG instead of a PNG two to three times its size
+        // (#2849). There is nothing to check: it was decoded once, to
+        // these very pixels.
         let (w, h) = picture.rgba.dimensions();
-        let keep_jpeg = planes.is_none()
-            && tracedraw_core::jpeg_source::decodes_to(&bytes, w, h, picture.rgba.as_raw());
+        let keep_jpeg = planes.is_none() && picture.from_jpeg;
         // A 1-bit, grayscale or indexed file keeps its colour mode; all
         // came in as RGB (#3025).
         let placed = if planes.is_none() && picture.mode != crate::bitmap_file::FileMode::Rgb {

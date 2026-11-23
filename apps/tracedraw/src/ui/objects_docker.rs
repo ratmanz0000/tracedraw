@@ -18,7 +18,7 @@
 //! the page's layers, #1132), shows all pages or the current one, and
 //! deletes the selected objects or, with none, the active layer.
 
-use crate::app::App;
+use crate::app::{App, RenameTarget};
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
 use crate::ui::dockers::kind_name;
@@ -64,6 +64,12 @@ struct Actions {
     rename_layer: Option<(LayerId, String)>,
     rename_object: Option<(ShapeId, String)>,
     rename_page: Option<String>,
+    /// A double click started renaming this page, layer or object in
+    /// place: the target and the name the field starts from.
+    inline_start: Option<(RenameTarget, String)>,
+    /// The row whose name is being renamed in place, and the rectangle
+    /// the field takes (the name's place in the row).
+    inline_field: Option<(RenameTarget, Rect)>,
     delete_layer: Option<LayerId>,
     reorder: Option<(LayerId, usize)>,
     /// Each object row drawn and where, and each layer row
@@ -649,6 +655,14 @@ fn scroll_target(app: &App, ui: &Ui) -> Option<ShapeId> {
 /// The tree: the pages and their layers (all of them, or the current
 /// one), then the Master Page.
 pub fn objects(app: &mut App, ui: &mut Ui) {
+    // An inline rename holds a page, layer or object id; once the drawing
+    // changes under it (undo, redo) the id may point at another one, so
+    // drop it rather than act on the wrong one (as `symbol_pick_rev` does
+    // for the Symbols docker).
+    if app.inline_rename_rev != app.engine.revision() {
+        app.inline_rename = None;
+        app.inline_rename_rev = app.engine.revision();
+    }
     let mut act = Actions {
         scroll_to: scroll_target(app, ui),
         thumbs: std::mem::take(&mut app.object_thumbs),
@@ -675,23 +689,30 @@ pub fn objects(app: &mut App, ui: &mut Ui) {
             let current = page.id == app.page;
             let page_open = !app.objects_closed_pages.contains(&page.id);
             let (toggle, resp) = node_row(
+                app,
                 ui,
                 ("objects_page", page.id.raw()),
                 &page.name,
                 page_open,
                 false,
                 current || !all,
+                Some(RenameTarget::Page(page.id)),
+                &mut act,
             );
             if toggle {
                 act.toggle_page = Some(page.id);
             }
-            // Double-click (or the context menu) renames the page.
-            if resp.double_clicked() {
-                act.rename_page = Some(page.name.clone());
-                if !current {
-                    act.goto = Some(page.id);
-                }
-            }
+            // A double click renames the page in place (started in
+            // [`node_row`]); the row's menu still opens the Rename...
+            // window.
+            #[cfg(test)]
+            ui.ctx().data_mut(|d| {
+                let id = egui::Id::new("objects_page_rows_drawn");
+                let mut rows = d.get_temp::<Vec<(PageId, Rect)>>(id).unwrap_or_default();
+                rows.retain(|(p, _)| *p != page.id);
+                rows.push((page.id, resp.rect));
+                d.insert_temp(id, rows);
+            });
             resp.context_menu(|ui| {
                 if !current && ui.button(tr("docker.go_to_page")).clicked() {
                     act.goto = Some(page.id);
@@ -735,12 +756,15 @@ pub fn objects(app: &mut App, ui: &mut Ui) {
         let master_open = !app.objects_master_closed;
         if needle.is_empty() || master_hit {
             act.toggle_master = node_row(
+                app,
                 ui,
                 "objects_master",
                 &tr("docker.master_page"),
                 master_open,
                 true,
                 true,
+                None,
+                &mut act,
             )
             .0;
         }
@@ -768,6 +792,12 @@ pub fn objects(app: &mut App, ui: &mut Ui) {
             }
         }
     }
+    // A double click on a page, layer or object started an inline rename:
+    // the field is drawn over that row's name this frame.
+    if let Some((target, name)) = act.inline_start.take() {
+        app.start_inline_rename(target, name);
+    }
+    inline_rename_field(app, ui, &mut act);
     let mut thumbs = std::mem::take(&mut act.thumbs);
     thumbs.trim(crate::object_thumbs::MAX_BYTES);
     if thumbs.waiting {
@@ -780,13 +810,18 @@ pub fn objects(app: &mut App, ui: &mut Ui) {
 
 /// The page or Master Page node: an arrow, the page icon and the title in
 /// bold. True when clicked (to open or close it), and the row's response.
+/// A page (`rename` is `Some`) is renamed in place on a double click on
+/// the title; the Master Page is not a name of its own and is not.
 fn node_row(
+    app: &App,
     ui: &mut Ui,
     id: impl std::hash::Hash + Copy + std::fmt::Debug,
     title: &str,
     open: bool,
     master: bool,
     bold: bool,
+    rename: Option<RenameTarget>,
+    act: &mut Actions,
 ) -> (bool, egui::Response) {
     let (rect, resp) = row(ui, Look::Node);
     let resp = resp.rich_tip_with(|| format!("{title}\n{}", tr("docker.page_row_desc")));
@@ -807,9 +842,94 @@ fn node_row(
         },
         Tokens::text(),
     );
+    let editing = rename.is_some_and(|t| app.inline_rename_of(t).is_some());
+    if let Some(target) = rename {
+        let field = Rect::from_min_max(
+            Pos2::new(x + 36.0, rect.top() + 2.0),
+            Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0),
+        );
+        if editing {
+            // The field is drawn over the title after the tree; a click on
+            // the row does not open or close the page while the name is
+            // edited (the arrow still does).
+            if act.inline_field.is_none() {
+                act.inline_field = Some((target, field));
+            }
+        } else if resp.double_clicked() {
+            act.inline_start = Some((target, title.to_string()));
+            act.inline_field = Some((target, field));
+        }
+    }
     // A double-click is two clicks, so renaming closes and reopens the
     // node and leaves it as it was.
-    (a.clicked() || resp.clicked(), resp)
+    let toggle = if editing {
+        a.clicked()
+    } else {
+        a.clicked() || resp.clicked()
+    };
+    (toggle, resp)
+}
+
+/// The one-line field over the name of the page, layer or object being
+/// renamed in place (see [`App::inline_rename`]): Enter or a click
+/// elsewhere keeps the new name, Escape keeps the old one. Nothing is
+/// drawn when no row is renamed, or when the row renamed has no place in
+/// `act.inline_field` (scrolled out of sight, for example).
+fn inline_rename_field(app: &mut App, ui: &mut Ui, act: &mut Actions) {
+    let Some((target, at)) = act.inline_field else {
+        return;
+    };
+    let Some(mut text) = app.inline_rename_of(target) else {
+        return;
+    };
+    let id = match target {
+        RenameTarget::Page(p) => egui::Id::new(("objects_inline_rename", "page", p.raw())),
+        RenameTarget::Layer(l) => egui::Id::new(("objects_inline_rename", "layer", l.raw())),
+        RenameTarget::Shape(s) => egui::Id::new(("objects_inline_rename", "shape", s.raw())),
+    };
+    // A child at the name's place: the row has its room already.
+    let mut field = ui.new_child(egui::UiBuilder::new().max_rect(at));
+    let resp = field.add_sized(
+        at.size(),
+        egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .font(egui::FontId::proportional(13.0))
+            .margin(egui::Margin::symmetric(2, 0)),
+    );
+    if !resp.has_focus() && !resp.lost_focus() {
+        resp.request_focus();
+    }
+    let resp = resp.rich_tip(tr("docker.inline_rename_tip"));
+    let (enter, esc) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    if esc {
+        app.inline_rename = None;
+        return;
+    }
+    if resp.lost_focus() || enter {
+        app.inline_rename = None;
+        match target {
+            RenameTarget::Page(page) => app.run(Command::RenamePage { page, name: text }),
+            RenameTarget::Layer(layer) => app.run(Command::RenameLayer { layer, name: text }),
+            RenameTarget::Shape(shape) => {
+                // An empty name takes the object's name away, as the
+                // Rename... window does; a name of spaces is no name.
+                let trimmed = text.trim();
+                app.run(Command::SetShapeName {
+                    shape,
+                    name: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                });
+            }
+        }
+        return;
+    }
+    if let Some((_, stored)) = app.inline_rename.as_mut() {
+        *stored = text;
+    }
 }
 
 /// A layer's row, then its objects when it is open.
@@ -895,8 +1015,21 @@ fn layer_rows(
     }
     // A layer of another page: that page comes first.
     let elsewhere = at.page.filter(|p| *p != app.page);
-    if resp.double_clicked() {
-        act.rename_layer = Some((layer.id, layer.name.clone()));
+    let target = RenameTarget::Layer(layer.id);
+    let field = Rect::from_min_max(
+        Pos2::new(x, rect.top() + 1.0),
+        Pos2::new(rect.right() - 4.0, rect.bottom() - 1.0),
+    );
+    if app.inline_rename_of(target).is_some() {
+        // The name field is drawn over this row after the tree; a click
+        // on the row does not make it the active layer while the name is
+        // edited (the eye, the printer and the padlock still work).
+        if act.inline_field.is_none() {
+            act.inline_field = Some((target, field));
+        }
+    } else if resp.double_clicked() {
+        act.inline_start = Some((target, layer.name.clone()));
+        act.inline_field = Some((target, field));
     } else if resp.clicked() {
         act.goto = elsewhere;
         act.pick = Some(layer.id);
@@ -1082,6 +1215,12 @@ fn layer_rows(
         let contents = app.clip_edit_contents();
         let frame = app.clip_frame_edit.as_ref().map(|(f, _)| *f);
         for s in layer.shapes.iter().rev() {
+            // While a symbol's objects are edited on their clean sheet,
+            // only those objects belong in the list: the drawing's other
+            // objects (and its GK-42 markers) are not on that sheet.
+            if app.symbol_edit_index().is_some() && app.outside_clip_edit(s.id) {
+                continue;
+            }
             if contents.contains(&s.id) {
                 continue;
             }
@@ -1747,6 +1886,13 @@ fn object_row(
         egui::FontId::proportional(13.0),
         color,
     );
+    // The field takes the name's place, not the eye and the padlock.
+    let target = RenameTarget::Shape(s.id);
+    let field = Rect::from_min_max(
+        Pos2::new(x, rect.top() + 1.0),
+        Pos2::new(rect.right() - 48.0, rect.bottom() - 1.0),
+    );
+    let editing = app.inline_rename_of(target).is_some();
     // Its own eye and padlock at the right end of the row, so an object
     // is hidden or locked from the list, and a locked one unlocked (#832).
     let base = egui::Id::new(("objects_object", s.id.raw()));
@@ -1772,12 +1918,20 @@ fn object_row(
     // is let go (see `drag_rows`): among a layer's objects, among a
     // group's, into a group or out of one (#2672).
     act.object_rows.push((s.id, rect));
-    if resp.drag_started() && !s.locked {
+    if resp.drag_started() && !s.locked && !editing {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new(ROW_DRAG), s.id));
     }
-    if resp.double_clicked() {
-        act.rename_object = Some((s.id, s.name.clone().unwrap_or_else(|| label.clone())));
+    if editing {
+        // The name field is drawn over this row after the tree; a click
+        // on the row does not select it while the name is edited (the eye
+        // and the padlock still work).
+        if act.inline_field.is_none() {
+            act.inline_field = Some((target, field));
+        }
+    } else if resp.double_clicked() {
+        act.inline_start = Some((target, s.name.clone().unwrap_or_else(|| label.clone())));
+        act.inline_field = Some((target, field));
     } else if resp.clicked() {
         act.goto = act.row_page.filter(|p| *p != app.page);
         act.select = Some(s.id);
@@ -4803,6 +4957,312 @@ mod drag_tests {
             .and_then(|rows| rows.into_iter().find(|(l, _)| *l == id))
             .map(|(_, r)| r)
             .expect("the layer's row")
+    }
+
+    fn page_row(ctx: &egui::Context, id: PageId) -> Rect {
+        ctx.data(|d| d.get_temp::<Vec<(PageId, Rect)>>(egui::Id::new("objects_page_rows_drawn")))
+            .and_then(|rows| rows.into_iter().find(|(p, _)| *p == id))
+            .map(|(_, r)| r)
+            .expect("the page's row")
+    }
+
+    /// Two quick clicks at `at`: a double click to the docker.
+    fn double_click(ctx: &egui::Context, app: &mut App, at: Pos2) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(ctx, app, vec![egui::Event::PointerMoved(at)]);
+        frame(ctx, app, vec![button(true)]);
+        frame(ctx, app, vec![button(false)]);
+        frame(ctx, app, vec![button(true)]);
+        frame(ctx, app, vec![button(false)]);
+    }
+
+    /// Select all in the field that has the keyboard, and type `text` over
+    /// it. Enter is a separate press (see `press_key`).
+    fn type_over(ctx: &egui::Context, app: &mut App, text: &str) {
+        let key = |key: egui::Key, pressed: bool, modifiers: egui::Modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        frame(
+            ctx,
+            app,
+            vec![key(egui::Key::A, true, egui::Modifiers::CTRL)],
+        );
+        frame(
+            ctx,
+            app,
+            vec![key(egui::Key::A, false, egui::Modifiers::CTRL)],
+        );
+        frame(ctx, app, vec![egui::Event::Text(text.into())]);
+    }
+
+    fn press_key(ctx: &egui::Context, app: &mut App, key: egui::Key) {
+        let key = |pressed: bool| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(ctx, app, vec![key(true)]);
+        frame(ctx, app, vec![key(false)]);
+    }
+
+    /// The inline rename holds the draft of the target it was started
+    /// with, and the drawing revision of that moment.
+    #[test]
+    fn inline_rename_state_follows_the_target() {
+        let mut app = App::headless();
+        let page = app.page;
+        let layer = app.doc().pages[0].layers[0].id;
+        assert!(app.inline_rename_of(RenameTarget::Page(page)).is_none());
+        app.start_inline_rename(RenameTarget::Page(page), "Draft".into());
+        assert_eq!(
+            app.inline_rename_of(RenameTarget::Page(page)).as_deref(),
+            Some("Draft")
+        );
+        assert!(
+            app.inline_rename_of(RenameTarget::Layer(layer)).is_none(),
+            "another target is not the one edited"
+        );
+        assert_eq!(app.inline_rename_rev, app.engine.revision());
+    }
+
+    /// A double click on a page's name renames the page in place: the
+    /// draft is held while it is typed, Enter keeps the new name in one
+    /// undo step, and the Rename... window is not opened.
+    #[test]
+    fn a_double_click_on_a_page_renames_it_in_place() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let page = app.page;
+        let old = app
+            .doc()
+            .pages
+            .iter()
+            .find(|p| p.id == page)
+            .expect("page")
+            .name
+            .clone();
+        frame(&ctx, &mut app, Vec::new());
+        let row = page_row(&ctx, page);
+        double_click(&ctx, &mut app, Pos2::new(row.left() + 80.0, row.center().y));
+        assert!(
+            matches!(
+                app.inline_rename,
+                Some((RenameTarget::Page(p), _)) if p == page
+            ),
+            "the page is renamed in place: {:?}",
+            app.inline_rename
+        );
+        assert_eq!(
+            app.inline_rename.as_ref().map(|(_, s)| s.as_str()),
+            Some(old.as_str()),
+            "the draft starts as the page's name"
+        );
+        // The field takes the keyboard on the next frame; typing only
+        // drafts, the page keeps its name until Enter.
+        frame(&ctx, &mut app, Vec::new());
+        type_over(&ctx, &mut app, "Renamed page");
+        assert_eq!(
+            app.inline_rename.as_ref().map(|(_, s)| s.as_str()),
+            Some("Renamed page"),
+            "the draft follows the typing"
+        );
+        assert_eq!(
+            app.doc()
+                .pages
+                .iter()
+                .find(|p| p.id == page)
+                .expect("page")
+                .name,
+            old,
+            "the name is kept until Enter"
+        );
+        press_key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.inline_rename.is_none());
+        assert_eq!(
+            app.doc()
+                .pages
+                .iter()
+                .find(|p| p.id == page)
+                .expect("page")
+                .name,
+            "Renamed page"
+        );
+        app.undo();
+        assert_eq!(
+            app.doc()
+                .pages
+                .iter()
+                .find(|p| p.id == page)
+                .expect("page")
+                .name,
+            old,
+            "one undo step"
+        );
+    }
+
+    /// Escape in the field keeps the old name: no command, no undo step.
+    #[test]
+    fn escape_keeps_the_old_name_of_a_page_inline_rename() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let page = app.page;
+        let old = app
+            .doc()
+            .pages
+            .iter()
+            .find(|p| p.id == page)
+            .expect("page")
+            .name
+            .clone();
+        frame(&ctx, &mut app, Vec::new());
+        let row = page_row(&ctx, page);
+        double_click(&ctx, &mut app, Pos2::new(row.left() + 80.0, row.center().y));
+        frame(&ctx, &mut app, Vec::new());
+        let key = |pressed: bool| egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        frame(&ctx, &mut app, vec![key(true)]);
+        frame(&ctx, &mut app, vec![key(false)]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("Discard".into())]);
+        press_key(&ctx, &mut app, egui::Key::Escape);
+        assert!(app.inline_rename.is_none());
+        assert_eq!(
+            app.doc()
+                .pages
+                .iter()
+                .find(|p| p.id == page)
+                .expect("page")
+                .name,
+            old
+        );
+    }
+
+    /// A double click on a layer's name renames the layer in place.
+    #[test]
+    fn a_double_click_on_a_layer_renames_it_in_place() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let layer = app.doc().pages[0].layers[0].id;
+        let old = app.doc().pages[0].layers[0].name.clone();
+        frame(&ctx, &mut app, Vec::new());
+        let row = layer_row(&ctx, layer);
+        double_click(&ctx, &mut app, Pos2::new(row.left() + 180.0, row.center().y));
+        assert!(
+            matches!(
+                app.inline_rename,
+                Some((RenameTarget::Layer(l), _)) if l == layer
+            ),
+            "the layer is renamed in place: {:?}",
+            app.inline_rename
+        );
+        frame(&ctx, &mut app, Vec::new());
+        type_over(&ctx, &mut app, "Renamed layer");
+        press_key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.inline_rename.is_none());
+        assert_eq!(app.doc().pages[0].layers[0].name, "Renamed layer");
+        app.undo();
+        assert_eq!(app.doc().pages[0].layers[0].name, old, "one undo step");
+    }
+
+    /// A double click on an object's name renames the object in place.
+    #[test]
+    fn a_double_click_on_an_object_renames_it_in_place() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let id = app.new_shape(rect_kind()).expect("shape");
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        let row = object_row(&ctx, id);
+        double_click(&ctx, &mut app, row.center());
+        assert!(
+            matches!(
+                app.inline_rename,
+                Some((RenameTarget::Shape(s), _)) if s == id
+            ),
+            "the object is renamed in place: {:?}",
+            app.inline_rename
+        );
+        frame(&ctx, &mut app, Vec::new());
+        type_over(&ctx, &mut app, "Renamed object");
+        press_key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.inline_rename.is_none());
+        assert_eq!(
+            app.doc().find_shape(id).expect("shape").name.as_deref(),
+            Some("Renamed object")
+        );
+        app.undo();
+        assert_eq!(
+            app.doc().find_shape(id).expect("shape").name,
+            None,
+            "one undo step"
+        );
+    }
+
+    /// A double click on a group's name renames the group in place, the
+    /// same as an object: a group is a shape in the list.
+    #[test]
+    fn a_double_click_on_a_group_renames_it_in_place() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let a = app.new_shape(rect_kind()).expect("a");
+        let b = app.new_shape(rect_kind()).expect("b");
+        app.run(Command::Group { shapes: vec![a, b] });
+        let g = app.doc().pages[0].layers[0].shapes[0].id;
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        let row = object_row(&ctx, g);
+        double_click(&ctx, &mut app, row.center());
+        assert!(
+            matches!(
+                app.inline_rename,
+                Some((RenameTarget::Shape(s), _)) if s == g
+            ),
+            "the group is renamed in place: {:?}",
+            app.inline_rename
+        );
+        frame(&ctx, &mut app, Vec::new());
+        type_over(&ctx, &mut app, "Renamed group");
+        press_key(&ctx, &mut app, egui::Key::Enter);
+        assert!(app.inline_rename.is_none());
+        assert_eq!(
+            app.doc().find_shape(g).expect("group").name.as_deref(),
+            Some("Renamed group")
+        );
+    }
+
+    /// Undo while a name is being renamed in place drops the edit: the id
+    /// may point at another page, layer or object after the undo. The
+    /// same guard as the Symbols docker's pick.
+    #[test]
+    fn an_undo_drops_a_pending_inline_rename() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let id = app.new_shape(rect_kind()).expect("shape");
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        let row = object_row(&ctx, id);
+        double_click(&ctx, &mut app, row.center());
+        assert!(app.inline_rename.is_some());
+        app.undo();
+        // The docker drops the stale edit when it is drawn again: the
+        // revision changed under the field.
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.inline_rename.is_none(), "the stale edit is dropped");
     }
 
     /// Press at `from`, drag to `to` over a few frames and let go there.

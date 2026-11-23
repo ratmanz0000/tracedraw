@@ -1445,6 +1445,26 @@ pub fn picture_turns_sideways(bytes: &[u8]) -> bool {
     )
 }
 
+/// Whether the file's own orientation turns or flips the pixels, so it
+/// cannot be kept as it stands: every transform but none, read from the
+/// header only. A file whose orientation cannot be read is taken as it
+/// stands.
+pub fn picture_needs_transform(bytes: &[u8]) -> bool {
+    use image::metadata::Orientation;
+    use image::ImageDecoder;
+    let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()
+    else {
+        return false;
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return false;
+    };
+    decoder
+        .orientation()
+        .map(|o| o != Orientation::NoTransforms)
+        .unwrap_or(false)
+}
+
 /// Keep bytes under a synthetic path so [`read`] finds them (browser).
 pub fn store(path: &Path, bytes: Vec<u8>) {
     STORE.with(|s| {

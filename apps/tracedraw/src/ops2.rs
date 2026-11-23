@@ -6290,36 +6290,127 @@ impl App {
     /// Symbols docker > Revert to objects: replace selected instances by
     /// copies of their definition.
     pub fn revert_symbol_instances(&mut self) {
-        let symbols = self.doc().symbols.clone();
-        let mut cmds = Vec::new();
-        let mut new_sel = Vec::new();
-        for s in self.selected_shapes() {
-            if let ShapeKind::SymbolInstance { index } = s.kind {
-                let Some(def) = symbols.get(index) else {
-                    continue;
-                };
-                let Ok((layer, _)) = self.doc().shape(s.id) else {
-                    continue;
-                };
-                let layer = layer.id;
-                // New ids for the objects inside a group definition
-                // too: each instance reverted brought the same ones (#3066).
-                let id = self.engine.new_shape_id();
-                let mut copy = crate::app::reid_pub(def.shape.clone(), id, &mut self.engine);
-                copy.absorb(s.transform);
-                new_sel.push(copy.id);
-                cmds.push(Command::DeleteShapes { shapes: vec![s.id] });
-                cmds.push(Command::AddShape { layer, shape: copy });
-            }
-        }
-        if !cmds.is_empty() {
-            let _ = self.engine.run_batch("Revert Symbol", &cmds);
-            self.selection = new_sel;
-        }
+        self.revert_symbol_instances_of(None);
     }
 
     /// The symbol whose objects are being edited (Edit Symbol), when the
     /// edit going on is one.
+    /// master layer, in groups and clip frames too. Each copy takes the
+    /// instance's place and transform, with ids of its own for the
+    /// objects inside a group definition (#3066). A symbol named by
+    /// `only` is taken out of the panel once its copies have gone. One
+    /// undo step.
+    pub fn revert_symbol_instances_of(&mut self, only: Option<usize>) {
+        if only.is_some() && self.clip_frame_edit.is_some() {
+            return;
+        }
+        let symbols = self.doc().symbols.clone();
+        let mut instances: Vec<Shape> = Vec::new();
+        match only {
+            Some(index) => {
+                if index >= symbols.len() {
+                    return;
+                }
+                fn walk(s: &Shape, index: usize, out: &mut Vec<Shape>) {
+                    match &s.kind {
+                        ShapeKind::SymbolInstance { index: i } if *i == index => out.push(s.clone()),
+                        ShapeKind::Group { children } => {
+                            children.iter().for_each(|c| walk(c, index, out));
+                        }
+                        ShapeKind::ClipFrame { frame, contents } => {
+                            walk(frame, index, out);
+                            contents.iter().for_each(|c| walk(c, index, out));
+                        }
+                        _ => {}
+                    }
+                }
+                for l in self.doc().all_layers() {
+                    for s in &l.shapes {
+                        walk(s, index, &mut instances);
+                    }
+                }
+            }
+            None => {
+                for s in self.selected_shapes() {
+                    if let ShapeKind::SymbolInstance { index } = s.kind {
+                        if symbols.get(index).is_some() {
+                            instances.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        let mut replacements = Vec::with_capacity(instances.len());
+        let mut new_sel = Vec::with_capacity(instances.len());
+        for s in instances {
+            let ShapeKind::SymbolInstance { index } = s.kind else {
+                continue;
+            };
+            let Some(def) = symbols.get(index) else {
+                continue;
+            };
+            // New ids for the objects inside a group definition
+            // too: each instance reverted brought the same ones (#3066).
+            let id = self.engine.new_shape_id();
+            let mut copy = crate::app::reid_pub(def.shape.clone(), id, &mut self.engine);
+            copy.absorb(s.transform);
+            new_sel.push(copy.id);
+            replacements.push((s.id, copy));
+        }
+        let mut cmds = Vec::new();
+        if !replacements.is_empty() {
+            cmds.push(Command::ReplaceShapes { replacements });
+        }
+        if let Some(index) = only {
+            // The definition is unused once its copies have gone.
+            cmds.push(Command::DeleteSymbol { index });
+        }
+        if cmds.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.run_batch("Revert Symbol", &cmds) {
+            self.status = e.to_string();
+            return;
+        }
+        let reverted = new_sel.len();
+        self.selection = new_sel;
+        if let Some(index) = only {
+            self.symbol_replace_source = None;
+            let name = symbols
+                .get(index)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            self.status = trf(
+                "status.symbol_reverted",
+                &[("n", &reverted.to_string()), ("name", &name)],
+            );
+        }
+    }
+
+    /// The Symbols docker's X: delete symbol `index` and every instance
+    /// of it, on any page or master layer, in groups and clip frames too;
+    /// one undo step.
+    pub fn delete_symbol(&mut self, index: usize) {
+        if self.clip_frame_edit.is_some() {
+            return;
+        }
+        let Some(name) = self.doc().symbols.get(index).map(|s| s.name.clone()) else {
+            return;
+        };
+        let n = crate::ui::dockers2::symbol_uses(self.doc(), index);
+        let had = self.doc().symbols.len();
+        self.run(Command::DeleteSymbol { index });
+        if self.doc().symbols.len() >= had {
+            return;
+        }
+        self.symbol_replace_source = None;
+        self.status = trf(
+            "status.symbol_deleted",
+            &[("name", &name), ("n", &n.to_string())],
+        );
+    }
+
+
     pub fn symbol_edit_index(&self) -> Option<usize> {
         if let Some(se) = &self.symbol_edit {
             return (se.index < self.doc().symbols.len()).then_some(se.index);
@@ -10495,4 +10586,32 @@ mod text_dialog_tests {
         );
         assert_eq!(app.engine.undo_label(), Some("Edit Text"));
     }
+    }
+
+    /// The Symbols panel's Revert on a symbol's row: every instance of
+    /// that symbol, on a layer, in a group, in a clip frame and on a
+    /// master layer, becomes independent copies of the definition where
+    /// each instance stood, the symbol goes, and one undo puts it all
+    /// back. The copies of a group definition do not share ids (#3066).
+    #[test]
+    fn reverting_a_symbol_from_its_row_turns_every_instance_into_objects() {
+        assert!(app.doc().find_shape(cid).is_some());
+        assert!(app.doc().find_shape(on_master).is_some());
+    }
+
+    /// The Symbols panel's X: the symbol and every instance of it go in
+    /// one undo step, a group that only held instances goes with them,
+    /// and one undo puts the symbol and the instances back.
+    #[test]
+    fn deleting_a_symbol_removes_it_and_every_instance_and_undoes() {
+        assert!(app.doc().find_shape(inst).is_some());
+        assert!(app.doc().find_shape(gid).is_some());
+        assert_eq!(crate::ui::dockers2::symbol_uses(app.doc(), 0), 3);
+    }
+
+    /// Revert to objects on selected instances only: those instances
+    /// become objects, the other instances and the symbol stay.
+    #[test]
+    fn reverting_selected_instances_leaves_the_symbol() {
+
 }

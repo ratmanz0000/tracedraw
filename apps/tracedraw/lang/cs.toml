@@ -10900,6 +10900,8 @@ docker.replace_pick = "Vyberte cílový symbol nebo Esc pro zrušení." # mt
 
 docker.rename_symbol_tip = "Dvojklikem na název symbol přejmenujete." # mt
 
+docker.inline_rename_tip = "Enter nebo klik jinam ponechá nový název, Escape zruší."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "Kalibrace GK-42"
 toolbar.gk42_desc = "Váže milimetry listu na skutečné metry GK-42 pomocí tří referenčních značek; kliknutí na list je umístí a snímá body."

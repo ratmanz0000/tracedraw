@@ -10900,6 +10900,8 @@ docker.replace_pick = "Pick the target symbol, or press Esc to cancel."
 
 docker.rename_symbol_tip = "Double-click the name to rename the symbol."
 
+docker.inline_rename_tip = "Enter or a click elsewhere keeps the new name, Escape cancels."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42 calibration"
 gk42.place_points = "Place points"

@@ -10900,6 +10900,8 @@ docker.replace_pick = "Pilih simbol target atau Esc untuk batal." # mt
 
 docker.rename_symbol_tip = "Klik ganda nama untuk mengganti nama simbol." # mt
 
+docker.inline_rename_tip = "Enter atau klik di tempat lain menyimpan nama baru, Escape membatalkan."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "Kalibrasi GK-42"
 toolbar.gk42_desc = "Mengaitkan milimeter lembar ke meter GK-42 sebenarnya dengan tiga penanda acuan; klik pada lembar untuk meletakkannya dan mengambil titik."

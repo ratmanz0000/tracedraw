@@ -10900,6 +10900,8 @@ docker.replace_pick = "Kies het doelsymbool of Esc om te annuleren." # mt
 
 docker.rename_symbol_tip = "Dubbelklik op de naam om het symbool te hernoemen." # mt
 
+docker.inline_rename_tip = "Enter of een klik elders houdt de nieuwe naam vast, Escape annuleert."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42-kalibratie"
 toolbar.gk42_desc = "Koppelt de millimeters van het vel aan werkelijke GK-42-meters met drie referentiemarkers; klikken op het vel plaatsen ze en nemen punten op."

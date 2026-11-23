@@ -165,7 +165,11 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     crate::join_tool::draw_join_ends(app, painter);
     crate::shape_builder::draw(app, painter);
     crate::comments::draw_comments(app, painter);
-    crate::map_gk42::overlay(app, painter);
+    // The GK-42 markers and picked points belong to the drawing, not
+    // to a symbol being edited on its clean sheet (#3904, symbol edit).
+    if app.symbol_edit_index().is_none() {
+        crate::map_gk42::overlay(app, painter);
+    }
     crate::perspective_draw::draw_grid(app, painter, rect);
     draw_frame_links(app, painter);
     draw_content_links(app, painter);
@@ -842,12 +846,11 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         (app.view_mode == crate::app::ViewMode::Pixels).then(|| app.document_dpi()),
     );
     let main_rendered = app.raster.borrow().render_count() != renders_before;
-    // SMOOTH_ZOOM_NO_BACKDROP: the last picture reprojects; the gaps show
-    // paper, not a second, smaller picture of the page. The backdrop of
-    // #2048 read as pieces of a large raster (two scales of the drawing
-    // on screen at once), and was a whole extra render of the page.
+    // SMOOTH_ZOOM_NO_BACKDROP: kept false so the small whole-page backdrop
+    // (#2048) covers the paper around the screen texture while zooming out
+    // or panning, instead of flashing white paper gaps.
     #[cfg(not(target_arch = "wasm32"))]
-    const SMOOTH_ZOOM_NO_BACKDROP: bool = true;
+    const SMOOTH_ZOOM_NO_BACKDROP: bool = false;
     #[cfg(not(target_arch = "wasm32"))]
     let backdrop = if SMOOTH_ZOOM_NO_BACKDROP {
         None

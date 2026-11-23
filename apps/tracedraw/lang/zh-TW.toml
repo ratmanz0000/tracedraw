@@ -10900,6 +10900,8 @@ docker.replace_pick = "選擇目標符號，或按 Esc 取消。" # mt
 
 docker.rename_symbol_tip = "雙擊名稱可重新命名符號。" # mt
 
+docker.inline_rename_tip = "按 Enter 或點擊其他位置保留新名稱，按 Escape 取消。"
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42 校準"
 toolbar.gk42_desc = "透過三個基準標記將圖紙公厘對應到真實 GK-42 公尺；在圖紙上點擊即可放置標記並拾取點。"

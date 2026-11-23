@@ -3244,6 +3244,10 @@ fn symbols(app: &mut App, ui: &mut Ui) {
     thumbs.begin_frame();
     let drawing = (app.engine.instance(), app.engine.revision());
     for (i, name) in syms {
+        // Identity line: what the symbol draws, then its name. Every
+        // action lives on its own line below, so a narrow docker (about
+        // 340 points) cannot clip the buttons at the end of the row,
+        // Replace among them.
         ui.horizontal(|ui| {
             // What the symbol draws, beside its name (#3249).
             symbol_picture(app, ui, &mut thumbs, drawing, i);
@@ -3267,12 +3271,21 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                     app.symbol_rename = Some((i, text));
                 }
             } else {
-                let resp = ui.label(&name).rich_tip(tr("docker.rename_symbol_tip"));
+                // Truncated, so a long name cannot push this line wider
+                // than the docker.
+                let resp = ui
+                    .add(egui::Label::new(&name).truncate())
+                    .rich_tip(tr("docker.rename_symbol_tip"));
                 if resp.double_clicked() {
                     app.symbol_rename = Some((i, name.clone()));
                     app.symbol_pick_rev = app.engine.revision();
                 }
             }
+        });
+        // Actions line, wrapped: Insert, Edit, Duplicate and Replace all
+        // stay on the panel whatever the docker's width, and Replace is
+        // not the item the clip rect takes away.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .small_button(tr("docker.insert"))
                 .rich_tip(crate::ui::tips::pair(
@@ -3357,9 +3370,34 @@ fn symbols(app: &mut App, ui: &mut Ui) {
                     }
                 }
             }
+            // Revert: every instance of this symbol becomes an
+            // independent copy and the symbol leaves the panel (#2343).
+            if ui
+                .add_enabled(
+                    app.clip_frame_edit.is_none(),
+                    egui::Button::new(tr("docker.revert_symbol")).small(),
+                )
+                .rich_tip(crate::ui::tips::keyed("docker.revert_symbol"))
+                .clicked()
+            {
+                app.revert_symbol_instances_of(Some(i));
+            }
+            // The X at the end of the row deletes the symbol and every
+            // instance with it; one undo step.
+            if ui
+                .add_enabled(
+                    app.clip_frame_edit.is_none(),
+                    egui::Button::new("x").small(),
+                )
+                .rich_tip(tr("docker.delete_symbol_tip"))
+                .clicked()
+            {
+                app.delete_symbol(i);
+            }
             let uses = symbol_uses(app.doc(), i);
             dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
         });
+        ui.add_space(6.0);
     }
     thumbs.trim(crate::object_thumbs::MAX_BYTES / 4);
     if thumbs.waiting {

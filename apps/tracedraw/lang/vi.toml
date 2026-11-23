@@ -10896,6 +10896,8 @@ status.symbolized = "Found {n} similar groups -> {name}" # mt
 
 docker.rename_symbol_tip = "Nhấp đúp vào tên để đổi tên biểu tượng." # mt
 
+docker.inline_rename_tip = "Nhấn Enter hoặc nhấp vào nơi khác để giữ tên mới, Escape hủy."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42 calibration"
 gk42.place_points = "Place points"

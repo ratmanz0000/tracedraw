@@ -6,6 +6,8 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Zoom: the pictures of the last few zoom levels are kept, so zooming back to one shows it sharp at once with no new render, and while a new zoom is drawn the nearest kept picture fills in instead of a blown-up or shrunk one (#3894).
+- Objects docker: a double click on a page, layer, group or object name renames it in place (Enter or a click elsewhere keeps the new name, Escape keeps the old one), the same as a symbol's name in the Symbols panel; the Rename... menus still open the name windows. An undo, redo or any other change of the drawing while the field is open drops the edit, so it cannot rename the wrong page, layer or object.
 - Symbols panel: each symbol's row has Revert, which turns every copy of that symbol back into ordinary objects where each copy stands (in groups, clip frames and on master layers too) and takes the unused symbol out of the panel, and an X at the right of the row, which deletes the symbol and every copy of it; both in one undo step. The panel's Revert to objects button still works on the copies selected on the canvas, and now reaches copies sitting inside a group or a clip frame as well.
 - Print Merged Document: the merged drawing is made only to be printed, so once the Print dialog and Print Preview are closed it is gone again and the drawing you merged is back in front, instead of an extra merged drawing staying open after every print or preview. Create Merged Document is the command that keeps the merged drawing (discussion #1610).
 - Cross hair to the window edges: the lines also follow the Shape tool's pointer, crossing at its tip (discussion #3268).

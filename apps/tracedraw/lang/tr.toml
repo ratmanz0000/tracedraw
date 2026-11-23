@@ -10900,6 +10900,8 @@ docker.replace_pick = "Hedef simgeyi seçin veya iptal için Esc." # mt
 
 docker.rename_symbol_tip = "Simgeyi yeniden adlandırmak için adına çift tıklayın." # mt
 
+docker.inline_rename_tip = "Enter veya başka bir yere tıklamak yeni adı korur, Escape iptal eder."
+
 docker.gk42 = "GK-42"
 toolbar.gk42 = "GK-42 kalibrasyonu"
 toolbar.gk42_desc = "Üç referans işaretiyle sayfanın milimetrelerini gerçek GK-42 metrelerine bağlar; sayfada tıklamalar onları yerleştirir ve nokta alır."
