@@ -1400,7 +1400,7 @@ mod tests {
         let got = read_tiff_pixels(&bytes).expect("tiff pixels");
         assert_eq!(got.dimensions(), (20, 10));
         let p = got.get_pixel(5, 0).0;
-        let want = to_u8(u16::from(5) * 3000);
+        let want = to_u8(5u16 * 3000);
         assert_eq!(p, [want, want, want, 255], "{p:?}");
     }
 
