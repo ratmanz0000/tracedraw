@@ -56,6 +56,11 @@ pub struct PageNumberSettings {
     /// 0 bottom centre, 1 bottom outer corner, 2 top centre, 3 top outer corner.
     pub position: u8,
     pub size_pt: f64,
+    /// The last pages, this many of them, show no number (#3789).
+    pub skip_last: usize,
+    /// Pages left without a number ("5, 9-10", from 1); the numbering
+    /// goes on after them (#3789).
+    pub skip: String,
 }
 
 impl Default for PageNumberSettings {
@@ -68,6 +73,8 @@ impl Default for PageNumberSettings {
             style: 0,
             position: 0,
             size_pt: 12.0,
+            skip_last: 0,
+            skip: String::new(),
         }
     }
 }
@@ -81,6 +88,8 @@ impl PageNumberSettings {
             style: self.style,
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
+            skip_last: self.skip_last,
+            skip: self.skip.clone(),
         }
     }
 
@@ -1838,6 +1847,8 @@ pub struct App {
     /// typed into, so the page beneath stays cached without re-rendering
     /// on each keystroke (#3904).
     pub text_edit_overlay: std::cell::RefCell<crate::text_editing::TextEditOverlay>,
+    /// The layout of the text being edited, kept across frames (#3960).
+    pub text_layout_cache: std::cell::RefCell<Option<crate::text_editing::CachedTextLayout>>,
     /// What the backdrop covers (see [`Self::backdrop_area`]), with the
     /// revision, page and page box it was worked out for.
     backdrop_area: std::cell::Cell<Option<(u64, PageId, Rect, Rect)>>,
@@ -3534,6 +3545,7 @@ impl App {
             page_rasters: Default::default(),
             page_snapshot: Default::default(),
             text_edit_overlay: Default::default(),
+            text_layout_cache: Default::default(),
             backdrop_area: Default::default(),
             view_mode: ViewMode::Enhanced,
             proof_colors: false,

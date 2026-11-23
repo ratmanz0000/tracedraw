@@ -2709,7 +2709,7 @@ pub(crate) fn dash_label(d: &[f64]) -> String {
     s
 }
 
-fn arrow_label(a: &tracedraw_core::Arrowhead) -> String {
+pub(crate) fn arrow_label(a: &tracedraw_core::Arrowhead) -> String {
     use tracedraw_core::Arrowhead as A;
     match a {
         A::None => "\u{2015}".into(),

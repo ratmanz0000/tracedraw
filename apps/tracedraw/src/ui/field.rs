@@ -356,7 +356,7 @@ impl<N: Numeric> NumField<'_, N> {
         let mut resp = ui.add(
             TextEdit::singleline(&mut buf)
                 .id(id)
-                .margin(egui::Margin::symmetric(4, 0))
+                .margin(egui::Margin::symmetric(4, 1))
                 .vertical_align(egui::Align::Center)
                 .desired_width(width),
         );
@@ -401,9 +401,9 @@ impl<N: Numeric> NumField<'_, N> {
                     crate::theme::Tokens::text_dim()
                 };
                 let (a, b, t) = (
-                    c + egui::vec2(-2.5, 1.5 * dir as f32),
-                    c + egui::vec2(2.5, 1.5 * dir as f32),
-                    c + egui::vec2(0.0, -1.5 * dir as f32),
+                    c + egui::vec2(-3.0, 2.0 * dir as f32),
+                    c + egui::vec2(3.0, 2.0 * dir as f32),
+                    c + egui::vec2(0.0, -2.0 * dir as f32),
                 );
                 p.add(egui::epaint::PathShape::convex_polygon(
                     vec![a, b, t],
