@@ -873,7 +873,10 @@ fn read_cmyk_tiff(bytes: &[u8]) -> Result<Option<ReadPicture>, String> {
     let Some((rgba, planes)) = inks_to_picture(w, h, px) else {
         return Err("the CMYK TIFF did not decode".into());
     };
-    picture_with_planes(rgba, planes).ok_or_else(|| "the CMYK TIFF did not decode".into())
+    match picture_with_planes(rgba, planes) {
+        Some(p) => Ok(Some(p)),
+        None => Err("the CMYK TIFF did not decode".into()),
+    }
 }
 
 /// The pixels of `w` by `h` ink coverages (cyan, magenta, yellow,
@@ -1386,7 +1389,7 @@ mod tests {
     /// A grey 16-bit TIFF through the same fallback, samples to 8 bits.
     #[test]
     fn a_grey16_tiff_at_the_memory_limit_is_read_by_the_tiff_crate() {
-        let img = image::ImageBuffer::from_fn(20, 10, |x, _| image::Luma([u16::from(x) * 3000]));
+        let img = image::ImageBuffer::from_fn(20, 10, |x, _| image::Luma([(x as u16) * 3000]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageLuma16(img)
             .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Tiff)
