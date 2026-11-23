@@ -245,8 +245,10 @@ impl ReadPicture {
 /// through the colour management, as a CMYK colour of the drawing
 /// shows (#2163); every other file is read as pixels.
 pub fn read(bytes: &[u8]) -> Result<ReadPicture, String> {
-    if let Some(p) = read_cmyk_tiff(bytes) {
-        return Ok(p);
+    match read_cmyk_tiff(bytes) {
+        Ok(Some(p)) => return Ok(p),
+        Ok(None) => {}
+        Err(e) => return Err(e),
     }
     if let Some(p) = read_cmyk_jpeg(bytes) {
         return Ok(p);
@@ -828,37 +830,43 @@ fn read_lab_tiff(bytes: &[u8]) -> Option<ReadPicture> {
     })
 }
 
-fn read_cmyk_tiff(bytes: &[u8]) -> Option<ReadPicture> {
+fn read_cmyk_tiff(bytes: &[u8]) -> Result<Option<ReadPicture>, String> {
     if !(bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*")) {
-        return None;
+        return Ok(None);
     }
     // Print-size pictures too (#2000): the reader's own guard is 256 MiB.
     let limit = usize::try_from(crate::files::picture_decode_limit()).unwrap_or(usize::MAX);
     let mut limits = tiff::decoder::Limits::default();
     limits.decoding_buffer_size = limits.decoding_buffer_size.max(limit);
     limits.intermediate_buffer_size = limits.intermediate_buffer_size.max(limit);
+    limits.ifd_value_size = limits.ifd_value_size.max(limit);
     let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(bytes))
-        .ok()?
+        .map_err(|e| e.to_string())?
         .with_limits(limits);
-    let step = match dec.colortype().ok()? {
+    let step = match dec.colortype().map_err(|e| e.to_string())? {
         tiff::ColorType::CMYK(8) => 4,
         tiff::ColorType::CMYKA(8) => 5,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let (w, h) = dec.dimensions().ok()?;
-    let tiff::decoder::DecodingResult::U8(data) = dec.read_image().ok()? else {
-        return None;
+    let (w, h) = dec.dimensions().map_err(|e| e.to_string())?;
+    // A CMYK TIFF that did not decode is that error, not a fall-through
+    // to the image reader's "Memory limit exceeded" (#4036): a deflate
+    // CMYK scan of 10800x21600 was reported there, the tiff crate's own
+    // error lost in `ok()`.
+    let data = match dec.read_image().map_err(|e| e.to_string())? {
+        tiff::decoder::DecodingResult::U8(data) => data,
+        _ => return Ok(None),
     };
     let n = (w as usize).checked_mul(h as usize)?;
     if data.len() < n.checked_mul(step)? {
-        return None;
+        return Err("the CMYK TIFF is short of its pixels".into());
     }
     let px = data.chunks_exact(step).take(n).map(|px| {
         let a = if step == 5 { px[4] } else { 255 };
         ([px[0], px[1], px[2], px[3]], a)
     });
     let (rgba, planes) = inks_to_picture(w, h, px)?;
-    picture_with_planes(rgba, planes)
+    picture_with_planes(rgba, planes).ok_or_else(|| "the CMYK TIFF did not decode".into())
 }
 
 /// The pixels of `w` by `h` ink coverages (cyan, magenta, yellow,
