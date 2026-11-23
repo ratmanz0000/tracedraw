@@ -686,6 +686,19 @@ impl Raster {
         pixel_dpi: Option<f64>,
     ) -> Option<(TextureId, Rect)> {
         let ppp = ctx.pixels_per_point();
+        // The picture covers whole device pixels, as its size is rounded
+        // to them: a canvas at fractional points would otherwise move the
+        // page's edges by a pixel from one zoom step to the next.
+        let rect = Rect::from_min_max(
+            egui::pos2(
+                crate::canvas::device_pixel(rect.min.x, ppp),
+                crate::canvas::device_pixel(rect.min.y, ppp),
+            ),
+            egui::pos2(
+                crate::canvas::device_pixel(rect.max.x, ppp),
+                crate::canvas::device_pixel(rect.max.y, ppp),
+            ),
+        );
         // The picture is drawn for the view the wheel's glide lands at,
         // not for the view on its way to it: one render a turn, not one
         // for a zoom the glide has already passed. The Pixels view is
@@ -1953,6 +1966,25 @@ mod tests {
         });
         full.textures_delta.clear();
         out.expect("texture")
+    }
+
+    /// The picture's edges sit on whole device pixels, also when the canvas
+    /// does not: the page does not move by a pixel while zooming.
+    #[test]
+    fn the_picture_sits_on_whole_device_pixels() {
+        static TURNS: Turns = Turns::new();
+        let ctx = Context::default();
+        let doc = Document::new("t", Size::new(100.0, 50.0));
+        let rect = Rect::from_min_max(egui::pos2(10.4, 20.6), egui::pos2(330.3, 220.7));
+        let mut raster = Raster {
+            turns: Some(&TURNS),
+            ..Default::default()
+        };
+        let (_, screen) = pass(&ctx, &mut raster, &doc, &View::default(), rect, 0.0);
+        let ppp = ctx.pixels_per_point();
+        for v in [screen.min.x, screen.min.y, screen.max.x, screen.max.y] {
+            assert!((v * ppp - (v * ppp).round()).abs() < 1e-3, "{screen:?}");
+        }
     }
 
     /// A pan shows the last render moved into place at once, and renders
