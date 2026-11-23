@@ -382,6 +382,27 @@ pub(crate) const ARG_BLEND_STEPS: u32 = 3000;
 const OBJ_CONTOUR_GROUP: u32 = 15;
 /// Object type of a drop shadow's linked group (`LIST lnkg`, version 15).
 const OBJ_DROP_SHADOW: u32 = 23;
+
+/// A name for the object kinds we know, for the note after opening. A
+/// bare hex number says nothing to the user about what was left out.
+fn object_kind_name(kind: u32) -> Option<&'static str> {
+    match kind {
+        OBJ_RECT => Some("rectangle"),
+        OBJ_ELLIPSE => Some("ellipse"),
+        OBJ_CURVE => Some("curve"),
+        OBJ_ARTISTIC_TEXT => Some("artistic text"),
+        OBJ_BITMAP => Some("bitmap"),
+        OBJ_PARAGRAPH_TEXT => Some("paragraph text"),
+        OBJ_POLYGON => Some("polygon"),
+        OBJ_PATH => Some("path"),
+        OBJ_EMBEDDED => Some("embedded object"),
+        OBJ_CONNECTOR => Some("connector"),
+        OBJ_MESH => Some("mesh fill"),
+        OBJ_GUIDE => Some("guideline"),
+        _ => None,
+    }
+}
+
 /// Length of the drop shadow record (argument 3000 of its linked group).
 const DROP_SHADOW_RECORD_LEN: usize = 107;
 /// Millimetres of feathering for each unit of the record's feathering
@@ -1254,9 +1275,12 @@ impl<'a> Ctx<'a> {
             .and_then(|a| d.get(a.off..a.end))
             .map(|b| self.read_name(b))
             .filter(|s| !s.is_empty());
+        let kind = object_kind_name(l.kind)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("type {:#06x}", l.kind));
         Some(match name {
-            Some(n) => format!("{n} (type {:#06x})", l.kind),
-            None => format!("type {:#06x}", l.kind),
+            Some(n) => format!("{n} ({kind})"),
+            None => kind,
         })
     }
 
@@ -8670,6 +8694,16 @@ fn grey_mask(f: &tracedraw_core::Fountain) -> Fill {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The note after opening names an object kind the reader knows
+    /// instead of giving only its hex code.
+    #[test]
+    fn unread_labels_name_known_object_kinds() {
+        assert_eq!(object_kind_name(OBJ_ARTISTIC_TEXT), Some("artistic text"));
+        assert_eq!(object_kind_name(OBJ_PARAGRAPH_TEXT), Some("paragraph text"));
+        assert_eq!(object_kind_name(OBJ_BITMAP), Some("bitmap"));
+        assert_eq!(object_kind_name(99), None);
+    }
 
     /// A version 16+ radial fountain of 1.0 by 1.0 runs from the centre
     /// to the object's edges, its half axes on the box's half sides, as
