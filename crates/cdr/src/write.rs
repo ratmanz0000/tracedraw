@@ -1366,7 +1366,9 @@ fn metadata_xml(v: Ver, doc: &Document) -> String {
                 xml_escape(v)
             ));
         }
-        x.push_str(&format!("                </rdf:{kind}>\n            </{tag}>\n"));
+        x.push_str(&format!(
+            "                </rdf:{kind}>\n            </{tag}>\n"
+        ));
         x
     };
     let mut info = String::new();
@@ -6246,21 +6248,13 @@ impl<'a> Writer<'a> {
                     .collect();
                 return self.group(&kids, s.name.as_deref(), centre, depth);
             }
-            ShapeKind::SymbolInstance { index } if v.zip() && s.effects.is_empty() => {
-                if let Some(placed) = self.symbol_instance(s, *index, centre, depth) {
-                    return placed;
-                }
-                let kids: Vec<Shape> = s
-                    .expand(self.symbols)
-                    .into_iter()
-                    .map(|mut c| {
-                        c.absorb(s.transform);
-                        c
-                    })
-                    .collect();
-                return self.group(&kids, s.name.as_deref(), centre, depth);
-            }
-            ShapeKind::Table(_) | ShapeKind::SymbolInstance { .. } => {
+            // Live sytr/symb records are written from the layout of one
+            // version 15 file, checked only with our own reader: the
+            // other program hangs on a file that holds them. Write every
+            // instance as the group of the definition's objects, as
+            // before #3250, so such files open there. The reader still
+            // takes live symbols from files we are given.
+            ShapeKind::SymbolInstance { .. } => {
                 let kids: Vec<Shape> = s
                     .expand(self.symbols)
                     .into_iter()
