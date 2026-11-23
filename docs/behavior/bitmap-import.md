@@ -15,6 +15,13 @@ across and down) swapped for a quarter turn
 (`bitmap_file::tests::an_exif_orientation_stands_the_picture_upright`,
 #2167).
 
+A TIFF the image reader turns away at its memory limit (a print-size
+scan, #4036) is read by the `tiff` crate with a budget: the decoded
+samples and the RGBA result together within `picture_decode_limit`, as
+RGB, grey or RGBA of 8 or 16 bits. A turned picture, separate planes,
+another colour type, or one that does not fit the budget is the
+original error.
+
 A CMYK JPEG (four components) comes in as a CMYK picture with its inks,
 as a CMYK TIFF does, its pixels showing the inks through the colour
 management as the drawing's CMYK colours show, so exporting an object
