@@ -686,19 +686,7 @@ impl Raster {
         pixel_dpi: Option<f64>,
     ) -> Option<(TextureId, Rect)> {
         let ppp = ctx.pixels_per_point();
-        // The picture covers whole device pixels, as its size is rounded
-        // to them: a canvas at fractional points would otherwise move the
-        // page's edges by a pixel from one zoom step to the next.
-        let rect = Rect::from_min_max(
-            egui::pos2(
-                crate::canvas::device_pixel(rect.min.x, ppp),
-                crate::canvas::device_pixel(rect.min.y, ppp),
-            ),
-            egui::pos2(
-                crate::canvas::device_pixel(rect.max.x, ppp),
-                crate::canvas::device_pixel(rect.max.y, ppp),
-            ),
-        );
+        let rect = whole_device_pixels(rect, ppp);
         // The picture is drawn for the view the wheel's glide lands at,
         // not for the view on its way to it: one render a turn, not one
         // for a zoom the glide has already passed. The Pixels view is
@@ -1435,6 +1423,25 @@ fn band_rects(at: Rect, h: u32, rows: &[(u32, u32)]) -> Vec<Rect> {
 /// rectangle `region` (page mm) covers, widened to whole pixels: their
 /// place in the picture, their size, and the view that renders exactly
 /// them. `None` when the region lies off the picture.
+/// `rect` grown outward to whole device pixels at `ppp` device pixels per
+/// point: the picture still covers the whole canvas, and its size and
+/// place stay on the pixel grid from one zoom step to the next.
+fn whole_device_pixels(rect: Rect, ppp: f32) -> Rect {
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
+    let snap = |v: f32, up: bool| {
+        let p = v * ppp;
+        (if up { p.ceil() } else { p.floor() }) / ppp
+    };
+    Rect::from_min_max(
+        egui::pos2(snap(rect.min.x, false), snap(rect.min.y, false)),
+        egui::pos2(snap(rect.max.x, true), snap(rect.max.y, true)),
+    )
+}
+
 fn sub_view(
     vt: ViewTransform,
     w: u32,
