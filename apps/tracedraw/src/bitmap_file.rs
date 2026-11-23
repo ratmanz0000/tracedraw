@@ -320,17 +320,22 @@ fn read_tiff_pixels(bytes: &[u8]) -> Option<image::RgbaImage> {
         }
     }
     let color = dec.colortype().ok()?;
-    let samples: u64 = match color {
-        tiff::ColorType::RGB(_) => 3,
-        tiff::ColorType::RGBA(_) => 4,
-        tiff::ColorType::Gray(_) => 1,
+    // Bytes of one picture's samples: 8-bit is one a sample, 16-bit two.
+    // A cap in samples, not bytes, turned a 16-bit grey picture away
+    // (200 bytes asked of a 400-byte decode, #4036).
+    let (samples, bytes) = match color {
+        tiff::ColorType::RGB(8) => (3, 1),
+        tiff::ColorType::RGBA(8) => (4, 1),
+        tiff::ColorType::Gray(8) => (1, 1),
+        tiff::ColorType::RGB(16) => (3, 2),
+        tiff::ColorType::RGBA(16) => (4, 2),
+        tiff::ColorType::Gray(16) => (1, 2),
         _ => return None,
     };
     let n = u64::from(w) * u64::from(h);
     // The decoded samples and the RGBA result together stay within the
-    // same limit the image reader had (giving each tiff buffer the whole
-    // of it asked for three times the picture).
-    let need = n.checked_mul(samples)?;
+    // same limit the image reader had.
+    let need = n.checked_mul(samples)?.checked_mul(bytes)?;
     let rgba_need = n.checked_mul(4)?;
     if need == 0 || need.checked_add(rgba_need)? > limit as u64 {
         return None;
@@ -840,12 +845,11 @@ fn read_cmyk_tiff(bytes: &[u8]) -> Result<Option<ReadPicture>, String> {
     limits.decoding_buffer_size = limits.decoding_buffer_size.max(limit);
     limits.intermediate_buffer_size = limits.intermediate_buffer_size.max(limit);
     limits.ifd_value_size = limits.ifd_value_size.max(limit);
-    let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(bytes))
-        .map_err(|e| e.to_string())?
-        .with_limits(limits);
-    let step = match dec.colortype().map_err(|e| e.to_string())? {
+    let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let step = match dec.colortype().ok()? {
         tiff::ColorType::CMYK(8) => 4,
         tiff::ColorType::CMYKA(8) => 5,
+        // Not a CMYK TIFF: the Lab, palette and pixel readers follow.
         _ => return Ok(None),
     };
     let (w, h) = dec.dimensions().map_err(|e| e.to_string())?;
