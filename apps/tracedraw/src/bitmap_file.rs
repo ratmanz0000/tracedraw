@@ -524,6 +524,74 @@ pub fn read_tiff_by_chunks(bytes: &[u8], max_pixels: u64) -> Option<ReadPicture>
         planes: None,
         mode,
         from_jpeg: false,
+    })
+}
+
+/// A PNG kept byte for byte without decode or re-encode, so packing can
+/// store the file itself instead of what a decoder makes of it: the
+/// signature and every chunk parse and their CRCs match, and no EXIF
+/// orientation asks the pixels to move. A Lab picture (whose pixels the
+/// drawing cannot draw as stored) and one over the decoder's own limit
+/// fall back to the general reader.
+pub fn kept_png(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    if crate::bitmap_fx::png_is_lab(bytes) {
+        return None;
+    }
+    if crate::files::picture_needs_transform(bytes) {
+        return None;
+    }
+    const IHDR: &[u8; 4] = b"IHDR";
+    const IDAT: &[u8; 4] = b"IDAT";
+    const IEND: &[u8; 4] = b"IEND";
+    let mut at = 8usize;
+    let mut size = None;
+    let mut seen_idat = false;
+    let mut seen_iend = false;
+    while at.checked_add(12)? <= bytes.len() {
+        let len = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        let kind: &[u8; 4] = bytes.get(at + 4..at + 8)?.try_into().ok()?;
+        let data_end = at.checked_add(8)?.checked_add(len)?;
+        let crc_end = data_end.checked_add(4)?;
+        if crc_end > bytes.len() {
+            return None;
+        }
+        let stored = u32::from_be_bytes(bytes.get(data_end..crc_end)?.try_into().ok()?);
+        if crc32fast::hash(bytes.get(at + 4..data_end)?) != stored {
+            return None;
+        }
+        match kind {
+            IHDR => {
+                if size.is_some() {
+                    return None;
+                }
+                let w = u32::from_be_bytes(bytes.get(at + 8..at + 12)?.try_into().ok()?);
+                let h = u32::from_be_bytes(bytes.get(at + 12..at + 16)?.try_into().ok()?);
+                if w == 0 || h == 0 {
+                    return None;
+                }
+                if u64::from(w) * u64::from(h) > tracedraw_io::pdf_import::FULL_PICTURE_PIXELS {
+                    return None;
+                }
+                size = Some((w, h));
+            }
+            IDAT => seen_idat = true,
+            IEND => {
+                seen_iend = true;
+                break;
+            }
+            _ => {}
+        }
+        at = crc_end;
+    }
+    let size = size?;
+    if !seen_idat || !seen_iend {
+        return None;
+    }
+    Some(size)
+}
 
 /// A JPEG decoded straight to the pixels it stores, when nothing has to
 /// move: the drawing then keeps the file's bytes as the source instead
@@ -548,8 +616,6 @@ fn read_jpeg_direct(bytes: &[u8]) -> Option<ReadPicture> {
         planes: None,
         mode,
         from_jpeg: true,
-    })
-}
     })
 }
 

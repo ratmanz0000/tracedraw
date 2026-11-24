@@ -4467,6 +4467,7 @@ dependencies = [
  "arboard",
  "base64 0.22.1",
  "boa_engine",
+ "crc32fast",
  "csv",
  "eframe",
  "egui",
