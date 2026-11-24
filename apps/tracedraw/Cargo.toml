@@ -96,7 +96,7 @@ libc = "0.2"
 # The window drawn with OpenGL (glow). wgpu is the optional `gpu`
 # feature: the graphics card chosen in Options, or its software adapter
 # (#445, #439), and GPU shadow blur.
-pollster = { version = "0.4", optional = true }
+pollster = "0.4"
 # AI Drawing: HTTPS requests to the AI service the user sets up.
 ureq = { version = "3", features = ["platform-verifier"] }
 # Lossy WebP export (libwebp, BSD licence): the pure-Rust encoder writes
