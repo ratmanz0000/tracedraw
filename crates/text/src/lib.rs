@@ -1759,7 +1759,7 @@ const SHAPED_KEPT: usize = 64;
 const SHAPED_GLYPHS: usize = 30_000;
 
 /// How many laid-out texts [`FontSystem::layouts`] keeps.
-const LAYOUT_KEPT: usize = 64;
+const LAYOUT_KEPT: usize = 512;
 
 /// The key of a text in a cache of [`FontSystem`]: everything its layout
 /// depends on, kept exactly. A request is hashed to 64 bits to find its
@@ -4081,7 +4081,7 @@ impl FontSystem {
             // whole cache made every text re-shape after any overflow,
             // which on a drawing with many texts cost a full re-shape per
             // keystroke.
-            while c.len() > 2000 {
+            while c.len() > 60_000 {
                 let Some(k) = c.keys().next().cloned() else {
                     break;
                 };

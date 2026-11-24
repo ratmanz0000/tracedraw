@@ -1687,7 +1687,7 @@ pub struct Evaluated {
 /// How many evaluations [`evaluate`] remembers: enough for a page with
 /// several contoured or blended objects to keep each one's across the
 /// pointer's moves; with 8 they pushed each other out (#3765).
-const EVALUATION_MEMORY: usize = 32;
+const EVALUATION_MEMORY: usize = 512;
 
 /// The latest evaluations of shapes that draw objects from their outline,
 /// newest last, each with the shape it was made from. Shared by all

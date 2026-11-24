@@ -5246,14 +5246,12 @@ impl Shape {
             text_layout_shift(*origin, *frame, false, para.columns_from_right())
         };
         let m = self.transform * local;
-        let [a, b, c, d, _, _] = m.as_coeffs();
-        let scale = a.abs().max(d.abs()).max(1e-12);
-        if b.abs() > 1e-12 * scale || c.abs() > 1e-12 * scale {
-            return None;
-        }
         let r = text_outline::bounds(&req)?;
-        let (p, q) = (m * Point::new(r.x0, r.y0), m * Point::new(r.x1, r.y1));
-        let out = Rect::from_points(p, q);
+        let p0 = m * Point::new(r.x0, r.y0);
+        let p1 = m * Point::new(r.x1, r.y0);
+        let p2 = m * Point::new(r.x1, r.y1);
+        let p3 = m * Point::new(r.x0, r.y1);
+        let out = Rect::from_points(p0, p1).union(Rect::from_points(p2, p3));
         (out.x0.is_finite() && out.y0.is_finite() && out.x1.is_finite() && out.y1.is_finite())
             .then_some(out)
     }
@@ -5279,6 +5277,11 @@ impl Shape {
                     .unwrap_or_else(|| self.local_path().bounding_box())
             }
             ShapeKind::ClipFrame { frame, .. } => frame.bounds(),
+            ShapeKind::Text { .. } => {
+                let mut plain = self.clone();
+                plain.transform = Affine::IDENTITY;
+                plain.own_bounds()
+            }
             _ => match self.kind.known_box() {
                 Some(r) => r,
                 None => self.local_path().bounding_box(),
