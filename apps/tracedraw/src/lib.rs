@@ -605,7 +605,7 @@ pub fn run() -> eframe::Result<()> {
     // An OpenGL fallback after wgpu has failed on this driver: ask for the
     // compatibility profile first, which Windows Intel drivers accept more
     // readily than the 3.3 core profile. Env var is read by the patched eframe.
-    if mode == gpu::Mode::Gl && cfg!(feature = "gpu") && std::env::var("TRACEDRAW_GL_CONTEXT").is_err() {
+    if mode == gpu::Mode::Gl && std::env::var("TRACEDRAW_GL_CONTEXT").is_err() {
         std::env::set_var("TRACEDRAW_GL_CONTEXT", "compat");
     }
     let first = gpu::Mode::first(&settings);
