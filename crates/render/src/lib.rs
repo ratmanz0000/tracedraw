@@ -1869,6 +1869,26 @@ impl Renderer<'_> {
                             None,
                         ),
                     }
+                } else {
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(230, 230, 230, 160);
+                    self.pixmap.fill_path(
+                        &sk,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                    let mut outline_paint = Paint::default();
+                    outline_paint.set_color_rgba8(180, 180, 180, 255);
+                    let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
+                    self.pixmap.stroke_path(
+                        &sk,
+                        &outline_paint,
+                        &stroke,
+                        Transform::identity(),
+                        None,
+                    );
                 }
             }
             if let Some(stroke) = &shape.stroke {

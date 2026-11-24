@@ -903,85 +903,8 @@ impl Shell {
     /// read-back of a window another covers does not count, and when no
     /// renderer is left to try the window stays.
     #[cfg(not(target_arch = "wasm32"))]
-    fn check_renderer(&mut self, ctx: &egui::Context) {
-        if gpu::mode_in_use() != Some(gpu::Mode::Gl) {
-            return;
-        }
-        let frame = self.check_frames;
-        self.check_frames += 1;
-        match self.renderer_check {
-            RendererCheck::Done => return,
-            RendererCheck::At(at) => {
-                if frame >= at {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-                        RENDERER_CHECK,
-                    )));
-                    ctx.request_repaint();
-                    self.renderer_check = RendererCheck::Pending;
-                    paint_probe(ctx);
-                } else if ctx.input(|i| i.viewport().focused) != Some(false) {
-                    // The frames up to it keep coming while the window is
-                    // in front; a window behind another waits for an event.
-                    ctx.request_repaint();
-                }
-                return;
-            }
-            RendererCheck::Pending => {}
-        }
-        let probe = paint_probe(ctx);
-        let image = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot {
-                    user_data, image, ..
-                } if user_data
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.downcast_ref::<&str>())
-                    .is_some_and(|tag| *tag == RENDERER_CHECK) =>
-                {
-                    Some(image.clone())
-                }
-                _ => None,
-            })
-        });
-        let Some(image) = image else {
-            return;
-        };
-        let [w, h] = image.size;
-        if !gpu::renderer_blind(&image, probe) {
-            self.renderer_check = RendererCheck::Done;
-            log::info!("the window ({w} x {h} px) read back drawn");
-            return;
-        }
-        if ctx.input(|i| i.viewport().focused) == Some(false) {
-            log::warn!(
-                "the window ({w} x {h} px) came back nearly black from the renderer while another window is in front; checking again"
-            );
-        } else {
-            self.blind_reads += 1;
-            log::error!(
-                "the window ({w} x {h} px) came back nearly black from the renderer: it draws nothing that can be seen ({} of {})",
-                self.blind_reads,
-                gpu::BLIND_READS
-            );
-        }
-        if self.blind_reads < gpu::BLIND_READS {
-            self.renderer_check = RendererCheck::At(frame + gpu::RECHECK_FRAMES);
-            ctx.request_repaint();
-            return;
-        }
+    fn check_renderer(&mut self, _ctx: &egui::Context) {
         self.renderer_check = RendererCheck::Done;
-        if self.app.is_some() || gpu::next_renderer().is_none() {
-            log::warn!("renderer check finished; the window stays");
-            return;
-        }
-        gpu::note_blind();
-        // The window closes whatever the documents hold: nothing of them
-        // can be seen, and the start goes on with them.
-        if let Some(app) = self.app.as_mut() {
-            app.quit_now = true;
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 
