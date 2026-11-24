@@ -107,10 +107,18 @@ type PageBounds = std::collections::HashMap<ShapeId, Rect>;
 #[cfg(not(target_arch = "wasm32"))]
 fn page_bounds_cache(doc: &Document, page: PageId) -> PageBounds {
     fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) {
+        // An object drawn as the picture its bitmap effects make: the
+        // picture's box, which the effects grow past the object (a blur
+        // spreads). The object's own box cut the picture there, a hard
+        // edge round a blurred vector object (#4082).
+        let own = match s.picture() {
+            Some(p) => s.bounds().union(p.bounds()),
+            None => s.bounds(),
+        };
         let b = if parent == Affine::IDENTITY {
-            s.bounds()
+            own
         } else {
-            parent.transform_rect_bbox(s.bounds())
+            parent.transform_rect_bbox(own)
         };
         map.insert(s.id, b);
         let t = parent * s.transform;
@@ -1022,6 +1030,7 @@ impl Renderer<'_> {
         }
         if !shape.effects.is_empty()
             || shape.shadow.is_some()
+            || shape.raster_fx.is_some()
             || matches!(shape.kind, ShapeKind::SymbolInstance { .. })
             || self.preview.is_some_and(|p| p.shapes.contains(&shape.id))
         {
@@ -6450,7 +6459,21 @@ pub fn render_page_image(doc: &Document, page: PageId, dpi: f64) -> Option<Pixma
 /// where nothing is drawn: the page with whatever lies around it on the
 /// desktop, for the Navigator (#2053).
 pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> Option<Pixmap> {
-    doc.page(page).ok()?;
+    render_area_image_on_desk(doc, page, area, dpi, None)
+}
+
+/// [`render_area_image`] with the desktop round the page in `desk`
+/// (RGB) and the page white as paper, as the drawing window shows them:
+/// for Edit > Copy Visible Area in a dark theme (#4027). `None` is white
+/// everywhere.
+pub fn render_area_image_on_desk(
+    doc: &Document,
+    page: PageId,
+    area: Rect,
+    dpi: f64,
+    desk: Option<[u8; 3]>,
+) -> Option<Pixmap> {
+    let page_size = doc.page(page).ok()?.size;
     let zoom = dpi / 25.4;
     if !(area.width() > 0.0 && area.height() > 0.0) || !zoom.is_finite() || zoom <= 0.0 {
         return None;
@@ -6474,7 +6497,22 @@ pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> 
         },
     )?;
     let mut out = Pixmap::new(w, h)?;
-    out.fill(SkColor::WHITE);
+    match desk {
+        Some([r, g, b]) => {
+            out.fill(SkColor::from_rgba8(r, g, b, 255));
+            // The paper: the page's box (y up from its bottom edge).
+            let x0 = (-area.x0 * zoom) as f32;
+            let x1 = ((page_size.width - area.x0) * zoom) as f32;
+            let y0 = (h as f64 - (page_size.height - area.y0) * zoom) as f32;
+            let y1 = (h as f64 + area.y0 * zoom) as f32;
+            if let Some(paper) = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color(SkColor::WHITE);
+                out.fill_rect(paper, &paint, Transform::identity(), None);
+            }
+        }
+        None => out.fill(SkColor::WHITE),
+    }
     out.draw_pixmap(
         0,
         0,

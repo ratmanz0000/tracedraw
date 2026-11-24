@@ -56,10 +56,41 @@ pub enum PixelTool {
     Zoom,
     /// Drags the view of the picture (the image editing mode).
     Pan,
+    /// A selection outline of clicked corners and dragged freehand parts,
+    /// closed with a double click, Enter or a click on its first point.
+    FreehandMask,
+    /// A selection outline of points, curved where a press is dragged
+    /// (the drag pulls the point's handles), closed with a double click,
+    /// Enter or a click on its first point.
+    PenMask,
+    /// A freehand selection whose outline clings to the strongest edge
+    /// near the pointer.
+    EdgeMask,
+    /// Paints the selection with the brush (Alt or Ctrl takes away).
+    MaskBrush,
+    /// A selection band between two parallel lines, dragged across.
+    BandMask,
+    /// Liquify's push, its own tool.
+    Smear,
+    /// Liquify's twirl (Alt turns the other way).
+    Twirl,
+    /// Liquify's pinch: pixels drawn to the brush's centre.
+    Attract,
+    /// Liquify's bloat: pixels pushed from the brush's centre.
+    Repel,
+    /// Sprays scattered dots, stars, bubbles, leaves or confetti.
+    Sprayer,
+    /// A drag fades the layer from its opacity at the press to its
+    /// opacity at the release.
+    LayerFade,
+    /// A click makes the colour clicked (and those near it) see-through.
+    ColorToClear,
+    /// Paints see-through into the layer, to the level chosen.
+    TransparencyBrush,
 }
 
 impl PixelTool {
-    pub const ALL: [PixelTool; 29] = [
+    pub const ALL: [PixelTool; 42] = [
         PixelTool::RectSelect,
         PixelTool::EllipseSelect,
         PixelTool::Lasso,
@@ -89,6 +120,19 @@ impl PixelTool {
         PixelTool::Remove,
         PixelTool::Zoom,
         PixelTool::Pan,
+        PixelTool::FreehandMask,
+        PixelTool::PenMask,
+        PixelTool::EdgeMask,
+        PixelTool::MaskBrush,
+        PixelTool::BandMask,
+        PixelTool::Smear,
+        PixelTool::Twirl,
+        PixelTool::Attract,
+        PixelTool::Repel,
+        PixelTool::Sprayer,
+        PixelTool::LayerFade,
+        PixelTool::ColorToClear,
+        PixelTool::TransparencyBrush,
     ];
 
     /// The tool's i18n key (`pixel.tool.<name>`).
@@ -123,7 +167,45 @@ impl PixelTool {
             PixelTool::Remove => "pixel.tool.remove",
             PixelTool::Zoom => "pixel.tool.zoom",
             PixelTool::Pan => "pixel.tool.pan",
+            PixelTool::FreehandMask => "pixel.tool.freehand_mask",
+            PixelTool::PenMask => "pixel.tool.pen_mask",
+            PixelTool::EdgeMask => "pixel.tool.edge_mask",
+            PixelTool::MaskBrush => "pixel.tool.mask_brush",
+            PixelTool::BandMask => "pixel.tool.band_mask",
+            PixelTool::Smear => "pixel.tool.smear",
+            PixelTool::Twirl => "pixel.tool.twirl",
+            PixelTool::Attract => "pixel.tool.attract",
+            PixelTool::Repel => "pixel.tool.repel",
+            PixelTool::Sprayer => "pixel.tool.sprayer",
+            PixelTool::LayerFade => "pixel.tool.layer_fade",
+            PixelTool::ColorToClear => "pixel.tool.color_to_clear",
+            PixelTool::TransparencyBrush => "pixel.tool.transparency_brush",
         }
+    }
+
+    /// What a Liquify tool does with the pixels (`Liquify` itself takes
+    /// the mode chosen; Alt turns a twirl the other way).
+    pub fn liquify_mode(
+        self,
+        chosen: crate::pixel_liquify::LiquifyMode,
+        alt: bool,
+    ) -> Option<crate::pixel_liquify::LiquifyMode> {
+        use crate::pixel_liquify::LiquifyMode as M;
+        Some(match self {
+            PixelTool::Liquify => chosen,
+            PixelTool::Smear => M::Push,
+            PixelTool::Twirl if alt => M::TwirlLeft,
+            PixelTool::Twirl => M::TwirlRight,
+            PixelTool::Attract => M::Pinch,
+            PixelTool::Repel => M::Bloat,
+            _ => return None,
+        })
+    }
+
+    /// A tool that moves pixels with the brush (Liquify and its kin).
+    pub fn is_liquify(self) -> bool {
+        self.liquify_mode(crate::pixel_liquify::LiquifyMode::Push, false)
+            .is_some()
     }
 
     /// A tool painted with a round brush along a drag.
@@ -144,6 +226,7 @@ impl PixelTool {
                 | PixelTool::Restore
                 | PixelTool::Tint
                 | PixelTool::ReplaceColor
+                | PixelTool::TransparencyBrush
         )
     }
 
@@ -154,6 +237,11 @@ impl PixelTool {
                 | PixelTool::EllipseSelect
                 | PixelTool::Lasso
                 | PixelTool::MagicWand
+                | PixelTool::FreehandMask
+                | PixelTool::PenMask
+                | PixelTool::EdgeMask
+                | PixelTool::MaskBrush
+                | PixelTool::BandMask
         )
     }
 }
@@ -164,6 +252,26 @@ pub enum SelectMode {
     Replace,
     Add,
     Subtract,
+    /// Kept where only one of the two is.
+    Xor,
+}
+
+impl SelectMode {
+    pub const ALL: [SelectMode; 4] = [
+        SelectMode::Replace,
+        SelectMode::Add,
+        SelectMode::Subtract,
+        SelectMode::Xor,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SelectMode::Replace => "pixel.sel_mode.normal",
+            SelectMode::Add => "pixel.sel_mode.add",
+            SelectMode::Subtract => "pixel.sel_mode.subtract",
+            SelectMode::Xor => "pixel.sel_mode.xor",
+        }
+    }
 }
 
 /// The settings of the brushes, the fill and the magic wand.
@@ -215,6 +323,25 @@ pub struct BrushOpts {
     pub remove_grow: f32,
     /// What the Liquify brush does.
     pub liquify: crate::pixel_liquify::LiquifyMode,
+    /// How a new selection joins the one there is (Shift adds, Ctrl
+    /// takes away, whatever this is).
+    pub sel_mode: SelectMode,
+    /// The rectangle and ellipse selections: a click makes one of this
+    /// width and height (pixels) when on.
+    pub sel_fixed: bool,
+    pub sel_size: (f32, f32),
+    /// The soft edge of the band selection, pixels.
+    pub band_soft: f32,
+    /// How far the edge mask looks for an edge, pixels.
+    pub magnet_reach: f32,
+    /// The transparency brush: how see-through it paints, 0 to 1.
+    pub transparency: f32,
+    /// Layer fade: the layer's opacity where the drag starts and
+    /// where it ends, 0 to 1.
+    pub fade_from: f32,
+    pub fade_to: f32,
+    /// The sprayer.
+    pub spray: crate::pixel_spray::SprayOpts,
 }
 
 impl Default for BrushOpts {
@@ -245,6 +372,15 @@ impl Default for BrushOpts {
             surface_light: 0.8,
             remove_grow: 4.0,
             liquify: crate::pixel_liquify::LiquifyMode::Push,
+            sel_mode: SelectMode::Replace,
+            sel_fixed: false,
+            sel_size: (100.0, 100.0),
+            band_soft: 20.0,
+            magnet_reach: 6.0,
+            transparency: 0.5,
+            fade_from: 1.0,
+            fade_to: 0.0,
+            spray: crate::pixel_spray::SprayOpts::default(),
         }
     }
 }
@@ -494,6 +630,19 @@ pub fn combine(old: Option<&GrayImage>, new: GrayImage, mode: SelectMode) -> Opt
             let mut m = o.clone();
             for (a, b) in m.pixels_mut().zip(new.pixels()) {
                 a[0] = ((a[0] as u16 * (255 - b[0]) as u16) / 255) as u8;
+            }
+            Some(m)
+        }
+        // With nothing selected, "everything" stands for the old one.
+        (SelectMode::Xor, None) => {
+            let mut m = new;
+            m.pixels_mut().for_each(|v| v[0] = 255 - v[0]);
+            Some(m)
+        }
+        (SelectMode::Xor, Some(o)) => {
+            let mut m = o.clone();
+            for (a, b) in m.pixels_mut().zip(new.pixels()) {
+                a[0] = (a[0] as i16 - b[0] as i16).unsigned_abs() as u8;
             }
             Some(m)
         }
@@ -1659,6 +1808,15 @@ impl Stroke {
                 base[2],
                 (base[3] as f32 * (1.0 - t)).round() as u8,
             ]),
+            PixelTool::TransparencyBrush => {
+                let k = self.opts.transparency.clamp(0.0, 1.0);
+                Rgba([
+                    base[0],
+                    base[1],
+                    base[2],
+                    (base[3] as f32 * (1.0 - k * t)).round() as u8,
+                ])
+            }
             PixelTool::Clone => match self.source(x, y) {
                 Some(src) => match &self.surface {
                     Some(s) => mix(
@@ -2141,32 +2299,127 @@ impl History {
     }
 }
 
-/// The outline of a selection for the screen: an RGBA picture of its
-/// size, clear except a dashed black and white line where the mask
-/// crosses half way.
-pub fn selection_outline(m: &GrayImage) -> RgbaImage {
-    let (w, h) = m.dimensions();
+/// The outline of a selection for the screen: the pixel edges where the
+/// mask crosses half way, joined into straight runs, each (from, to) in
+/// pixels and turned so that the selection lies on its right: followed
+/// from start to end the runs go round the selection clockwise (the way
+/// the dashes march).
+pub fn selection_edges(m: &GrayImage) -> Vec<[(f32, f32); 2]> {
+    let (w, h) = (m.width() as i64, m.height() as i64);
+    let raw = m.as_raw();
     let on = |x: i64, y: i64| {
-        x >= 0
-            && y >= 0
-            && x < w as i64
-            && y < h as i64
-            && m.get_pixel(x as u32, y as u32)[0] >= 128
+        x >= 0 && y >= 0 && x < w && y < h && raw[(y * w + x) as usize] >= 128
     };
-    RgbaImage::from_fn(w, h, |x, y| {
-        let (xi, yi) = (x as i64, y as i64);
-        let me = on(xi, yi);
-        let edge = me && (!on(xi - 1, yi) || !on(xi + 1, yi) || !on(xi, yi - 1) || !on(xi, yi + 1));
-        if edge {
-            if ((x + y) / 4) % 2 == 0 {
-                Rgba([0, 0, 0, 255])
+    let mut out = Vec::new();
+    // Across: 1 where the selection is below the edge, 2 above.
+    for y in 0..=h {
+        let mut run: Option<(i64, u8)> = None;
+        for x in 0..=w {
+            let side = if x == w {
+                0
             } else {
-                Rgba([255, 255, 255, 255])
+                match (on(x, y - 1), on(x, y)) {
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    _ => 0,
+                }
+            };
+            if run.is_some_and(|(_, s)| s != side) {
+                if let Some((s0, s)) = run.take() {
+                    let (a, b) = ((s0 as f32, y as f32), (x as f32, y as f32));
+                    out.push(if s == 1 { [a, b] } else { [b, a] });
+                }
             }
-        } else {
-            Rgba([0, 0, 0, 0])
+            if side != 0 && run.is_none() {
+                run = Some((x, side));
+            }
         }
-    })
+    }
+    // Up and down: 1 where the selection is right of the edge, 2 left.
+    for x in 0..=w {
+        let mut run: Option<(i64, u8)> = None;
+        for y in 0..=h {
+            let side = if y == h {
+                0
+            } else {
+                match (on(x - 1, y), on(x, y)) {
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    _ => 0,
+                }
+            };
+            if run.is_some_and(|(_, s)| s != side) {
+                if let Some((s0, s)) = run.take() {
+                    let (a, b) = ((x as f32, s0 as f32), (x as f32, y as f32));
+                    out.push(if s == 1 { [b, a] } else { [a, b] });
+                }
+            }
+            if side != 0 && run.is_none() {
+                run = Some((y, side));
+            }
+        }
+    }
+    out
+}
+
+/// A point of a pen outline: where it lies and its two handles, as
+/// offsets from it (both nothing at a corner).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PenNode {
+    pub p: (f32, f32),
+    /// The handle of the curve coming in.
+    pub inn: (f32, f32),
+    /// The handle of the curve going out.
+    pub out: (f32, f32),
+}
+
+impl PenNode {
+    pub fn corner(p: (f32, f32)) -> Self {
+        PenNode {
+            p,
+            ..Default::default()
+        }
+    }
+}
+
+/// A pen outline as a polygon: each part between two points a cubic
+/// curve through their handles (a straight line between corners), cut
+/// into steps of about 2 pixels; `closed` adds the part from the last
+/// point back to the first.
+pub fn pen_polygon(nodes: &[PenNode], closed: bool) -> Vec<(f32, f32)> {
+    let n = nodes.len();
+    let Some(first) = nodes.first() else {
+        return Vec::new();
+    };
+    let dist = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).hypot(a.1 - b.1);
+    let mut pts = vec![first.p];
+    let parts = if closed && n > 2 { n } else { n - 1 };
+    for i in 0..parts {
+        let (a, b) = (nodes[i], nodes[(i + 1) % n]);
+        let p0 = a.p;
+        let p1 = (a.p.0 + a.out.0, a.p.1 + a.out.1);
+        let p2 = (b.p.0 + b.inn.0, b.p.1 + b.inn.1);
+        let p3 = b.p;
+        let steps = if a.out == (0.0, 0.0) && b.inn == (0.0, 0.0) {
+            1
+        } else {
+            let len = dist(p0, p1) + dist(p1, p2) + dist(p2, p3);
+            ((len / 2.0).ceil() as usize).clamp(4, 512)
+        };
+        for k in 1..=steps {
+            let t = k as f32 / steps as f32;
+            let u = 1.0 - t;
+            let (c0, c1, c2, c3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            pts.push((
+                c0 * p0.0 + c1 * p1.0 + c2 * p2.0 + c3 * p3.0,
+                c0 * p0.1 + c1 * p1.1 + c2 * p2.1 + c3 * p3.1,
+            ));
+        }
+    }
+    if closed && pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    pts
 }
 
 #[cfg(test)]
@@ -2903,11 +3156,45 @@ mod tests {
     }
 
     #[test]
-    fn the_selection_outline_is_on_the_edge() {
+    fn the_selection_outline_runs_round_the_selection_clockwise() {
         let m = rect_mask(10, 10, (2.0, 2.0), (8.0, 8.0)).unwrap();
-        let o = selection_outline(&m);
-        assert_eq!(o.get_pixel(2, 5)[3], 255);
-        assert_eq!(o.get_pixel(5, 5)[3], 0);
-        assert_eq!(o.get_pixel(0, 0)[3], 0);
+        let mut e = selection_edges(&m);
+        e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Four runs, one a side: right along the top, down the right,
+        // left along the bottom and up the left.
+        assert_eq!(
+            e,
+            vec![
+                [(2.0, 2.0), (8.0, 2.0)],
+                [(2.0, 8.0), (2.0, 2.0)],
+                [(8.0, 2.0), (8.0, 8.0)],
+                [(8.0, 8.0), (2.0, 8.0)],
+            ]
+        );
+        assert!(selection_edges(&GrayImage::new(4, 4)).is_empty());
+        // A selection to the picture's edge has its outline there.
+        let all = GrayImage::from_pixel(3, 2, Luma([255]));
+        assert_eq!(selection_edges(&all).len(), 4);
+    }
+
+    #[test]
+    fn a_pen_outline_curves_through_its_handles() {
+        // Corners only: the polygon of the points.
+        let sq = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)].map(PenNode::corner);
+        assert_eq!(pen_polygon(&sq, true), vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]);
+        assert_eq!(pen_polygon(&sq[..1], true), vec![(0.0, 0.0)]);
+        // A smooth point bulges the line out towards its handles.
+        let mut mid = PenNode::corner((10.0, 0.0));
+        mid.inn = (-5.0, -8.0);
+        mid.out = (5.0, 8.0);
+        let curve = [PenNode::corner((0.0, 0.0)), mid, PenNode::corner((20.0, 0.0))];
+        let pts = pen_polygon(&curve, false);
+        assert!(pts.len() > 8);
+        assert_eq!(pts.last(), Some(&(20.0, 0.0)));
+        assert!(pts.iter().any(|p| p.1 < -1.0), "the first part bulges up");
+        assert!(pts.iter().any(|p| p.1 > 1.0), "the second part bulges down");
+        let m = lasso_mask(20, 20, &pen_polygon(&sq, true)).unwrap();
+        assert_eq!(m.get_pixel(8, 2)[0], 255);
+        assert_eq!(m.get_pixel(2, 8)[0], 0);
     }
 }

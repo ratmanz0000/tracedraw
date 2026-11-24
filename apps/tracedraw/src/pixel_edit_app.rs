@@ -35,7 +35,9 @@ const LABEL: &str = "Edit Picture";
 #[derive(Default)]
 pub struct PixelTextures {
     pub tex: Option<egui::TextureHandle>,
-    pub outline: Option<egui::TextureHandle>,
+    /// The selection's outline: runs of pixel edges, round it clockwise
+    /// (see `pixel_edit::selection_edges`).
+    pub edges: Vec<[(f32, f32); 2]>,
     /// Pixels changed since the picture was last sent to the screen.
     pub dirty: Option<Dirty>,
     /// The whole picture is sent again (new size, undo, preview).
@@ -46,6 +48,8 @@ pub struct PixelTextures {
     pub overlay: Option<egui::TextureHandle>,
     /// The effect preview was shown last frame.
     pub showed_preview: bool,
+    /// The Layers panel's miniatures.
+    pub thumbs: crate::ui::pixel_layers::LayerThumbs,
 }
 
 /// A picture being edited in place.
@@ -65,6 +69,10 @@ pub struct PixelEdit {
     pub drag_from: Option<(f32, f32)>,
     pub drag_to: Option<(f32, f32)>,
     pub lasso: Vec<(f32, f32)>,
+    /// The pen outline being made (Pen mask), and whether a press is
+    /// pulling the handles of its last point.
+    pub pen: Vec<pixel_edit::PenNode>,
+    pub pen_drag: bool,
     /// Move: the layer's pixels when the drag started, and how far the
     /// drag has moved them.
     pub move_base: Option<image::RgbaImage>,
@@ -87,6 +95,11 @@ pub struct PixelEdit {
     pub original: std::rc::Rc<image::RgbaImage>,
     /// The Liquify stroke under way.
     pub liquify: Option<crate::pixel_liquify::Liquify>,
+    /// The sprayer's drag under way.
+    pub spray: Option<crate::pixel_spray::Spray>,
+    /// The Pick tool's numbers on the property bar (move, scale, turn,
+    /// flips), put in the layer with Apply.
+    pub placement: crate::pixel_ops::Placement,
     /// Smart Resize: the new width and height, percent of the picture's.
     pub smart_size: (f32, f32),
     /// A depth map of the picture (its size, 255 nearest) that stands for
@@ -467,6 +480,8 @@ impl App {
             size_px,
             original: std::rc::Rc::new(img.clone()),
             liquify: None,
+            spray: None,
+            placement: Default::default(),
             smart_size: (100.0, 100.0),
             depth: None,
             remove: None,
@@ -479,6 +494,8 @@ impl App {
             drag_from: None,
             drag_to: None,
             lasso: Vec::new(),
+            pen: Vec::new(),
+            pen_drag: false,
             move_base: None,
             move_by: (0, 0),
             layer_drag: false,
@@ -659,13 +676,7 @@ impl App {
         let clicked = response.clicked_by(PointerButton::Primary);
         let (w, h) = pe.pi.img.dimensions();
         let inside = x >= 0.0 && y >= 0.0 && x < w as f32 && y < h as f32;
-        let mode = if mods.shift {
-            SelectMode::Add
-        } else if mods.command || mods.ctrl {
-            SelectMode::Subtract
-        } else {
-            SelectMode::Replace
-        };
+        let mode = select_mode(pe.opts.sel_mode, mods);
         let tool = pe.tool;
         // Alt+click sets the source of the clone and heal brushes.
         if matches!(tool, PixelTool::Clone | PixelTool::Heal) && mods.alt {
@@ -685,8 +696,10 @@ impl App {
                         | PixelTool::Gradient
                         | PixelTool::Move
                         | PixelTool::Shape
-                        | PixelTool::Liquify
-                ))
+                        | PixelTool::Sprayer
+                        | PixelTool::LayerFade
+                        | PixelTool::ColorToClear
+                ) || tool.is_liquify())
         {
             if !matches!(tool, PixelTool::Brush | PixelTool::Eraser) {
                 if started || clicked {
@@ -738,9 +751,12 @@ impl App {
                     | PixelTool::Move
                     | PixelTool::Warp
                     | PixelTool::Shape
-                    | PixelTool::Liquify
                     | PixelTool::Remove
-            );
+                    | PixelTool::Sprayer
+                    | PixelTool::LayerFade
+                    | PixelTool::ColorToClear
+            )
+            || tool.is_liquify();
         if paints && pe.pi.active_locked() {
             if started || clicked {
                 self.status = tr("pixel.status.layer_locked");
@@ -847,10 +863,58 @@ impl App {
             }
             return;
         }
-        if tool == PixelTool::Liquify {
+        // The mask brush paints the selection itself.
+        if tool == PixelTool::MaskBrush {
+            let take = mods.alt || mods.command || mods.ctrl || mode == SelectMode::Subtract;
+            if started || (clicked && pe.mask_stroke.is_none()) {
+                pe.step();
+                let (w, h) = pe.pi.img.dimensions();
+                if mode == SelectMode::Replace && !mods.shift && pe.pi.sel.is_some() && started {
+                    // A new stroke in Normal starts a new selection.
+                    pe.pi.sel = Some(image::GrayImage::new(w, h));
+                }
+                let m = pe
+                    .pi
+                    .sel
+                    .get_or_insert_with(|| image::GrayImage::new(w, h));
+                pe.mask_stroke = Some(MaskStroke::new(pe.opts, m, if take { 0 } else { 255 }));
+            }
+            if started || dragged || clicked {
+                if let (Some(ms), Some(m)) = (pe.mask_stroke.as_mut(), pe.pi.sel.as_mut()) {
+                    ms.to(m, None, x, y);
+                }
+                pe.view.borrow_mut().sel_changed = true;
+            }
+            if stopped || clicked {
+                pe.mask_stroke = None;
+                pe.view.borrow_mut().sel_changed = true;
+            }
+            return;
+        }
+        if tool == PixelTool::Sprayer {
+            if started || (clicked && pe.spray.is_none()) {
+                pe.step();
+                let mut sp = crate::pixel_spray::Spray::new(pe.opts);
+                let b = sp.to(&mut pe.pi, x, y);
+                pe.mark(b);
+                pe.spray = (!clicked).then_some(sp);
+            } else if dragged {
+                let pe = &mut **pe;
+                let b = match pe.spray.as_mut() {
+                    Some(sp) => sp.to(&mut pe.pi, x, y),
+                    None => None,
+                };
+                pe.mark(b);
+            }
+            if stopped {
+                pe.spray = None;
+            }
+            return;
+        }
+        if let Some(lmode) = tool.liquify_mode(pe.opts.liquify, mods.alt) {
             if started || (clicked && pe.liquify.is_none()) {
                 pe.step();
-                let mut lq = crate::pixel_liquify::Liquify::new(pe.opts.liquify, pe.opts, &pe.pi);
+                let mut lq = crate::pixel_liquify::Liquify::new(lmode, pe.opts, &pe.pi);
                 let b = lq.to(&mut pe.pi, x, y);
                 pe.mark(b);
                 pe.liquify = (!clicked).then_some(lq);
@@ -913,10 +977,21 @@ impl App {
             return;
         }
         match tool {
+            PixelTool::RectSelect | PixelTool::EllipseSelect
+                if clicked && pe.opts.sel_fixed && inside =>
+            {
+                // A box of the width and height chosen, from the click.
+                let (fw, fh) = pe.opts.sel_size;
+                pe.drag_from = Some((x, y));
+                pe.drag_to = Some((x + fw.max(1.0), y + fh.max(1.0)));
+                pixel_release(pe, mods);
+            }
             PixelTool::RectSelect
             | PixelTool::EllipseSelect
             | PixelTool::Gradient
-            | PixelTool::Shape => {
+            | PixelTool::Shape
+            | PixelTool::BandMask
+            | PixelTool::LayerFade => {
                 if started {
                     pe.drag_from = Some((x, y));
                     pe.drag_to = Some((x, y));
@@ -932,6 +1007,86 @@ impl App {
                     pe.drag_to = Some((x, y));
                     pixel_release(pe, mods);
                 }
+            }
+            PixelTool::FreehandMask => {
+                // Clicks set corners, drags draw freehand; a double
+                // click, or a click on the first corner, closes it.
+                let near_first = pe.lasso.first().is_some_and(|f| {
+                    (f.0 - x).hypot(f.1 - y) * screen_per_px.max(1e-6) <= 8.0
+                });
+                if response.double_clicked() || (clicked && near_first && pe.lasso.len() > 2) {
+                    close_freehand(pe, mode);
+                } else if clicked
+                    || started
+                    || (dragged
+                        && pe
+                            .lasso
+                            .last()
+                            .is_none_or(|l| (l.0 - x).abs() + (l.1 - y).abs() > 1.0))
+                {
+                    pe.lasso.push((x, y));
+                }
+            }
+            PixelTool::PenMask => {
+                // A press sets a point, a drag from it pulls its handles
+                // (Alt the one going on only); a double click, or a
+                // press on the first point, closes it.
+                let spp = screen_per_px.max(1e-6);
+                let near = |p: (f32, f32), r: f32| (p.0 - x).hypot(p.1 - y) * spp <= r;
+                let pressed = response.contains_pointer()
+                    && response.ctx.input(|i| i.pointer.primary_pressed());
+                if response.double_clicked() {
+                    pe.pen_drag = false;
+                    if pe.pen.len() > 2 {
+                        close_pen(pe, mode);
+                    }
+                } else if pressed {
+                    if pe.pen.len() > 2 && pe.pen.first().is_some_and(|f| near(f.p, 8.0)) {
+                        pe.pen_drag = false;
+                        close_pen(pe, mode);
+                    } else if pe.pen.last().is_some_and(|l| near(l.p, 3.0)) {
+                        // The second press of a double click.
+                        pe.pen_drag = false;
+                    } else {
+                        pe.pen.push(pixel_edit::PenNode::corner((x, y)));
+                        pe.pen_drag = true;
+                    }
+                } else if dragged && pe.pen_drag {
+                    if let Some(l) = pe.pen.last_mut() {
+                        l.out = (x - l.p.0, y - l.p.1);
+                        if !mods.alt {
+                            l.inn = (-l.out.0, -l.out.1);
+                        }
+                    }
+                }
+                if stopped || clicked {
+                    pe.pen_drag = false;
+                }
+            }
+            PixelTool::EdgeMask => {
+                let reach = pe.opts.magnet_reach;
+                if started {
+                    let p = crate::pixel_ops::snap_to_edge(&pe.pi.img, x, y, reach);
+                    pe.lasso = vec![p];
+                } else if dragged
+                    && pe
+                        .lasso
+                        .last()
+                        .is_none_or(|l| (l.0 - x).abs() + (l.1 - y).abs() > 2.0)
+                {
+                    let p = crate::pixel_ops::snap_to_edge(&pe.pi.img, x, y, reach);
+                    pe.lasso.push(p);
+                }
+                if stopped {
+                    let mode_now = mode;
+                    close_freehand(pe, mode_now);
+                }
+            }
+            PixelTool::ColorToClear if clicked && inside => {
+                let o = pe.opts;
+                pe.apply(false, |pi| {
+                    crate::pixel_ops::color_to_clear(pi, x as u32, y as u32, &o)
+                });
             }
             PixelTool::Lasso => {
                 if started {
@@ -981,8 +1136,17 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let pressed = |k: Key, m: Modifiers| ctx.input_mut(|i| i.consume_key(m, k));
         if pressed(Key::Enter, Modifiers::NONE) {
-            // Enter puts a warp under way in the layer first.
+            // Enter closes a freehand outline, puts a warp under way in
+            // the layer, else finishes.
             match self.pixel_edit.as_mut() {
+                Some(pe) if pe.tool == PixelTool::FreehandMask && pe.lasso.len() > 2 => {
+                    let mode = pe.opts.sel_mode;
+                    close_freehand(pe, mode);
+                }
+                Some(pe) if pe.tool == PixelTool::PenMask && pe.pen.len() > 2 => {
+                    let mode = pe.opts.sel_mode;
+                    close_pen(pe, mode);
+                }
                 Some(pe) if pe.warp.is_some() => pe.apply_warp(),
                 _ => self.finish_pixel_edit(),
             }
@@ -990,6 +1154,22 @@ impl App {
         }
         // The zoom of the image window.
         use crate::ui::pixel_cmds::PixelCmd;
+        if pressed(Key::R, cmd | Modifiers::SHIFT) {
+            PixelCmd::TurnLeft.run(self);
+            return;
+        }
+        if pressed(Key::R, cmd) {
+            PixelCmd::TurnRight.run(self);
+            return;
+        }
+        // The adjustments with keys of their own.
+        for (k, m, id) in crate::ui::pixel_mode::ADJUST_KEYS {
+            let m = if m { cmd | Modifiers::SHIFT } else { cmd };
+            if pressed(k, m) {
+                crate::ui::pixel_mode::open_effect(self, id);
+                return;
+            }
+        }
         for (keys, c) in [
             (&[Key::Plus, Key::Equals][..], PixelCmd::ZoomIn),
             (&[Key::Minus][..], PixelCmd::ZoomOut),
@@ -1006,8 +1186,12 @@ impl App {
         };
         if pressed(Key::Escape, Modifiers::NONE) {
             // Esc leaves a warp off first, then drops the selection, then
-            // ends the editing.
-            if pe.warp.is_some() {
+            // ends the editing (an outline being clicked goes first).
+            if !pe.lasso.is_empty() || !pe.pen.is_empty() {
+                pe.lasso.clear();
+                pe.pen.clear();
+                pe.pen_drag = false;
+            } else if pe.warp.is_some() {
                 pe.cancel_warp();
             } else if pe.pi.sel.is_some() {
                 pe.set_selection(None);
@@ -1030,10 +1214,14 @@ impl App {
             let (w, h) = pe.pi.img.dimensions();
             let inv = pixel_edit::invert(pe.pi.sel.as_ref(), w, h);
             pe.set_selection(Some(inv));
+        } else if !pe.pen.is_empty() && pressed(Key::Backspace, Modifiers::NONE) {
+            // Backspace takes the pen outline's last point back.
+            pe.pen.pop();
+            pe.pen_drag = false;
         } else if pressed(Key::Delete, Modifiers::NONE) || pressed(Key::Backspace, Modifiers::NONE)
         {
             pe.apply(false, pixel_edit::clear_selection);
-        } else if pressed(Key::Q, Modifiers::NONE) {
+        } else if pressed(Key::Q, Modifiers::SHIFT) {
             let on = pe.target != MaskTarget::QuickMask;
             pe.set_quick_mask(on);
         } else if pressed(Key::OpenBracket, Modifiers::NONE) {
@@ -1041,39 +1229,54 @@ impl App {
         } else if pressed(Key::CloseBracket, Modifiers::NONE) {
             pe.opts.size = (pe.opts.size * 1.2).min(2000.0);
         } else {
-            for (k, t) in [
-                (Key::B, PixelTool::Brush),
-                (Key::E, PixelTool::Eraser),
-                (Key::S, PixelTool::Clone),
-                (Key::J, PixelTool::Heal),
-                (Key::M, PixelTool::RectSelect),
-                (Key::L, PixelTool::Lasso),
-                (Key::W, PixelTool::MagicWand),
-                (Key::G, PixelTool::Fill),
-                (Key::O, PixelTool::Dodge),
-                (Key::I, PixelTool::Eyedropper),
-                (Key::R, PixelTool::Blur),
-                (Key::V, PixelTool::Move),
-                (Key::Z, PixelTool::Zoom),
-                (Key::H, PixelTool::Pan),
-            ] {
-                if pressed(k, Modifiers::NONE) {
+            for (t, k, shift) in crate::ui::pixel_mode::SHORTCUTS {
+                let m = if shift { Modifiers::SHIFT } else { Modifiers::NONE };
+                if pressed(k, m) {
                     crate::ui::pixel_mode::choose_tool(pe, t);
+                    break;
                 }
             }
         }
     }
 }
 
+/// How a new selection joins the one there is: Shift adds, Ctrl takes
+/// away, Shift and Ctrl keep where only one is; else the mode chosen on
+/// the property bar.
+pub fn select_mode(chosen: SelectMode, mods: Modifiers) -> SelectMode {
+    let ctrl = mods.command || mods.ctrl;
+    match (mods.shift, ctrl) {
+        (true, true) => SelectMode::Xor,
+        (true, false) => SelectMode::Add,
+        (false, true) => SelectMode::Subtract,
+        _ => chosen,
+    }
+}
+
+/// Close the outline of clicked corners into a selection.
+pub fn close_freehand(pe: &mut PixelEdit, mode: SelectMode) {
+    let pts = std::mem::take(&mut pe.lasso);
+    let (w, h) = pe.pi.img.dimensions();
+    if let Some(m) = pixel_edit::lasso_mask(w, h, &pts) {
+        let sel = pixel_edit::combine(pe.pi.sel.as_ref(), m, mode);
+        pe.set_selection(sel);
+    }
+}
+
+/// Close the pen outline into a selection.
+pub fn close_pen(pe: &mut PixelEdit, mode: SelectMode) {
+    let nodes = std::mem::take(&mut pe.pen);
+    pe.pen_drag = false;
+    let (w, h) = pe.pi.img.dimensions();
+    if let Some(m) = pixel_edit::lasso_mask(w, h, &pixel_edit::pen_polygon(&nodes, true)) {
+        let sel = pixel_edit::combine(pe.pi.sel.as_ref(), m, mode);
+        pe.set_selection(sel);
+    }
+}
+
 /// The end of a drag of a selection tool or the gradient.
 fn pixel_release(pe: &mut PixelEdit, mods: Modifiers) {
-    let mode = if mods.shift {
-        SelectMode::Add
-    } else if mods.command || mods.ctrl {
-        SelectMode::Subtract
-    } else {
-        SelectMode::Replace
-    };
+    let mode = select_mode(pe.opts.sel_mode, mods);
     let (w, h) = pe.pi.img.dimensions();
     let (from, to) = (pe.drag_from.take(), pe.drag_to.take());
     let lasso = std::mem::take(&mut pe.lasso);
@@ -1110,6 +1313,22 @@ fn pixel_release(pe: &mut PixelEdit, mods: Modifiers) {
             }
             let o = pe.opts;
             pe.apply(false, |pi| pixel_edit::gradient(pi, a, b, &o));
+        }
+        PixelTool::LayerFade => {
+            let (Some(a), Some(b)) = (from, to) else {
+                return;
+            };
+            let o = pe.opts;
+            pe.apply(false, |pi| crate::pixel_ops::layer_fade(pi, a, b, &o));
+        }
+        PixelTool::BandMask => {
+            let (Some(a), Some(b)) = (from, to) else {
+                return;
+            };
+            if let Some(m) = crate::pixel_ops::band_mask(w, h, a, b, pe.opts.band_soft) {
+                let sel = pixel_edit::combine(pe.pi.sel.as_ref(), m, mode);
+                pe.set_selection(sel);
+            }
         }
         PixelTool::Shape => {
             let (Some(a), Some(b)) = (from, to) else {
@@ -1174,7 +1393,9 @@ pub fn draw_mapped(
         }
         v.full = false;
         v.dirty = None;
+        v.thumbs.stale = true;
     } else if let Some(b) = v.dirty.take() {
+        v.thumbs.stale = true;
         let (x0, y0) = (b[0].min(w), b[1].min(h));
         let (x1, y1) = (b[2].min(w), b[3].min(h));
         if x1 > x0 && y1 > y0 {
@@ -1205,14 +1426,12 @@ pub fn draw_mapped(
     }
     v.showed_preview = preview;
     if v.sel_changed {
-        v.outline = pe.pi.sel.as_ref().map(|m| {
-            let o = pixel_edit::selection_outline(m);
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [o.width() as usize, o.height() as usize],
-                o.as_raw(),
-            );
-            ctx.load_texture("pixel_edit_outline", img, opts)
-        });
+        v.edges = pe
+            .pi
+            .sel
+            .as_ref()
+            .map(pixel_edit::selection_edges)
+            .unwrap_or_default();
         v.sel_changed = false;
     }
     let corners = [
@@ -1276,10 +1495,8 @@ pub fn draw_mapped(
     if let Some(t) = &v.overlay {
         painter.add(quad(t.id()));
     }
-    if pe.target != MaskTarget::QuickMask {
-        if let Some(t) = &v.outline {
-            painter.add(quad(t.id()));
-        }
+    if pe.target != MaskTarget::QuickMask && !v.edges.is_empty() {
+        marching_ants(painter, &v.edges, map);
     }
     // The picture's edge.
     let edge = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1E, 0x7C, 0xE8));
@@ -1291,7 +1508,27 @@ pub fn draw_mapped(
     let ink = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1E, 0x7C, 0xE8));
     if let (Some(a), Some(b)) = (pe.drag_from, pe.drag_to) {
         match pe.tool {
-            PixelTool::RectSelect | PixelTool::Gradient if pe.tool == PixelTool::Gradient => {
+            PixelTool::Gradient | PixelTool::LayerFade => {
+                painter.line_segment([to_screen(a), to_screen(b)], ink);
+                painter.circle_filled(to_screen(a), 3.5, egui::Color32::WHITE);
+                painter.circle_filled(to_screen(b), 3.5, egui::Color32::BLACK);
+            }
+            PixelTool::BandMask => {
+                // The band's two edges, square to the drag, across the
+                // picture.
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len = dx.hypot(dy).max(1e-3);
+                let (nx, ny) = (-dy / len, dx / len);
+                let far = (w + h) as f32;
+                for p in [a, b] {
+                    painter.line_segment(
+                        [
+                            to_screen((p.0 - nx * far, p.1 - ny * far)),
+                            to_screen((p.0 + nx * far, p.1 + ny * far)),
+                        ],
+                        ink,
+                    );
+                }
                 painter.line_segment([to_screen(a), to_screen(b)], ink);
             }
             PixelTool::RectSelect => {
@@ -1365,8 +1602,65 @@ pub fn draw_mapped(
         let pts: Vec<_> = pe.lasso.iter().map(|p| to_screen(*p)).collect();
         painter.add(egui::Shape::line(pts, ink));
     }
+    // The outline of clicked corners: its corners and the line on to the
+    // pointer.
+    if pe.tool == PixelTool::FreehandMask && !pe.lasso.is_empty() {
+        if let (Some(l), Some(p)) = (pe.lasso.last(), pointer) {
+            painter.line_segment([to_screen(*l), to_screen(p)], ink);
+        }
+        if let Some(f) = pe.lasso.first() {
+            painter.circle(to_screen(*f), 4.0, egui::Color32::WHITE, ink);
+        }
+    }
+    // The pen outline: its curve so far, on to the pointer, its points,
+    // the first one round, and the handles of the last.
+    if pe.tool == PixelTool::PenMask && !pe.pen.is_empty() {
+        let line: Vec<_> = pixel_edit::pen_polygon(&pe.pen, false)
+            .into_iter()
+            .map(to_screen)
+            .collect();
+        if line.len() > 1 {
+            painter.add(egui::Shape::line(line, ink));
+        }
+        if let (Some(l), Some(p), false) = (pe.pen.last(), pointer, pe.pen_drag) {
+            let next = [*l, pixel_edit::PenNode::corner(p)];
+            let pts: Vec<_> = pixel_edit::pen_polygon(&next, false)
+                .into_iter()
+                .map(to_screen)
+                .collect();
+            painter.add(egui::Shape::dashed_line(&pts, ink, 4.0, 3.0));
+        }
+        for n in &pe.pen {
+            let c = to_screen(n.p);
+            painter.rect(
+                egui::Rect::from_center_size(c, egui::vec2(6.0, 6.0)),
+                0.0,
+                egui::Color32::WHITE,
+                ink,
+                egui::StrokeKind::Middle,
+            );
+        }
+        if let Some(f) = pe.pen.first() {
+            painter.circle(to_screen(f.p), 4.0, egui::Color32::WHITE, ink);
+        }
+        if let Some(l) = pe.pen.last() {
+            for h in [l.inn, l.out] {
+                if h != (0.0, 0.0) {
+                    let e = to_screen((l.p.0 + h.0, l.p.1 + h.1));
+                    painter.line_segment([to_screen(l.p), e], ink);
+                    painter.circle_filled(e, 3.0, ink.color);
+                }
+            }
+        }
+    }
     // The brush's size under the pointer, and the clone source.
-    if pe.tool.is_brush() || pe.tool == PixelTool::Light {
+    if pe.tool.is_brush()
+        || pe.tool.is_liquify()
+        || matches!(
+            pe.tool,
+            PixelTool::Light | PixelTool::MaskBrush | PixelTool::Sprayer | PixelTool::Remove
+        )
+    {
         if let Some((x, y)) = pointer {
             let r = pe.opts.size / 2.0;
             let pts: Vec<_> = (0..=40)
@@ -1399,10 +1693,127 @@ pub fn draw_mapped(
     }
 }
 
+/// Dashes and gaps of the selection outline, in screen points.
+const ANT: f32 = 4.0;
+/// How fast the dashes march round the selection, points a second.
+const ANT_SPEED: f64 = 12.0;
+/// More screen points of outline than this and the dashes stand still
+/// (a selection of thousands of specks), so the screen keeps up.
+const ANT_MOST: f32 = 400_000.0;
+
+/// The selection outline as marching ants: a black line with white
+/// dashes on it that move round the selection, clockwise, a line one
+/// screen point wide at every zoom. Only the runs on the screen are
+/// drawn.
+fn marching_ants(
+    painter: &egui::Painter,
+    edges: &[[(f32, f32); 2]],
+    map: &dyn Fn(f32, f32) -> egui::Pos2,
+) {
+    let clip = painter.clip_rect().expand(2.0);
+    let shown: Vec<(egui::Pos2, egui::Pos2)> = edges
+        .iter()
+        .map(|e| (map(e[0].0, e[0].1), map(e[1].0, e[1].1)))
+        .filter(|(a, b)| clip.intersects(egui::Rect::from_two_pos(*a, *b)))
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    let black = egui::Stroke::new(1.0, egui::Color32::BLACK);
+    let white = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    let mut shapes: Vec<egui::Shape> =
+        shown.iter().map(|(a, b)| egui::Shape::line_segment([*a, *b], black)).collect();
+    let length: f32 = shown.iter().map(|(a, b)| (*b - *a).length()).sum();
+    let moving = length <= ANT_MOST;
+    let ctx = painter.ctx();
+    let phase = if moving {
+        (ctx.input(|i| i.time) * ANT_SPEED).rem_euclid(2.0 * ANT as f64) as f32
+    } else {
+        0.0
+    };
+    for (a, b) in shown {
+        ant_dashes(a, b, phase, white, &mut shapes);
+    }
+    painter.extend(shapes);
+    if moving {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The white dashes on the line from `a` to `b`: laid on the line's
+/// own distance along its direction less `phase`, so runs in a line
+/// share one pattern and a larger phase moves them on towards `b`.
+pub(crate) fn ant_dashes(
+    a: egui::Pos2,
+    b: egui::Pos2,
+    phase: f32,
+    stroke: egui::Stroke,
+    out: &mut Vec<egui::Shape>,
+) {
+    let v = b - a;
+    let len = v.length();
+    if len <= 0.0 {
+        return;
+    }
+    let u = v / len;
+    let along = a.x * u.x + a.y * u.y - phase;
+    let mut t = -along.rem_euclid(2.0 * ANT);
+    while t < len {
+        let (d0, d1) = (t.max(0.0), (t + ANT).min(len));
+        if d1 > d0 {
+            out.push(egui::Shape::line_segment([a + u * d0, a + u * d1], stroke));
+        }
+        t += 2.0 * ANT;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn the_pen_closes_its_outline_into_a_selection_and_curves_through_handles() {
+        let (mut app, id) = app_with_picture();
+        app.edit_bitmap_inside(id);
+        let pe = app.pixel_edit.as_mut().unwrap();
+        pe.tool = PixelTool::PenMask;
+        let c = pixel_edit::PenNode::corner;
+        pe.pen = vec![c((1.0, 1.0)), c((10.0, 1.0)), c((10.0, 9.0)), c((1.0, 9.0))];
+        close_pen(pe, SelectMode::Replace);
+        let sel = pe.pi.sel.clone().unwrap();
+        assert_eq!(sel.get_pixel(5, 5)[0], 255);
+        assert_eq!(sel.get_pixel(15, 5)[0], 0);
+        assert!(pe.pen.is_empty() && !pe.pen_drag);
+        // The right side pulled out into a curve reaches further right.
+        let mut bulge = c((10.0, 5.0));
+        bulge.inn = (6.0, -3.0);
+        bulge.out = (-6.0, 3.0);
+        pe.pen = vec![c((1.0, 1.0)), c((10.0, 1.0)), bulge, c((10.0, 9.0)), c((1.0, 9.0))];
+        close_pen(pe, SelectMode::Replace);
+        let sel = pe.pi.sel.clone().unwrap();
+        assert!(sel.get_pixel(11, 3)[0] >= 128, "the curve bulges past the corners");
+        assert_eq!(sel.get_pixel(15, 3)[0], 0);
+    }
+
+    #[test]
+    fn the_ants_dashes_march_along_the_line() {
+        let dashes = |phase: f32| {
+            let mut out = Vec::new();
+            let st = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            ant_dashes(egui::pos2(0.0, 0.0), egui::pos2(16.0, 0.0), phase, st, &mut out);
+            out.iter()
+                .filter_map(|s| match s {
+                    egui::Shape::LineSegment { points, .. } => Some((points[0].x, points[1].x)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(dashes(0.0), vec![(0.0, 4.0), (8.0, 12.0)]);
+        // Later on they have moved on along the line.
+        assert_eq!(dashes(2.0), vec![(2.0, 6.0), (10.0, 14.0)]);
+        assert_eq!(dashes(6.0), vec![(0.0, 2.0), (6.0, 10.0), (14.0, 16.0)]);
+    }
 
     /// An app with one 20 x 10 pixel picture, 40 x 20 mm at (10, 10).
     fn app_with_picture() -> (App, ShapeId) {
@@ -1705,5 +2116,63 @@ mod tests {
         assert!(pe.target_mask().is_none());
         pe.undo();
         assert_eq!(*pe.pi.img.get_pixel(10, 5), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn the_new_selection_tools_select() {
+        let (mut app, id) = app_with_picture();
+        app.edit_bitmap_inside(id);
+        let pe = app.pixel_edit.as_mut().unwrap();
+        // Band: the band dragged across.
+        pe.tool = PixelTool::BandMask;
+        pe.opts.band_soft = 0.0;
+        pe.drag_from = Some((5.0, 5.0));
+        pe.drag_to = Some((10.0, 5.0));
+        pixel_release(pe, Modifiers::NONE);
+        let sel = pe.pi.sel.clone().unwrap();
+        assert_eq!(sel.get_pixel(7, 2)[0], 255);
+        assert_eq!(sel.get_pixel(15, 2)[0], 0);
+        // Freehand: clicked corners closed; Shift+Ctrl keeps where only
+        // one of the two is.
+        pe.tool = PixelTool::FreehandMask;
+        pe.lasso = vec![(0.0, 0.0), (8.0, 0.0), (8.0, 10.0), (0.0, 10.0)];
+        let m = Modifiers::SHIFT | Modifiers::CTRL;
+        close_freehand(pe, select_mode(pe.opts.sel_mode, m));
+        let sel = pe.pi.sel.clone().unwrap();
+        assert_eq!(sel.get_pixel(2, 5)[0], 255, "only the freehand");
+        assert_eq!(sel.get_pixel(7, 5)[0], 0, "both");
+        assert_eq!(sel.get_pixel(9, 5)[0], 255, "only the band");
+        assert!(pe.lasso.is_empty());
+        // The mode on the bar when no key is held.
+        pe.opts.sel_mode = SelectMode::Subtract;
+        assert_eq!(select_mode(pe.opts.sel_mode, Modifiers::NONE), SelectMode::Subtract);
+        assert_eq!(select_mode(pe.opts.sel_mode, Modifiers::SHIFT), SelectMode::Add);
+    }
+
+    #[test]
+    fn layer_fade_fades_the_layer_in_one_step() {
+        let (mut app, id) = app_with_picture();
+        app.edit_bitmap_inside(id);
+        let pe = app.pixel_edit.as_mut().unwrap();
+        pe.tool = PixelTool::LayerFade;
+        pe.drag_from = Some((0.0, 5.0));
+        pe.drag_to = Some((20.0, 5.0));
+        pixel_release(pe, Modifiers::NONE);
+        assert!(pe.pi.img.get_pixel(19, 5)[3] < 30);
+        pe.undo();
+        assert_eq!(pe.pi.img.get_pixel(19, 5)[3], 255);
+    }
+
+    #[test]
+    fn the_liquify_tools_each_move_the_pixels_their_way() {
+        use crate::pixel_liquify::LiquifyMode as M;
+        let chosen = M::Bloat;
+        assert_eq!(PixelTool::Liquify.liquify_mode(chosen, false), Some(M::Bloat));
+        assert_eq!(PixelTool::Smear.liquify_mode(chosen, false), Some(M::Push));
+        assert_eq!(PixelTool::Twirl.liquify_mode(chosen, false), Some(M::TwirlRight));
+        assert_eq!(PixelTool::Twirl.liquify_mode(chosen, true), Some(M::TwirlLeft));
+        assert_eq!(PixelTool::Attract.liquify_mode(chosen, false), Some(M::Pinch));
+        assert_eq!(PixelTool::Repel.liquify_mode(chosen, false), Some(M::Bloat));
+        assert_eq!(PixelTool::Brush.liquify_mode(chosen, false), None);
     }
 }

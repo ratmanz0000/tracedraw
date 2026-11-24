@@ -583,10 +583,10 @@ impl App {
             .enumerate()
             .min_by(|a, b| a.1.distance_squared(p).total_cmp(&b.1.distance_squared(p)))?
             .0;
-        // The grid point is where the letters lie in the parent's space;
-        // the click that hit_char reads is on the page.
-        let to_page = self.doc().parent_transform(text)?;
-        Some(to_page * grid[nearest])
+        // The grid is in the space of the groups around the text; the
+        // letters are found on the page (#4037).
+        let parent = self.doc().parent_transform(text).unwrap_or(Affine::IDENTITY);
+        Some(parent * grid[nearest])
     }
 
     fn leaf_at(
@@ -833,6 +833,13 @@ impl App {
             {
                 return true;
             }
+            return std::iter::once(ev.main)
+                .chain(ev.below)
+                .chain(ev.above)
+                .any(|mut part| {
+                    part.effects.clear();
+                    self.shape_hit_in(&part, p, tol, depth)
+                });
         }
         // A dimension is picked on its lines, arrowheads and label only,
         // never in the empty part of its box: an object under it (the
@@ -866,18 +873,21 @@ impl App {
         let open = s.kind.is_open_curve();
         let filled =
             !matches!(s.fill, Fill::None) && (!open || self.doc().metadata.fill_open_curves);
-        // The fill of an open curve shown, and its inside when "Treat all
-        // objects as filled" is on, runs across its open ends, as drawn.
-        // The raw path's winding of an open line reads one side of its
-        // box as inside, which picked the line there.
-        let contains = |path: &tracedraw_core::BezPath| {
+        // The fill of an open curve shown runs across its open ends, as
+        // drawn.
+        // The inside of an open curve is that of the curve closed across
+        // its open ends, as its fill is drawn: the raw path took one side
+        // of a slanted line's box as inside, so a click in the empty half
+        // of that box picked the line over the objects there (#4032). A
+        // straight line closed has no inside.
+        let inside = || {
             if open {
-                tracedraw_core::command::close_subpaths(path).contains(p)
+                tracedraw_core::command::close_subpaths(&path).contains(p)
             } else {
                 path.contains(p)
             }
         };
-        if (filled || self.settings.treat_all_filled) && contains(&path) {
+        if (filled || self.settings.treat_all_filled) && inside() {
             return true;
         }
         crate::canvas::distance_to_path(&path, p) <= (tol * 1.5).max(half + tol)
@@ -2197,15 +2207,6 @@ impl App {
         {
             return;
         }
-        // The GK-42 mode takes the primary click first: while it is on,
-        // a click places the markers or adds a picked point, and a
-        // drag keeps doing the tool's work below (the box select, the
-        // pan). It goes before the click_selects branch, whose select
-        // would swallow the click otherwise.
-        if self.map_gk42.on && response.clicked_by(PointerButton::Primary) {
-            crate::map_gk42::click(self, p);
-            return;
-        }
         // A click with a tool whose click has no job of its own selects;
         // a drag goes on to the tool below.
         if self.tool.click_selects() && response.clicked_by(PointerButton::Primary) {
@@ -2278,7 +2279,15 @@ impl App {
                 // a click sampled or applied nothing (#2897).
                 if response.clicked() || response.drag_stopped_by(PointerButton::Primary) {
                     let attrs = self.tool == Tool::AttributesEyedropper;
-                    if !attrs && self.eyedropper_wants_screen(p, mods.shift, mods.ctrl) {
+                    let sampling = !self.eyedropper_apply || mods.ctrl;
+                    // Alt+click reads the picture under the shapes drawn
+                    // over it, as when tracing a photo by hand (#4083).
+                    let beneath = (!attrs && mods.alt && sampling)
+                        .then(|| self.sample_picture_beneath(p))
+                        .flatten();
+                    if let Some(c) = beneath {
+                        self.took_sampled_color(c, false);
+                    } else if !attrs && self.eyedropper_wants_screen(p, mods.shift, mods.ctrl) {
                         // No object gives a colour here (the desk, the
                         // empty page): the colour shown there (#3040).
                         let at = response.interact_pointer_pos().unwrap_or(screen);
@@ -2865,6 +2874,11 @@ impl App {
                         .is_some_and(|s| matches!(s.kind, ShapeKind::Bitmap { .. }))
                     && self.edit_bitmap_inside(id)
                 {
+                    return;
+                }
+                // A group bent by an envelope holding a blend: the blend's
+                // options, the group in focus (#3968).
+                if self.edit_bent_blend(id) {
                     return;
                 }
                 // A group or clip frame: into focus mode.
@@ -4845,9 +4859,9 @@ impl App {
                 // Text > Bullets On/Off at the caret (#3593).
                 self.toggle_bullets();
             } else if is(Key::S, cmd) {
-                self.save(false);
+                self.save_showing_progress(false);
             } else if is(Key::S, cmd | Modifiers::SHIFT) {
-                self.save(true);
+                self.save_showing_progress(true);
             } else {
                 continue;
             }
@@ -5298,10 +5312,10 @@ impl App {
             self.redo();
         }
         if pressed(Key::S, cmd) {
-            self.save(false);
+            self.save_showing_progress(false);
         }
         if pressed(Key::S, cmd | Modifiers::SHIFT) {
-            self.save(true);
+            self.save_showing_progress(true);
         }
         if pressed(Key::S, Modifiers::ALT) && self.symmetry_edit.is_none() {
             self.create_symmetry();

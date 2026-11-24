@@ -551,7 +551,12 @@ impl App {
         let before = self.docs.len();
         let old = self.active_doc.min(before.saturating_sub(1));
         let lone = before > 0 && self.twin(old).is_none();
+        // Read at once, so that it takes the changed drawing's tab (a
+        // large file of another format is otherwise read a frame later,
+        // after its notice shows).
+        self.open_noticed = Some(path.clone());
         self.open_path_with_password(path, "");
+        self.open_noticed = None;
         if !lone || self.docs.len() != before + 1 || self.active_doc != before {
             return;
         }
@@ -788,6 +793,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("temp dir");
         d
+    }
+
+    /// Save from the menus, the toolbar and the keyboard writes a large
+    /// drawing off the interface's thread (#4011): the drawing stays
+    /// unsaved, with what is typed and clicked held back, until its file
+    /// is written, and is then saved as after any save. A drawing changed
+    /// meanwhile keeps its unsaved changes; a small one, and every other
+    /// save (the question on closing), is written at once.
+    #[test]
+    fn a_large_drawing_is_saved_off_the_interfaces_thread() {
+        let dir = temp_dir("saving-worker");
+        let mut app = App::headless();
+        assert!(!app.save_on_worker, "the tests save at once");
+        app.save_on_worker = true;
+        app.open_document(
+            tracedraw_core::Document::new("Big", Size::new(100.0, 100.0)),
+            None,
+        );
+        add_rect(&mut app);
+        // A small drawing: written at once.
+        let small = dir.join("small.tdraw");
+        app.save_to_showing_progress(small.clone());
+        assert!(app.saving.is_none() && !app.engine.is_dirty());
+        assert!(small.exists());
+        // A file already large is the sign of a large drawing.
+        let big = dir.join("big.tdraw");
+        std::fs::write(&big, vec![0u8; crate::saving::BACKGROUND_FROM as usize]).expect("file");
+        add_rect(&mut app);
+        // Any other save writes at once.
+        app.save_to(big.clone());
+        assert!(app.saving.is_none() && !app.engine.is_dirty());
+        std::fs::write(&big, vec![0u8; crate::saving::BACKGROUND_FROM as usize]).expect("file");
+        add_rect(&mut app);
+        app.save_showing_progress(false);
+        assert!(app.saving.is_some(), "being written");
+        assert!(app.engine.is_dirty(), "not saved until the file is written");
+        // What is typed, clicked or dropped meanwhile is left out.
+        let mut raw = egui::RawInput {
+            events: vec![
+                egui::Event::Text("x".into()),
+                egui::Event::PointerMoved(egui::pos2(3.0, 4.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(3.0, 4.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        crate::saving::hold_input(&mut raw);
+        assert_eq!(raw.events.len(), 1);
+        let t = web_time::Instant::now();
+        while app.poll_saving() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(app.saving.is_none() && !app.engine.is_dirty());
+        assert_eq!(app.file.as_deref(), Some(big.as_path()));
+        let bytes = std::fs::read(&big).expect("file");
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "the packed drawing");
+        assert!(app.status.contains("big.tdraw"));
+        // Changed while its file was written: the file holds the drawing
+        // as it was, and the drawing keeps its unsaved change.
+        std::fs::write(&big, vec![0u8; crate::saving::BACKGROUND_FROM as usize]).expect("file");
+        app.save_showing_progress(false);
+        assert!(app.saving.is_some());
+        add_rect(&mut app);
+        app.wait_for_saving();
+        assert!(app.saving.is_none());
+        assert!(app.engine.is_dirty(), "changed since its copy was taken");
+        // Saved again while one is being written: the first ends first.
+        std::fs::write(&big, vec![0u8; crate::saving::BACKGROUND_FROM as usize]).expect("file");
+        app.save_showing_progress(false);
+        app.save_to(big.clone());
+        assert!(app.saving.is_none() && !app.engine.is_dirty());
+        assert_eq!(&std::fs::read(&big).expect("file")[..2], &[0x1f, 0x8b]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A large file of another format says it is being opened before it
+    /// is read (the reading stops the window): the notice is on screen
+    /// for a frame first, then the file opens; several open one after
+    /// the other, each with its notice; Revert reads at once, into the
+    /// same tab. A small file opens at once.
+    #[test]
+    fn a_large_file_of_another_format_says_it_is_opening_first() {
+        let dir = temp_dir("open-notice");
+        let mut app = App::headless();
+        app.save_on_worker = true;
+        let svg = |name: &str, pad: usize| {
+            let path = dir.join(name);
+            let text = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><!--{}--><rect x=\"10\" y=\"10\" width=\"30\" height=\"20\"/></svg>",
+                " ".repeat(pad)
+            );
+            std::fs::write(&path, text).expect("file");
+            path
+        };
+        let base = app.docs.len();
+        let small = svg("small.svg", 0);
+        app.open_path(small);
+        assert!(app.open_notice.is_none());
+        assert_eq!(app.docs.len(), base + 1, "opened at once");
+        let big = crate::opening::BACKGROUND_FROM as usize;
+        let (one, two) = (svg("one.svg", big), svg("two.svg", big));
+        app.open_path(one.clone());
+        app.open_path(two.clone());
+        assert_eq!(app.docs.len(), base + 1, "not read yet");
+        assert_eq!(app.open_notice.as_ref().map(|n| n.0.clone()), Some(one.clone()));
+        assert!(app.status.contains("one.svg"), "{}", app.status);
+        // Its notice is drawn, then it is read; the next one's shows.
+        assert!(app.poll_open_notice() && app.poll_open_notice());
+        assert_eq!(app.docs.len(), base + 1);
+        assert!(app.poll_open_notice(), "the second waits its turn");
+        assert_eq!(app.docs.len(), base + 2);
+        assert_eq!(app.open_notice.as_ref().map(|n| n.0.clone()), Some(two));
+        assert!(app.poll_open_notice() && app.poll_open_notice());
+        assert!(!app.poll_open_notice());
+        assert_eq!(app.docs.len(), base + 3);
+        assert!(app.open_notice.is_none());
+        assert_eq!(app.doc().pages[0].layers[0].shapes.len(), 1);
+        // Revert reads the file at once, into the same tab.
+        app.switch_document(base + 1);
+        add_rect(&mut app);
+        assert_eq!(app.revert_path(), Some(crate::files::canonical(&one)));
+        app.revert();
+        assert!(app.open_notice.is_none());
+        assert_eq!(app.docs.len(), base + 3);
+        assert_eq!(app.doc().pages[0].layers[0].shapes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Open drawings keep their files (#2130): the file of every open

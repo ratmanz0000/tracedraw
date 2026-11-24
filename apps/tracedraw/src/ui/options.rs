@@ -1327,7 +1327,22 @@ fn display_page(app: &mut App, ui: &mut Ui) {
                     "options.preview_background_tip",
                 ),
                 |ui| {
-                    rgb_button(ui, &mut app.settings.preview_background);
+                    // The colour shown is the one round the page, the
+                    // drawing window's until one is picked (#4027).
+                    let [r, g, b, _] = app.preview_background_color().to_array();
+                    let mut rgb = [r, g, b];
+                    if rgb_button(ui, &mut rgb) {
+                        app.settings.preview_background = rgb;
+                        app.settings.preview_background_custom = true;
+                    }
+                    if ui
+                        .button(tr("options.reset"))
+                        .rich_tip(crate::ui::tips::pair("options.reset", "dialog.reset_desc"))
+                        .clicked()
+                    {
+                        app.settings.preview_background = [255, 255, 255];
+                        app.settings.preview_background_custom = false;
+                    }
                 },
             );
         });
@@ -1702,6 +1717,11 @@ fn nodes_page(app: &mut App, ui: &mut Ui) {
                 tr("options.corner_one_at_a_time"),
             )
             .rich_tip(tr("options.corner_one_at_a_time_tip"));
+            ui.checkbox(
+                &mut n.corners_follow_edits,
+                tr("options.corners_follow_edits"),
+            )
+            .rich_tip(tr("options.corners_follow_edits_tip"));
         });
     });
     ui.horizontal(|ui| {
@@ -5268,22 +5288,25 @@ fn dimension_page(app: &mut App, ui: &mut Ui) {
         style.precision = precision;
         ui.end_row();
         row_label(ui, &tr("options.dimension_style"));
+        let mut notation = style.notation();
         crate::ui::keynav::ComboBox::from_id_salt("options_dimension_style")
-            .selected_text(tr(if style.fractional {
-                "options.fractional"
-            } else {
-                "options.decimal"
-            }))
-            .width(120.0)
+            .selected_text(tr(notation.key()))
+            .width(220.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut style.fractional, false, tr("options.decimal"));
-                ui.selectable_value(&mut style.fractional, true, tr("options.fractional"));
+                for n in crate::dimensions::Notation::ALL {
+                    ui.selectable_value(
+                        &mut notation,
+                        n,
+                        format!("{}   {}", tr(n.key()), n.sample(style.precision)),
+                    );
+                }
             })
             .response
             .rich_tip(crate::ui::tips::pair(
                 "options.dimension_style",
                 "options.dimension_style_tip",
             ));
+        style.set_notation(notation);
         ui.end_row();
         row_label(ui, &tr("dimension.units"));
         let choices = crate::dimensions::units_choices();
@@ -6139,7 +6162,21 @@ fn page_margins_row(app: &mut App, ui: &mut Ui) {
         .changed();
     // Ticked: 12.7 mm all round to start with.
     let mut m = current.unwrap_or(PageMargins::uniform(12.7));
+    let mut linked = app.settings.page_margins_linked;
+    let mut set_all: Option<f64> = None;
     ui.add_enabled_ui(on, |ui| {
+        // Linked, a change to one margin sets all four to it (#4030).
+        if ui
+            .checkbox(&mut linked, tr("options.screen_margins_link"))
+            .rich_tip(crate::ui::tips::pair(
+                "options.screen_margins_link",
+                "options.screen_margins_link_tip",
+            ))
+            .changed()
+            && linked
+        {
+            set_all = Some(m.top);
+        }
         grid("doc_page_margins").show(ui, |ui| {
             for (key, v) in [
                 ("options.margin_top", &mut m.top),
@@ -6162,11 +6199,21 @@ fn page_margins_row(app: &mut App, ui: &mut Ui) {
                 {
                     *v = u.to_mm(shown);
                     changed = true;
+                    if linked {
+                        set_all = Some(*v);
+                    }
                 }
                 ui.end_row();
             }
         });
     });
+    app.settings.page_margins_linked = linked;
+    if let Some(v) = set_all {
+        if m != PageMargins::uniform(v) {
+            m = PageMargins::uniform(v);
+            changed = true;
+        }
+    }
     if changed {
         app.set_page_margins(on.then_some(m));
     }

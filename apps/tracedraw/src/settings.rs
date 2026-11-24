@@ -433,6 +433,15 @@ pub struct Settings {
     /// in the full-screen preview (F9), white at first (#3930).
     #[serde(default = "default_preview_background")]
     pub preview_background: [u8; 3],
+    /// Document Setup > Layout > Margins: the four page margins linked,
+    /// so changing one sets all four to it (#4030).
+    #[serde(default)]
+    pub page_margins_linked: bool,
+    /// The preview's colour was picked: white too is then white, not the
+    /// colour round the page in the drawing window, which the unpicked
+    /// white stands for (a dark theme's grey, #4027).
+    #[serde(default)]
+    pub preview_background_custom: bool,
     /// Options > Document > Page size: how the page's shadow and border
     /// look on screen (#3078).
     #[serde(default, skip_serializing_if = "PageLook::is_default")]
@@ -654,6 +663,10 @@ pub struct Settings {
     /// Inside); none until it is first used (its default panels show).
     #[serde(default)]
     pub pixel_dockers: Option<DockerSetup>,
+    /// The image editing mode's Hints panel was put with the panels left
+    /// from before it came (once; closed after, it stays closed).
+    #[serde(default)]
+    pub pixel_hints_added: bool,
     /// The font lists' fonts used last, newest first.
     #[serde(default)]
     pub recent_fonts: Vec<String>,
@@ -1331,6 +1344,11 @@ pub struct NodePrefs {
     /// corner. Off: a drag rounds every corner, or the chosen nodes'
     /// corners, as before.
     pub corner_one_at_a_time: bool,
+    /// Rounded corners follow node edits (#3265): moving nodes, or
+    /// bending a segment, beside a rounded corner rounds it again with
+    /// its radius where its sides now run, so it stays a rounded corner
+    /// with its widget. Off: the arc stays as it was drawn, as before.
+    pub corners_follow_edits: bool,
     /// Nodes are outlined in a colour for their type, cusp, smooth or
     /// symmetrical, besides their shape (#3000). Off by default.
     pub color_by_type: bool,
@@ -1355,6 +1373,7 @@ impl Default for NodePrefs {
             object_pick_distance: 3.0,
             corner_widgets: true,
             corner_one_at_a_time: true,
+            corners_follow_edits: true,
             color_by_type: false,
             cusp_rgb: [0xE0, 0x60, 0x00],
             smooth_rgb: [0x10, 0x9A, 0x30],
@@ -2151,6 +2170,9 @@ pub struct ViewPrefs {
     pub mode: String,
     /// The grid page shows lines per unit instead of their spacing.
     pub grid_frequency: bool,
+    /// View > Multipage View: kept on, the drawings opened next show
+    /// every page too, instead of only the first (#3724).
+    pub multipage: bool,
 }
 
 impl Default for ViewPrefs {
@@ -2171,6 +2193,7 @@ impl Default for ViewPrefs {
             rasterize_complex_effects: true,
             mode: "enhanced".into(),
             grid_frequency: false,
+            multipage: false,
         }
     }
 }
@@ -2464,6 +2487,8 @@ impl Default for Settings {
             selection_bar_mouse: false,
             preview_page_border: true,
             preview_background: default_preview_background(),
+            preview_background_custom: false,
+            page_margins_linked: false,
             page_look: PageLook::default(),
             constrain_angle: default_constrain_angle(),
             symmetry_show_lines: true,
@@ -2554,6 +2579,7 @@ impl Default for Settings {
             shown_bars: None,
             dockers: None,
             pixel_dockers: None,
+            pixel_hints_added: false,
             recent_fonts: Vec::new(),
             font_filter_open: false,
             font_english_names: true,

@@ -199,6 +199,8 @@ mod offset_shadow_handle;
 mod ops;
 mod ops2;
 mod opening;
+mod saving;
+mod exporting;
 mod package;
 mod page_drop;
 mod page_names;
@@ -220,7 +222,9 @@ mod pixel_edit;
 mod pixel_edit_app;
 mod pixel_light;
 mod pixel_liquify;
+mod pixel_ops;
 mod pixel_paint;
+mod pixel_spray;
 mod pixel_surface;
 mod pixel_view;
 mod pixel_warp;
@@ -333,6 +337,7 @@ mod variable_outline;
 mod symbol_scatter;
 mod vector_mosaic;
 mod view;
+mod view_steps;
 mod view_motion;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_copy;
@@ -469,7 +474,7 @@ pub fn run() -> eframe::Result<()> {
         mcp_link::bridge();
         return Ok(());
     }
-    // A window that stops responding says so, and offers a report.
+    // A step that takes long is noted in a file; a crash is offered.
     hang_watch::start();
     // `tracedraw --x11`: the window opens through X11 (XWayland on a
     // Wayland desktop), where a graphics tablet's pen moves the pointer
@@ -1056,6 +1061,15 @@ impl eframe::App for Shell {
         // A text box's right-click menu picked last frame (#3798).
         ui::text_field_menu::raw_input(raw_input);
         interaction::release_chorded_left(ctx, raw_input);
+        // While a large drawing is written off the interface's thread
+        // nothing typed, clicked or dropped reaches it (#4011).
+        if self
+            .app
+            .as_ref()
+            .is_some_and(|app| app.saving.is_some() || app.exporting.is_some())
+        {
+            saving::hold_input(raw_input);
+        }
         // The screen's safe area on Android (#1917).
         if let Some(app) = self.app.as_ref() {
             ui::screen_margins::apply(ctx, &app.settings, raw_input);
@@ -1204,6 +1218,23 @@ impl eframe::App for Shell {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // A large drawing being saved off the interface's thread (#4011):
+        // a window closed meanwhile waits for the file.
+        if (app.saving.is_some() || app.exporting.is_some())
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            app.wait_for_saving();
+            app.wait_for_exporting();
+        }
+        if app.poll_saving() | app.poll_exporting() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // A large file of another format about to be opened: its notice
+        // is on screen before the reading starts.
+        if app.poll_open_notice() {
+            ui.ctx().request_repaint();
+        }
         // A large drawing being opened off the interface's thread (#2849).
         if app.poll_opening() {
             ui.ctx()
@@ -1322,6 +1353,8 @@ impl eframe::App for Shell {
     /// session; drawings left unsaved stay backed up for it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(app) = self.app.as_mut() {
+            app.wait_for_saving();
+            app.wait_for_exporting();
             app.save_settings();
             app.leave_session();
             // Restart after an update: the new version starts last, when

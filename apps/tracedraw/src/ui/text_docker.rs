@@ -819,7 +819,12 @@ pub(crate) fn character_panel(
                 0.0
             };
         changed |= crate::ui::tips::tip_over(ui, crate::ui::tips::keyed("toolbar.font"), |ui| {
-            crate::ui::font_list::text_font_list(app, ui, &format!("{salt}_text_font"), w.max(120.0))
+            crate::ui::font_list::text_font_list(
+                app,
+                ui,
+                &format!("{salt}_text_font"),
+                w.max(120.0),
+            )
         });
         row_check_when(app, ui, "font", show_checks);
     });
@@ -995,9 +1000,7 @@ pub(crate) fn character_panel(
                 app.apply_outline_width(pt * 25.4 / 72.0);
             }
         }
-        let mut c = stroke
-            .as_ref()
-            .map_or(app.current_colors.1, |s| s.color);
+        let mut c = stroke.as_ref().map_or(app.current_colors.1, |s| s.color);
         if crate::ui::color_picker::color_button(ui, &mut c) {
             app.apply_outline_color(Some(c));
         }
@@ -1268,13 +1271,7 @@ fn record_style_control(_ui: &Ui, _name: &str, _rect: Rect) {}
 /// boxes. Each change is one undo step on the selected text; an overprint
 /// box set as the object's overprint leaves the characters following
 /// the object.
-fn character_styles(
-    app: &mut App,
-    ui: &mut Ui,
-    sp: &TextSpan,
-    first: Option<&Shape>,
-    salt: &str,
-) {
+fn character_styles(app: &mut App, ui: &mut Ui, sp: &TextSpan, first: Option<&Shape>, salt: &str) {
     ui.horizontal(|ui| {
         ui.label(tr("docker.strikethrough"));
         if let Some(picked) = line_style_list(

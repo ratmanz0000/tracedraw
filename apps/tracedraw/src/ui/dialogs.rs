@@ -121,6 +121,9 @@ pub struct ExportState {
     /// DXF: the drawing unit, an index into
     /// [`tracedraw_io::dxf::DxfUnits::ALL`] (#3583).
     pub dxf_units: usize,
+    /// DXF: how curves are written, an index into
+    /// [`tracedraw_io::dxf::DxfCurves::ALL`] (#4012).
+    pub dxf_curves: usize,
     /// WMF: dashed outlines written as solid lines (#3819).
     pub wmf_solid_dashes: bool,
 }
@@ -166,6 +169,7 @@ impl Default for ExportState {
             plt_one_pen: false,
             plt_resolution: 0.02,
             dxf_units: 0,
+            dxf_curves: 0,
             wmf_solid_dashes: false,
         }
     }
@@ -347,10 +351,14 @@ impl ExportState {
 
     /// The DXF export's choices (#3583).
     pub fn dxf_options(&self) -> tracedraw_io::dxf::DxfOptions {
-        use tracedraw_io::dxf::DxfUnits;
+        use tracedraw_io::dxf::{DxfCurves, DxfUnits};
         tracedraw_io::dxf::DxfOptions {
             units: DxfUnits::ALL
                 .get(self.dxf_units)
+                .copied()
+                .unwrap_or_default(),
+            curves: DxfCurves::ALL
+                .get(self.dxf_curves)
                 .copied()
                 .unwrap_or_default(),
         }
@@ -688,6 +696,11 @@ pub struct PrintState {
     pub page_numbers: bool,
     /// PostScript language level of a PostScript file (2 or 3).
     pub ps_level: u8,
+    /// Printing on a PostScript printer (Windows) sends it PostScript,
+    /// whose colours keep their CMYK values, instead of pictures of the
+    /// sheets in RGB, which its driver turns back into other CMYK values
+    /// (#4052).
+    pub ps_to_printer: bool,
     /// Separations to a PostScript file set each plate's halftone screen:
     /// `screen_lpi` lines per inch at the plate's angle.
     pub screens: bool,
@@ -1030,6 +1043,7 @@ impl Default for PrintState {
             info_text: String::new(),
             page_numbers: false,
             ps_level: 2,
+            ps_to_printer: false,
             screens: false,
             screen_lpi: 150.0,
             screen_angles: Vec::new(),
@@ -2190,6 +2204,9 @@ pub fn show(app: &mut App, ctx: &Context) {
     duplex_backs_prompt(app, ctx);
     // A large drawing being opened: how far it got, and Cancel (#2849).
     crate::opening::window(app, ctx);
+    crate::saving::window(app, ctx);
+    crate::exporting::window(app, ctx);
+    crate::exporting::opening_notice(app, ctx);
     // A shape of My shapes asks for its name (#2360).
     crate::ui::toolbar::my_shape_name_dialog(app, ctx);
     crate::ui::chrome::set_center_dialogs(ctx, app.settings.center_dialogs);
@@ -3325,8 +3342,6 @@ pub fn show(app: &mut App, ctx: &Context) {
         Dialog::ProblemReport(offer) => {
             use crate::hang_watch::Problem;
             let what = match offer.problem {
-                Problem::HangNow(s) => trf("report.hang_now", &[("seconds", &s.to_string())]),
-                Problem::HangLast => tr("report.hang_last"),
                 Problem::CrashLast => tr("report.crash_last"),
             };
             let text = format!("{what}\n\n{}", tr("report.body"));
@@ -5303,7 +5318,29 @@ pub fn export_chosen_file(
 /// says the last options were used and how to see them, and a click on it
 /// opens Options > Global > File Formats, where the setting is.
 pub fn write_export(app: &mut App, path: &std::path::Path, st: &ExportState, last_options: bool) {
-    match crate::export::export(app, path, st) {
+    // Off the interface's thread, with a window that shows how far it
+    // got: a long export no longer stops the program with nothing on
+    // screen.
+    if app.save_on_worker {
+        app.wait_for_exporting();
+        let work = crate::export::prepare_export(app, path, st);
+        match crate::exporting::Exporting::start(work, last_options) {
+            Ok(job) => {
+                app.status = trf("status.exporting", &[("p", &path.display().to_string())]);
+                app.exporting = Some(job);
+            }
+            Err(e) => export_done(app, Err(e), last_options),
+        }
+        return;
+    }
+    let result = crate::export::export(app, path, st);
+    export_done(app, result, last_options);
+}
+
+/// An export is over: its outcome on the status line (see
+/// [`write_export`]).
+pub fn export_done(app: &mut App, result: Result<String, String>, last_options: bool) {
+    match result {
         Ok(msg) if last_options => {
             log::info!("{msg}");
             app.status = tr("status.exported_last_options");
@@ -6005,9 +6042,19 @@ pub const DXF_UNIT_KEYS: [&str; 5] = [
     "units.feet",
 ];
 
-/// The DXF export's choice in the Export dialog (#3583): the drawing
-/// unit the file's lengths are written in (millimetres unless chosen).
+/// The names of the DXF export's ways to write curves, in the order of
+/// [`tracedraw_io::dxf::DxfCurves::ALL`] (#4012).
+pub const DXF_CURVE_KEYS: [&str; 3] = [
+    "export.dxf_curves_arcs",
+    "export.dxf_curves_splines",
+    "export.dxf_curves_lines",
+];
+
+/// The DXF export's choices in the Export dialog: the drawing unit the
+/// file's lengths are written in (millimetres unless chosen, #3583) and
+/// how curves are written (smooth arcs unless chosen, #4012).
 fn dxf_export_fields(ui: &mut Ui, st: &mut ExportState) {
+    use crate::ui::tips::RichTip;
     ui.horizontal(|ui| {
         ui.label(tr("options.units"));
         let k = st.dxf_units.min(DXF_UNIT_KEYS.len() - 1);
@@ -6018,6 +6065,20 @@ fn dxf_export_fields(ui: &mut Ui, st: &mut ExportState) {
                     ui.selectable_value(&mut st.dxf_units, i, tr(key));
                 }
             });
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr("export.dxf_curves"));
+        let k = st.dxf_curves.min(DXF_CURVE_KEYS.len() - 1);
+        crate::ui::keynav::ComboBox::from_id_salt("exp_dxf_curves")
+            .selected_text(tr(DXF_CURVE_KEYS[k]))
+            .show_ui(ui, |ui| {
+                for (i, key) in DXF_CURVE_KEYS.iter().enumerate() {
+                    ui.selectable_value(&mut st.dxf_curves, i, tr(key))
+                        .rich_tip(crate::ui::tips::keyed(key));
+                }
+            })
+            .response
+            .rich_tip(crate::ui::tips::keyed("export.dxf_curves"));
     });
 }
 
@@ -7686,6 +7747,20 @@ fn print_tab_prepress(app: &App, ui: &mut Ui, st: &mut PrintState) {
 }
 
 fn print_tab_postscript(app: &App, ui: &mut Ui, st: &mut PrintState) {
+    // Windows hands a printer pictures of the sheets in RGB; a PostScript
+    // printer can take PostScript instead, its colours kept in CMYK
+    // (#4052). Elsewhere the printer takes the print PDF as it is.
+    if cfg!(target_os = "windows") || st.ps_to_printer {
+        print_group(ui, &tr("print.ps_to_printer_group"), |ui| {
+            ui.add_enabled(
+                st.destination == 0 && !st.as_bitmap,
+                egui::Checkbox::new(&mut st.ps_to_printer, tr("print.ps_to_printer")),
+            )
+            .rich_tip(crate::ui::tips::keyed("print.ps_to_printer"))
+            .rich_disabled_tip(crate::ui::tips::keyed("print.ps_to_printer"));
+        });
+        ui.add_space(6.0);
+    }
     if st.destination != 2 {
         ui.label(egui::RichText::new(tr("print.postscript_hint")).color(Tokens::text_dim()));
         ui.add_space(6.0);
@@ -11505,9 +11580,7 @@ fn edit_text_box(
                         .outline
                         .clone()
                         .filter(|o| o.width > 0.0)
-                        .unwrap_or_else(|| {
-                            tracedraw_core::Stroke::new(app.current_colors.1, 0.2)
-                        });
+                        .unwrap_or_else(|| tracedraw_core::Stroke::new(app.current_colors.1, 0.2));
                     st.width = mm;
                     s.outline = Some(st);
                 });
@@ -11519,9 +11592,7 @@ fn edit_text_box(
                         .outline
                         .clone()
                         .filter(|o| o.width > 0.0)
-                        .unwrap_or_else(|| {
-                            tracedraw_core::Stroke::new(app.current_colors.1, 0.2)
-                        });
+                        .unwrap_or_else(|| tracedraw_core::Stroke::new(app.current_colors.1, 0.2));
                     st.color = color;
                     s.outline = Some(st);
                 });
@@ -11599,9 +11670,9 @@ fn edit_text_box(
                 let bg = if has_bg {
                     None
                 } else {
-                    Some(tracedraw_core::Fill::Solid(
-                        tracedraw_core::Color::rgb8(255, 255, 160),
-                    ))
+                    Some(tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(
+                        255, 255, 160,
+                    )))
                 };
                 spans_apply(spans, from, to, |s| s.background = bg.clone());
             }

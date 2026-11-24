@@ -129,23 +129,40 @@ pub fn numbered_path(path: &Path, number: usize, ext: &str) -> std::path::PathBu
 }
 
 pub fn export(app: &mut App, path: &Path, st: &ExportState) -> Result<String, String> {
+    prepare_export(app, path, st).run(&std::sync::atomic::AtomicUsize::new(0))
+}
+
+/// An export made ready on the interface's thread: the pages to write
+/// and everything of the program they need, so that the files can be
+/// made and written on a worker thread ([`ExportWork::run`]).
+pub struct ExportWork {
+    doc: Document,
+    ext: &'static str,
+    st: ExportState,
+    pub path: std::path::PathBuf,
+    /// The drawing's title, for the formats that carry one.
+    title: String,
+    /// The output profile and condition of a PDF/X file.
+    profile: Option<Vec<u8>>,
+    condition: String,
+    /// The profile a CMYK bitmap carries (#1763).
+    icc: Option<Vec<u8>>,
+    /// The number each page's file gets when there are several (#1382).
+    numbers: Vec<usize>,
+}
+
+/// The export of `st` to `path`, ready to run.
+pub fn prepare_export(app: &mut App, path: &Path, st: &ExportState) -> ExportWork {
     let (_, ext) = EXPORT_FORMATS[st.format];
     let (mut doc, _) = export_document(app, st);
+    let title = if st.title.trim().is_empty() {
+        app.document_title().trim_end_matches('*').to_string()
+    } else {
+        st.title.trim().to_string()
+    };
     if ext == "ai" && st.classic_ai() {
         // The classic AI file's `%%Title`, as the PDF-compatible one's.
-        doc.title = if st.title.trim().is_empty() {
-            app.document_title().trim_end_matches('*').to_string()
-        } else {
-            st.title.trim().to_string()
-        };
-    }
-    if st.one_file_holds_the_pages(ext) {
-        let bytes = document_file(app, &doc, ext, st)?;
-        crate::files::write(path, bytes).map_err(|e| e.to_string())?;
-        return Ok(trf(
-            "status.exported",
-            &[("path", &path.display().to_string())],
-        ));
+        doc.title = title.clone();
     }
     // The other formats hold one page: one file per page, numbered by
     // the page it shows when there are several (#1382).
@@ -157,64 +174,131 @@ pub fn export(app: &mut App, path: &Path, st: &ExportState) -> Result<String, St
             .map(|i| i + 1)
             .collect()
     };
-    let many = doc.pages.len() > 1;
-    let mut written = Vec::with_capacity(doc.pages.len());
     // A CMYK bitmap carries the profile its inks are in (#1763).
     let icc = (st.color_mode_for(ext) == ExportColorMode::Cmyk)
         .then(|| export_cmyk_profile(app))
         .flatten();
-    for k in 0..doc.pages.len() {
-        let bytes = page_file(&doc, k, ext, st, icc.as_deref())?;
-        let target = if many {
-            numbered_path(path, numbers.get(k).copied().unwrap_or(k + 1), ext)
-        } else {
-            path.to_path_buf()
-        };
-        crate::files::write(&target, bytes).map_err(|e| e.to_string())?;
-        written.push(target);
+    ExportWork {
+        profile: pdfx_profile(app, pdf_standard(ext, st)),
+        condition: output_condition(app, &st.output_condition),
+        doc,
+        ext,
+        st: st.clone(),
+        path: path.to_path_buf(),
+        title,
+        icc,
+        numbers,
     }
-    Ok(match (written.first(), written.last()) {
-        (Some(first), Some(last)) if many => trf(
-            "status.exported_pages",
-            &[
-                ("count", &written.len().to_string()),
-                ("first", &first.display().to_string()),
-                ("last", &last.display().to_string()),
-            ],
-        ),
-        _ => trf("status.exported", &[("path", &path.display().to_string())]),
-    })
+}
+
+impl ExportWork {
+    /// How many steps the export has: the files of a format that holds
+    /// one page each, one for a format that holds them all.
+    pub fn steps(&self) -> usize {
+        if self.st.one_file_holds_the_pages(self.ext) {
+            1
+        } else {
+            self.doc.pages.len()
+        }
+    }
+
+    /// Make the files and write them, counting each one done in `done`;
+    /// the status line's words.
+    pub fn run(self, done: &std::sync::atomic::AtomicUsize) -> Result<String, String> {
+        let (doc, ext, st, path) = (&self.doc, self.ext, &self.st, self.path.as_path());
+        if st.one_file_holds_the_pages(ext) {
+            let bytes =
+                document_file_with(doc, ext, st, &self.title, self.profile, self.condition)?;
+            crate::files::write(path, bytes).map_err(|e| e.to_string())?;
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(trf(
+                "status.exported",
+                &[("path", &path.display().to_string())],
+            ));
+        }
+        let many = doc.pages.len() > 1;
+        let mut written = Vec::with_capacity(doc.pages.len());
+        for k in 0..doc.pages.len() {
+            let bytes = page_file(doc, k, ext, st, self.icc.as_deref())?;
+            let target = if many {
+                numbered_path(path, self.numbers.get(k).copied().unwrap_or(k + 1), ext)
+            } else {
+                path.to_path_buf()
+            };
+            crate::files::write(&target, bytes).map_err(|e| e.to_string())?;
+            written.push(target);
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(match (written.first(), written.last()) {
+            (Some(first), Some(last)) if many => trf(
+                "status.exported_pages",
+                &[
+                    ("count", &written.len().to_string()),
+                    ("first", &first.display().to_string()),
+                    ("last", &last.display().to_string()),
+                ],
+            ),
+            _ => trf("status.exported", &[("path", &path.display().to_string())]),
+        })
+    }
+}
+
+/// The PDF/X standard `st` asks of a file of format `ext`.
+fn pdf_standard(ext: &str, st: &ExportState) -> tracedraw_io::pdf::PdfStandard {
+    use tracedraw_io::pdf::PdfStandard;
+    match (ext, st.pdf_standard) {
+        ("pdf", 1) => PdfStandard::X1a,
+        ("pdf", 2) => PdfStandard::X3,
+        ("pdf", 3) => PdfStandard::X4,
+        _ => PdfStandard::None,
+    }
 }
 
 /// The file of a format that holds every page (PDF, AI, PostScript, PRN,
 /// HTML) for the pages of `doc`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn document_file(
     app: &App,
     doc: &Document,
     ext: &str,
     st: &ExportState,
 ) -> Result<Vec<u8>, String> {
+    let title = if st.title.trim().is_empty() {
+        app.document_title().trim_end_matches('*').to_string()
+    } else {
+        st.title.trim().to_string()
+    };
+    document_file_with(
+        doc,
+        ext,
+        st,
+        &title,
+        pdfx_profile(app, pdf_standard(ext, st)),
+        output_condition(app, &st.output_condition),
+    )
+}
+
+/// [`document_file`] with what it takes from the program given: the
+/// title, and the output profile and condition of a PDF/X file.
+fn document_file_with(
+    doc: &Document,
+    ext: &str,
+    st: &ExportState,
+    title: &str,
+    output_profile: Option<Vec<u8>>,
+    output_condition: String,
+) -> Result<Vec<u8>, String> {
     let output = tracedraw_io::for_output(doc);
     let doc = output.as_ref();
     Ok(match ext {
         "pdf" | "ai" => {
-            use tracedraw_io::pdf::{PdfOptions, PdfStandard};
-            let standard = match (ext, st.pdf_standard) {
-                ("pdf", 1) => PdfStandard::X1a,
-                ("pdf", 2) => PdfStandard::X3,
-                ("pdf", 3) => PdfStandard::X4,
-                _ => PdfStandard::None,
-            };
+            use tracedraw_io::pdf::PdfOptions;
             let opts = PdfOptions {
-                standard,
-                output_profile: pdfx_profile(app, standard),
-                output_condition: output_condition(app, &st.output_condition),
+                standard: pdf_standard(ext, st),
+                output_profile,
+                output_condition,
                 bleed_mm: if ext == "pdf" { st.bleed_mm } else { 0.0 },
-                title: Some(if st.title.trim().is_empty() {
-                    app.document_title().trim_end_matches('*').to_string()
-                } else {
-                    st.title.trim().to_string()
-                }),
+                title: Some(title.to_string()),
                 keywords: (!st.tags.trim().is_empty()).then(|| st.tags.trim().to_string()),
                 flatten_dpi: st.dpi.max(72.0),
                 text: tracedraw_io::pdf::PdfText {
@@ -1207,9 +1291,31 @@ fn print_doc(app: &mut App, st: &PrintState, mut doc: Document) -> Result<String
                 // Print as bitmap: the sheets are already pictures of
                 // that resolution, sent as they are.
                 let bitmap_dpi = st.as_bitmap.then(|| st.bitmap_dpi.clamp(36.0, 1200.0));
+                // A PostScript printer on Windows can take the sheets as
+                // PostScript, its colours as written in CMYK (#4052); the
+                // job then holds its copies.
+                let postscript = (cfg!(target_os = "windows") && st.ps_to_printer && !st.as_bitmap)
+                    .then(|| {
+                        let mut ps_doc = doc.clone();
+                        if copies > 1 {
+                            repeat_copies(&mut ps_doc, copies.min(999) as usize, collate);
+                        }
+                        let mut out = tracedraw_io::eps::document_to_ps(&ps_doc);
+                        if st.separations && st.screens {
+                            out = with_screens(&out, &page_screens(&ps_doc, &plate_names, st));
+                        }
+                        postscript_level(out, st.ps_level).into_bytes()
+                    });
                 let msg = trf("status.printing_to", &[("name", &printer)]);
+                let progress = app.print_progress.clone();
+                progress.clear();
                 app.start_print_job(move || {
-                    print_on(&printer, &name, &doc, copies, collate, &stem, bitmap_dpi)
+                    let r = print_on(
+                        &printer, &name, &doc, copies, collate, &stem, bitmap_dpi, &progress,
+                        postscript,
+                    );
+                    progress.clear();
+                    r
                 });
                 return Ok(msg);
             }
@@ -1391,6 +1497,7 @@ pub fn with_screens(ps: &str, screens: &[Option<(f64, f64)>]) -> String {
 /// The print PDF sent to the system printer `printer` (`lp`), with the
 /// copies the dialog asked for.
 #[cfg(not(target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
 fn print_on(
     printer: &str,
     name: &str,
@@ -1399,6 +1506,8 @@ fn print_on(
     collate: bool,
     title: &str,
     _bitmap_dpi: Option<f64>,
+    _progress: &crate::printers::PrintProgress,
+    _postscript: Option<Vec<u8>>,
 ) -> Result<String, String> {
     let pdf = tracedraw_io::pdf::document_to_pdf(doc);
     let dir = std::env::temp_dir().join("tracedraw-print");
@@ -1417,6 +1526,7 @@ fn print_on(
 /// the job (#1404); `bitmap_dpi` (Print as bitmap) sends that resolution
 /// instead.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn print_on(
     printer: &str,
     _name: &str,
@@ -1425,20 +1535,112 @@ fn print_on(
     collate: bool,
     title: &str,
     bitmap_dpi: Option<f64>,
+    progress: &crate::printers::PrintProgress,
+    postscript: Option<Vec<u8>>,
 ) -> Result<String, String> {
+    // PostScript to a PostScript printer (#4052); any other printer
+    // takes the pictures below.
+    if let Some(ps) = postscript {
+        if crate::printers::print_postscript_windows(printer, &ps, title)? {
+            return Ok(trf("status.print_sent_printer", &[("name", printer)]));
+        }
+    }
     let dpi = bitmap_dpi
         .unwrap_or_else(|| windows_print_dpi(crate::printers::printer_resolution_windows(printer)));
-    let sheets: Vec<crate::printers::Sheet> = doc
-        .pages
-        .iter()
-        .map(|p| crate::printers::Sheet {
-            width: p.size.width,
-            height: p.size.height,
-            tiles: sheet_tiles(doc, p.id, dpi, PRINT_TILE_PIXELS).unwrap_or_default(),
-        })
-        .collect();
-    crate::printers::print_sheets_windows(printer, &sheets, dpi, copies, collate, title)?;
+    let dir = std::env::temp_dir().join("tracedraw-print");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let sheets = draw_sheets_to(&dir, doc, dpi, PRINT_TILE_PIXELS, progress)?;
+    crate::printers::print_sheets_windows(
+        printer, &dir, &sheets, dpi, copies, collate, title, progress,
+    )?;
     Ok(trf("status.print_sent_printer", &[("name", printer)]))
+}
+
+/// Every sheet of `doc` drawn at `dpi` into picture files in `dir`
+/// ([`sheet_tiles`]), in sheet order: each sheet's width and height in mm
+/// and its files. Each sheet's pictures are written as soon as it is
+/// drawn, so only the sheets being drawn are in memory however many
+/// there are (a print merge of 2000 sheets held them all), and several
+/// sheets are drawn at a time, sharing the `max_pixels` drawn at once.
+/// `progress` is told of each sheet drawn. On an error the files written
+/// are removed.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn draw_sheets_to(
+    dir: &std::path::Path,
+    doc: &Document,
+    dpi: f64,
+    max_pixels: u64,
+    progress: &crate::printers::PrintProgress,
+) -> Result<Vec<(f64, f64, Vec<crate::printers::TileFile>)>, String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    type Drawn = Option<(f64, f64, Vec<crate::printers::TileFile>)>;
+    let n = doc.pages.len();
+    progress.start(crate::printers::PrintProgress::DRAWING, n);
+    let workers = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
+        .min(n.max(1));
+    let each = (max_pixels / workers as u64).max(1);
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let drawn: std::sync::Mutex<Vec<Drawn>> = std::sync::Mutex::new((0..n).map(|_| None).collect());
+    let error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let work = || {
+        while !failed.load(Ordering::Relaxed) {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            let Some(page) = doc.pages.get(k) else {
+                break;
+            };
+            let mut files = Vec::new();
+            let mut wrote = Ok(());
+            for (t, tile) in sheet_tiles(doc, page.id, dpi, each)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let path = dir.join(format!("sheet-{}-{}.png", k + 1, t + 1));
+                wrote = std::fs::write(&path, &tile.png);
+                files.push(crate::printers::TileFile {
+                    path,
+                    x: tile.x,
+                    y: tile.y,
+                    width: tile.width,
+                    height: tile.height,
+                });
+                if wrote.is_err() {
+                    break;
+                }
+            }
+            if let Ok(mut d) = drawn.lock() {
+                d[k] = Some((page.size.width, page.size.height, files));
+            }
+            if let Err(e) = wrote {
+                failed.store(true, Ordering::Relaxed);
+                if let Ok(mut slot) = error.lock() {
+                    slot.get_or_insert(e.to_string());
+                }
+                break;
+            }
+            progress.one_more();
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 1..workers {
+            s.spawn(work);
+        }
+        work();
+    });
+    let drawn = drawn.into_inner().map_err(|e| e.to_string())?;
+    if let Some(e) = error.into_inner().ok().flatten() {
+        for (_, _, files) in drawn.iter().flatten() {
+            for f in files {
+                let _ = std::fs::remove_file(&f.path);
+            }
+        }
+        return Err(e);
+    }
+    Ok(drawn.into_iter().flatten().collect())
 }
 
 /// The resolution sheets are drawn at for a Windows printer that says
@@ -4217,6 +4419,70 @@ mod tests {
         assert!(tiles.is_empty());
     }
 
+    /// A print of many sheets: each sheet's pictures are written to files
+    /// as it is drawn (none kept in memory), several sheets at a time, and
+    /// come back in sheet order with the progress told of each; a blank
+    /// sheet has no file.
+    #[test]
+    fn many_sheets_are_drawn_into_files_in_their_order() {
+        use tracedraw_core::Fill;
+        let size = tracedraw_core::Size::new(50.0, 40.0);
+        let mut doc = Document::new("many", size);
+        for _ in 1..9 {
+            let _ = tracedraw_core::Command::AddPage {
+                name: None,
+                size,
+                layer: None,
+            }
+            .apply(&mut doc);
+        }
+        assert_eq!(doc.pages.len(), 9);
+        // Sheet k (but the blank sixth) holds a square k+1 mm wide.
+        for k in 0..9 {
+            if k == 5 {
+                continue;
+            }
+            let layer = doc.pages[k].layers[0].id;
+            let id = doc.ids_mut().shape();
+            let mut s = tracedraw_core::Shape::new(
+                id,
+                ShapeKind::Rect {
+                    rect: tracedraw_core::Rect::new(5.0, 5.0, 6.0 + k as f64, 15.0),
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            s.fill = Fill::Solid(tracedraw_core::Color::rgb8(0, 0, 0));
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+        }
+        let dir = std::env::temp_dir().join(format!("tracedraw-print-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let progress = crate::printers::PrintProgress::default();
+        let sheets = draw_sheets_to(&dir, &doc, 100.0, 1 << 20, &progress).expect("drawn");
+        assert_eq!(sheets.len(), 9);
+        assert_eq!(
+            progress.get(),
+            Some((crate::printers::PrintProgress::DRAWING, 9, 9))
+        );
+        for (k, (w, h, files)) in sheets.iter().enumerate() {
+            assert_eq!((*w, *h), (50.0, 40.0));
+            if k == 5 {
+                assert!(files.is_empty(), "a blank sheet sends only the paper");
+                continue;
+            }
+            assert_eq!(files.len(), 1, "sheet {k}");
+            let f = &files[0];
+            assert!(f.path.ends_with(format!("sheet-{}-1.png", k + 1)));
+            assert!((f.width - (1.0 + k as f64)).abs() < 0.6, "sheet {k}: {}", f.width);
+            let png = std::fs::read(&f.path).expect("file");
+            assert!(tiny_skia::Pixmap::decode_png(&png).is_ok());
+        }
+        // A folder that cannot be written to: the error, and no sheet.
+        let gone = dir.join("no").join("such").join("folder");
+        assert!(draw_sheets_to(&gone, &doc, 100.0, 1 << 20, &progress).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The printer's own resolution, kept within reason (#1404).
     #[test]
     fn windows_prints_at_the_printers_resolution() {
@@ -4424,6 +4690,83 @@ mod tests {
             ));
         let inks: Vec<u8> = plate_pixels(&doc).iter().map(|p| ink(&p[0])).collect();
         assert!(inks[0] < 26 && inks[2] > 230, "{inks:?}");
+    }
+
+    /// File > Export runs off the interface's thread: the export is made
+    /// ready at once, its files are written by a worker that counts them,
+    /// and the status line says how it ended as after any export; the
+    /// same files as an export run at once. One started while another
+    /// runs waits for it.
+    #[test]
+    fn an_export_runs_off_the_interfaces_thread() {
+        let mut app = App::headless();
+        for k in 0..3 {
+            if k > 0 {
+                app.add_page();
+            }
+            app.new_shape(ShapeKind::Rect {
+                rect: Rect::new(10.0, 10.0, 20.0 + 10.0 * k as f64, 30.0),
+                radius: 0.0,
+                corners: None,
+            });
+        }
+        let dir = std::env::temp_dir().join(format!("tracedraw-exporting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("now")).unwrap();
+        std::fs::create_dir_all(dir.join("worker")).unwrap();
+        let st = ExportState {
+            format: 2,
+            dpi: 25.4,
+            all_pages: true,
+            transparent: false,
+            ..ExportState::default()
+        };
+        // At once, as the tests and the browser export.
+        crate::ui::dialogs::write_export(&mut app, &dir.join("now").join("a.png"), &st, false);
+        assert!(app.exporting.is_none());
+        let said = app.status.clone();
+        assert!(said.contains('3'), "{said}");
+        // On a worker.
+        app.save_on_worker = true;
+        let work = prepare_export(&mut app, &dir.join("worker").join("a.png"), &st);
+        assert_eq!(work.steps(), 3, "a file for each page");
+        crate::ui::dialogs::write_export(&mut app, &dir.join("worker").join("a.png"), &st, false);
+        assert!(app.exporting.is_some(), "running");
+        assert!(app.status.contains("a.png"), "{}", app.status);
+        let t = web_time::Instant::now();
+        while app.poll_exporting() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(app.exporting.is_none());
+        assert_eq!(app.status, said.replace("now", "worker"));
+        for name in ["a-1.png", "a-2.png", "a-3.png"] {
+            assert_eq!(
+                std::fs::read(dir.join("worker").join(name)).expect(name),
+                std::fs::read(dir.join("now").join(name)).expect(name),
+                "{name}"
+            );
+        }
+        // A PDF holds every page: one step. Another export started while
+        // it runs waits for it first.
+        let pdf = ExportState {
+            format: 1,
+            all_pages: true,
+            ..ExportState::default()
+        };
+        assert_eq!(EXPORT_FORMATS[1].1, "pdf");
+        assert_eq!(prepare_export(&mut app, &dir.join("b.pdf"), &pdf).steps(), 1);
+        crate::ui::dialogs::write_export(&mut app, &dir.join("b.pdf"), &pdf, false);
+        crate::ui::dialogs::write_export(&mut app, &dir.join("c.pdf"), &pdf, false);
+        assert!(dir.join("b.pdf").exists(), "the first ended before the second began");
+        app.wait_for_exporting();
+        assert!(app.exporting.is_none());
+        assert!(std::fs::read(dir.join("c.pdf")).expect("pdf").starts_with(b"%PDF"));
+        // An export that fails says so.
+        crate::ui::dialogs::write_export(&mut app, &dir.join("no").join("x.pdf"), &pdf, false);
+        app.wait_for_exporting();
+        assert!(app.status.starts_with(&tr("dialog.export_failed")), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// File > Export of the current page, every page or a list of pages:

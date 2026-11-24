@@ -6327,6 +6327,29 @@ fn ctrl_draws_a_three_point_circle_round_the_press_point() {
     assert_eq!(shape_count(&app), before + 1);
 }
 
+/// Ctrl held at the third click of the 3-Point Ellipse draws the circle
+/// with the line as its diameter, its centre the line's middle, wherever
+/// the third point is (#4086); on the side of the third point it is the
+/// same circle.
+#[test]
+fn ctrl_at_the_third_click_draws_the_circle_on_the_three_point_line() {
+    let (ctx, mut app, first) = setup();
+    app.select(vec![first]);
+    app.delete_selection();
+    app.set_tool(Tool::ThreePointEllipse);
+    let (a, b) = (Point::new(100.0, 150.0), Point::new(140.0, 150.0));
+    let (sa, sb) = (app.view.to_screen(a), app.view.to_screen(b));
+    drag(&ctx, &mut app, sa, sb, Modifiers::NONE, Vec::new());
+    assert!(app.three_point_base.is_some());
+    let third = app.view.to_screen(Point::new(117.0, 157.0));
+    click_at(&ctx, &mut app, third, Modifiers::CTRL);
+    let id = *app.selection.first().expect("the circle");
+    let e = bounds(&app, id);
+    for (got, want) in [(e.x0, 100.0), (e.x1, 140.0), (e.y0, 130.0), (e.y1, 170.0)] {
+        assert!((got - want).abs() < 0.05, "diameter 100..140 at y 150: {e:?}");
+    }
+}
+
 /// Ctrl held at the third click of a 3-point curve draws a bow: the arc
 /// of the circle through the three points, standing evenly on its chord
 /// wherever the third point is (#934). Without Ctrl the curve stays the
@@ -12501,6 +12524,66 @@ fn corner_widgets_follow_their_preference_on_by_default() {
     // Settings saved before the preference existed read it as on.
     let old: crate::settings::NodePrefs = serde_json::from_str("{}").expect("old prefs");
     assert!(old.corner_widgets);
+}
+
+/// Rounded corners follow node edits (#3265): dragging the node in the
+/// middle of a side of a rounded square, or bending that side, leaves
+/// the corners beside it rounded with their radius (and their widgets);
+/// with the preference off the arcs stay as they were drawn.
+#[test]
+fn rounded_corners_stay_round_when_a_node_beside_them_moves() {
+    use tracedraw_core::corner_cut::{cut_corners, fillets, CornerCut};
+    use tracedraw_core::geometry::BezPath;
+    let (ctx, mut app, rect) = setup();
+    app.select(vec![rect]);
+    app.delete_selection();
+    let mut square = BezPath::new();
+    square.move_to((20.0, 20.0));
+    square.line_to((40.0, 20.0));
+    square.line_to((60.0, 20.0));
+    square.line_to((60.0, 60.0));
+    square.line_to((20.0, 60.0));
+    square.close_path();
+    let (round, _) = cut_corners(&square, CornerCut::Fillet(5.0), None);
+    let id = app
+        .new_shape(ShapeKind::Path {
+            path: round.clone(),
+            closed: true,
+        })
+        .expect("square");
+    app.select(vec![id]);
+    app.set_tool(Tool::Shape);
+    app.settings.nodes.corner_widgets = true;
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let path_of = |app: &App| match &app.doc().find_shape(id).expect("curve").kind {
+        ShapeKind::Path { path, .. } => path.clone(),
+        _ => panic!("a curve"),
+    };
+    let radii = |app: &App| -> Vec<f64> { fillets(&path_of(app)).iter().map(|f| f.radius).collect() };
+    assert_eq!(radii(&app).len(), 4);
+    let mid = app.view.to_screen(Point::new(40.0, 20.0));
+    let zoom = app.view.zoom;
+    let down = egui::vec2(0.0, 6.0 * zoom);
+    // The page's y may run either way on screen: pull the node off its
+    // side, whichever way that is.
+    drag(&ctx, &mut app, mid, mid + down, Modifiers::NONE, Vec::new());
+    let moved = path_of(&app);
+    assert_ne!(moved, round, "the node moved");
+    let r = radii(&app);
+    assert_eq!(r.len(), 4, "{r:?}");
+    assert!(r.iter().all(|r| (r - 5.0).abs() < 1e-3), "{r:?}");
+    // Their widgets, and one for the sharp corner the node now makes.
+    assert_eq!(app.corner_widgets().len(), 5);
+    // Off: the arcs beside the node stay as drawn and lose their sides.
+    let _ = app.engine.undo();
+    assert_eq!(path_of(&app), round);
+    app.settings.nodes.corners_follow_edits = false;
+    app.select(Vec::new());
+    app.select(vec![id]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    drag(&ctx, &mut app, mid, mid + down, Modifiers::NONE, Vec::new());
+    assert_ne!(path_of(&app), round, "the node moved");
+    assert!(radii(&app).len() < 4, "{:?}", radii(&app));
 }
 
 /// A corner rounded with a widget can be rounded again (#872): the curve
@@ -31707,4 +31790,130 @@ fn a_right_click_on_the_menu_bar_opens_the_toolbars_menu() {
     assert!(shown.iter().all(|s| *s), "{shown:?}");
     click_menu_away(&ctx, &mut app);
     assert!(!bar_menu_shown(&ctx, &mut app, Vec::new()));
+}
+
+/// The Zoom tool's marquee fills the window with the area dragged over,
+/// its middle in the window's middle, whichever way it is dragged and
+/// whether the tool was picked for good or for one zoom with F2 (#4009).
+#[test]
+fn the_zoom_marquee_zooms_into_the_area_dragged() {
+    for (one_shot, reverse) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (ctx, mut app, _id) = setup();
+        if one_shot {
+            frame(&ctx, &mut app, vec![key(egui::Key::F2, Modifiers::NONE)], Modifiers::NONE);
+        } else {
+            app.set_tool(Tool::Zoom);
+            frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        }
+        let (a, b) = (Point::new(120.0, 150.0), Point::new(160.0, 180.0));
+        let (sa, sb) = (app.view.to_screen(a), app.view.to_screen(b));
+        let (from, to) = if reverse { (sb, sa) } else { (sa, sb) };
+        drag(&ctx, &mut app, from, to, Modifiers::NONE, Vec::new());
+        for _ in 0..3 {
+            frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        }
+        let mid = app.view.to_screen(Point::new(140.0, 165.0));
+        let c = app.canvas_rect.center();
+        assert!((mid - c).length() < 3.0, "{one_shot} {reverse}: {mid:?} {c:?}");
+        let w = (app.view.to_screen(b).x - app.view.to_screen(a).x).abs();
+        assert!(w > app.canvas_rect.width() * 0.5, "{one_shot} {reverse}: {w} {:?}", app.canvas_rect);
+    }
+}
+
+/// #4045: a shape drawn with the Common Shapes tool keeps what it is and
+/// its settings; its handle is dragged right after it is drawn (with the
+/// tool still in hand) and with the Shape tool, which shows the handles
+/// instead of the curve's nodes, each drag one undo step; Convert to
+/// Curves leaves an ordinary curve with its nodes.
+#[test]
+fn a_common_shape_is_adjusted_by_its_handles() {
+    let (ctx, mut app, rect) = setup();
+    app.select(vec![rect]);
+    app.delete_selection();
+    app.set_tool(Tool::CommonShapes);
+    app.common_shape = crate::common_shapes::CommonShape::RightArrow;
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let a = app.view.to_screen(Point::new(100.0, 100.0));
+    let b = app.view.to_screen(Point::new(200.0, 150.0));
+    drag(&ctx, &mut app, a, b, Modifiers::NONE, Vec::new());
+    let id = *app.selection.first().expect("drawn and selected");
+    let shape = |app: &App| app.doc().find_shape(id).cloned().expect("arrow");
+    let values = |app: &App| {
+        crate::common_shapes::live(&shape(app))
+            .map(|(_, _, v)| v)
+            .expect("still the arrow")
+    };
+    assert_eq!(values(&app), vec![0.4, 0.4]);
+    // The status bar and the Objects docker name it.
+    assert_eq!(
+        crate::ui::dockers::tagged_kind(&shape(&app), "Curve".into()),
+        crate::common_shapes::CommonShape::RightArrow.name()
+    );
+    let adjust_handle = |app: &App| {
+        let s = shape(app);
+        let nodes = crate::kind_nodes::nodes(&s);
+        assert_eq!(nodes.len(), 1, "{nodes:?}");
+        assert!(matches!(nodes[0].0, crate::kind_nodes::KindNode::Adjust { index: 0 }));
+        app.view.to_screen(nodes[0].1)
+    };
+    // With the Common Shapes tool: the head made longer (the handle
+    // dragged toward the tail), no new shape drawn.
+    let count = app.doc().pages[0].layers.iter().map(|l| l.shapes.len()).sum::<usize>();
+    let h = adjust_handle(&app);
+    drag(&ctx, &mut app, h, h - egui::vec2(40.0, 0.0), Modifiers::NONE, Vec::new());
+    let after = app.doc().pages[0].layers.iter().map(|l| l.shapes.len()).sum::<usize>();
+    assert_eq!(after, count, "the drag adjusted the arrow, it drew none");
+    let v = values(&app);
+    assert!(v[0] > 0.45 && (v[1] - 0.4).abs() < 0.02, "{v:?}");
+    // One undo takes the whole drag back, the arrow stays.
+    app.undo();
+    assert_eq!(values(&app), vec![0.4, 0.4]);
+    // With the Shape tool: no curve nodes, the handle thins the shaft.
+    app.set_tool(Tool::Shape);
+    app.select(vec![id]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let tip = app.view.to_screen(Point::new(200.0, 125.0));
+    assert!(app.node_at(app.view.to_page(tip)).is_none(), "nodes hidden");
+    let h = adjust_handle(&app);
+    let down = app.view.to_screen(Point::new(0.0, 125.0)).y - h.y;
+    drag(
+        &ctx,
+        &mut app,
+        h,
+        h + egui::vec2(0.0, down * 0.5),
+        Modifiers::NONE,
+        Vec::new(),
+    );
+    let v = values(&app);
+    assert!((v[0] - 0.4).abs() < 0.02 && v[1] < 0.3, "{v:?}");
+    assert_eq!(app.engine.undo_label(), Some("Edit Shape"));
+    let s = shape(&app);
+    let (cs, r, vals) = crate::common_shapes::live(&s).expect("live");
+    assert_eq!(
+        s.kind,
+        ShapeKind::Path {
+            path: cs.path_with(r, &vals),
+            closed: true
+        }
+    );
+    // Stretched with the Pick tool: still the arrow, its handle on it.
+    app.set_tool(Tool::Pick);
+    app.select(vec![id]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let e = handle(&app, Handle::E);
+    drag(&ctx, &mut app, e, e + egui::vec2(60.0, 0.0), Modifiers::NONE, Vec::new());
+    let s = shape(&app);
+    assert!(bounds(&app, id).width() > 110.0, "{:?}", bounds(&app, id));
+    assert_eq!(crate::common_shapes::live(&s).map(|(_, _, v)| v), Some(vals.clone()));
+    app.set_tool(Tool::Shape);
+    app.select(vec![id]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let tip = app.view.to_screen(s.transform * Point::new(200.0, 125.0));
+    // Convert to Curves: an ordinary curve, its nodes back.
+    app.convert_to_curves();
+    let s = shape(&app);
+    assert!(s.common_shape.is_none());
+    assert!(crate::kind_nodes::nodes(&s).is_empty());
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert!(app.node_at(app.view.to_page(tip)).is_some(), "nodes back");
 }

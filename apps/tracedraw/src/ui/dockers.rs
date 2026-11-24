@@ -1061,7 +1061,8 @@ pub(crate) fn tab_icon(tab: DockerTab) -> Option<TabIcon> {
         | DockerTab::PixelDistort
         | DockerTab::PixelEffects
         | DockerTab::PixelImage
-        | DockerTab::PixelHistogram => crate::ui::pixel_mode::docker_icon(tab),
+        | DockerTab::PixelHistogram
+        | DockerTab::PixelHints => crate::ui::pixel_mode::docker_icon(tab),
     }
 }
 
@@ -2229,9 +2230,7 @@ fn properties(app: &mut App, ui: &mut Ui) {
                                 app.open_edit_text_dialog();
                             }
                             if !app.editing_text()
-                                && ui
-                                    .button(tr("docker.edit_with_text_tool"))
-                                    .clicked()
+                                && ui.button(tr("docker.edit_with_text_tool")).clicked()
                             {
                                 app.begin_text_edit(target.id);
                             }
@@ -2247,13 +2246,7 @@ fn properties(app: &mut App, ui: &mut Ui) {
                                 true,
                             );
                         });
-                        if matches!(
-                            target.kind,
-                            ShapeKind::Text {
-                                frame: Some(_),
-                                ..
-                            }
-                        ) {
+                        if matches!(target.kind, ShapeKind::Text { frame: Some(_), .. }) {
                             ui.collapsing(tr("docker.frame"), |ui| {
                                 crate::ui::text_docker::frame_panel(
                                     app,
@@ -4854,9 +4847,16 @@ pub fn kind_id(k: &ShapeKind) -> &'static str {
 }
 
 /// What an object is, with what makes it more than its kind: a
-/// symmetry (#2997) or an object clone (#2877).
+/// symmetry (#2997) or an object clone (#2877); a common shape is named
+/// as the shape it is (#4045).
 pub fn tagged_kind(s: &tracedraw_core::document::Shape, kind: String) -> String {
     let mut kind = kind;
+    // A common shape goes by its own name, as long as it is one (#4045).
+    if s.common_shape.is_some() {
+        if let Some((shape, _, _)) = crate::common_shapes::live(s) {
+            kind = shape.name();
+        }
+    }
     if s
         .effects
         .iter()
@@ -7359,5 +7359,67 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(selection_area_mm2(&open), None);
+    }
+
+    /// #4097: Selecting a text shape shows the live character controls in
+    /// the Properties docker, and the controls can edit its font, style
+    /// and alignment.
+    #[test]
+    fn properties_docker_shows_full_text_controls() {
+        use tracedraw_core::geometry::Point;
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        app.show_welcome = false;
+        app.show_dockers = true;
+        app.docker_tab = DockerTab::Properties;
+        app.settings.properties_closed.clear();
+        app.start_text(Point::new(10.0, 20.0), None);
+        app.text_insert("Properties Text");
+        app.finish_text();
+        let text_id = app.selection[0];
+        assert_eq!(app.selection, vec![text_id]);
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| properties(&mut app, ui));
+        out.textures_delta.clear();
+
+        let s = app.doc().find_shape(text_id).expect("text");
+        let ShapeKind::Text { spans, .. } = &s.kind else {
+            panic!("text");
+        };
+        assert_eq!(app.text_font, spans[0].font_family);
+        app.change_case(crate::ops2::CaseMode::Upper);
+        let s = app.doc().find_shape(text_id).expect("text");
+        let ShapeKind::Text { spans, .. } = &s.kind else {
+            panic!("text");
+        };
+        assert_eq!(spans[0].text, "PROPERTIES TEXT");
+
+        // Selecting a framed paragraph text also renders paragraph and frame sections.
+        app.start_text(
+            Point::new(10.0, 50.0),
+            Some(tracedraw_core::geometry::Size::new(80.0, 40.0)),
+        );
+        app.text_insert("Frame paragraph text");
+        app.finish_text();
+        let frame_id = app.selection[0];
+        assert_eq!(app.selection, vec![frame_id]);
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| properties(&mut app, ui),
+        );
+        out.textures_delta.clear();
     }
 }

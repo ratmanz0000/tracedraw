@@ -40,6 +40,48 @@ pub fn flatten(path: &BezPath, view: &View) -> Vec<(Vec<Pos2>, bool)> {
     out
 }
 
+/// The point of a flattened path nearest to `p` and its distance (mm);
+/// `None` for a path with no segment.
+pub fn nearest_on_path(path: &BezPath, p: Point) -> Option<(Point, f64)> {
+    let mut best: Option<(Point, f64)> = None;
+    let mut last: Option<Point> = None;
+    let mut start: Option<Point> = None;
+    let take = |a: Point, b: Point, best: &mut Option<(Point, f64)>| {
+        let ab = b - a;
+        let len2 = ab.hypot2();
+        let t = if len2 > 0.0 {
+            ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let q = a + ab * t;
+        let d = (p - q).hypot();
+        if best.is_none_or(|(_, bd)| d < bd) {
+            *best = Some((q, d));
+        }
+    };
+    kurbo::flatten(path.elements().iter().copied(), 0.02, &mut |el| match el {
+        PathEl::MoveTo(q) => {
+            last = Some(q);
+            start = Some(q);
+        }
+        PathEl::LineTo(q) => {
+            if let Some(a) = last {
+                take(a, q, &mut best);
+            }
+            last = Some(q);
+        }
+        PathEl::ClosePath => {
+            if let (Some(a), Some(s)) = (last, start) {
+                take(a, s, &mut best);
+            }
+            last = start;
+        }
+        _ => {}
+    });
+    best
+}
+
 /// Distance from a point to the nearest segment of a flattened path (mm).
 pub fn distance_to_path(path: &BezPath, p: Point) -> f64 {
     let mut best = f64::MAX;
@@ -237,7 +279,12 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
             Color32::BLACK,
         );
         let mods = painter.ctx().input(|i| i.modifiers);
-        let arc = app.tool == Tool::ThreePointCurve && app.constrain_held(&mods);
+        let arc = match app.tool {
+            Tool::ThreePointCurve => app.constrain_held(&mods),
+            // Ctrl at the third point: the circle on the base (#4086).
+            Tool::ThreePointEllipse => mods.ctrl || mods.command,
+            _ => false,
+        };
         let preview = three_point_preview(app.tool, a, b, c, arc);
         for (pts, closed) in flatten(&preview, view) {
             if pts.len() > 1 {
@@ -1048,7 +1095,7 @@ fn live_colour_region(app: &App, preview: Option<Affine>) -> Option<Rect> {
     let mut pad = 2.0 / app.view.zoom.max(0.01) as f64;
     let mut region: Option<Rect> = None;
     for s in shapes.iter() {
-        if s.has_live_effects() || holds_a_symbol(s) {
+        if s.has_live_effects() || s.raster_fx.is_some() || holds_a_symbol(s) {
             return None;
         }
         let b = app.visual_bounds(s);
@@ -1377,7 +1424,10 @@ fn three_point_preview(
     let len = base.hypot().max(1e-6);
     let dir = base / len;
     let normal = Vec2::new(-dir.y, dir.x);
-    let height = (c - a).dot(normal);
+    let mut height = (c - a).dot(normal);
+    if tool == Tool::ThreePointEllipse && arc {
+        height = crate::app::circle_on_base_height(len, height);
+    }
     match tool {
         Tool::ThreePointCurve => crate::app::three_point_curve(a, b, c, arc),
         _ => {
@@ -2614,6 +2664,18 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
         draw_nodes(app, painter);
         return;
     }
+    // The Common Shapes tool shows the handles of the selected shapes it
+    // drew, which it drags as the Shape tool does (#4045).
+    if app.tool == Tool::CommonShapes && app.text_edit.is_none() {
+        let prefs = app.settings.nodes;
+        let [r, g, b] = prefs.main_rgb;
+        let main = Color32::from_rgb(r, g, b);
+        for s in app.shape_tool_shapes() {
+            if crate::shape_tool::shows_handles(&s) {
+                draw_adjust_handles(painter, view, &s, prefs.size.px(), main, main);
+            }
+        }
+    }
     // The Mesh Fill tool's box or freehand loop over mesh nodes.
     if matches!(app.tool, Tool::MeshFill | Tool::Envelope) {
         draw_node_marquees(app, painter);
@@ -3575,6 +3637,37 @@ fn spacing_arrow_shapes(c: Pos2, horizontal: bool, color: Color32) -> Vec<epaint
 /// The outline of a rectangle, ellipse or polygon the Shape tool edits,
 /// on screen: one line of points for each of its outlines, a closed one
 /// ending where it starts. Drawn dashed in the node colour (#670).
+/// A common shape's adjustment handles (#4045) over its outline: each a
+/// diamond filled in the node colour, told apart from nodes (squares)
+/// and from a rectangle's edge handles (white diamonds).
+fn draw_adjust_handles(
+    painter: &Painter,
+    view: &View,
+    s: &tracedraw_core::Shape,
+    size: f32,
+    main: Color32,
+    outline: Color32,
+) {
+    for (pts, _) in flatten(&s.page_path(), view) {
+        painter.add(egui::Shape::line(pts, EStroke::new(1.0, outline)));
+    }
+    let h = size / 2.0 + 1.5;
+    for (_, p) in crate::kind_nodes::nodes(s) {
+        let c = view.to_screen(p);
+        let diamond = vec![
+            c + egui::vec2(0.0, -h),
+            c + egui::vec2(h, 0.0),
+            c + egui::vec2(0.0, h),
+            c + egui::vec2(-h, 0.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond,
+            main,
+            EStroke::new(1.0, Color32::WHITE),
+        ));
+    }
+}
+
 pub(crate) fn kind_outline(s: &tracedraw_core::Shape, view: &View) -> Vec<Vec<Pos2>> {
     flatten(&s.page_path(), view)
         .into_iter()
@@ -3766,6 +3859,12 @@ fn draw_nodes(app: &App, painter: &Painter) {
                     node_marker(painter, p, size + 6.0, prefs.cusp, None, main);
                 }
             }
+            continue;
+        }
+        // A common shape: its outline and its adjustment handles; the
+        // curve's own nodes do not show (#4045).
+        if crate::shape_tool::shows_handles(&s) {
+            draw_adjust_handles(painter, view, &s, size, main, outline_of(s.id));
             continue;
         }
         let ShapeKind::Path { path, .. } = &s.kind else {

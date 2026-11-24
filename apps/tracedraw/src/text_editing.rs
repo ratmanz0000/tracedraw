@@ -242,10 +242,10 @@ impl App {
     /// transform after the origin or frame shift).
     pub fn text_layout_of(&self, id: ShapeId) -> Option<(TextLayout, Affine)> {
         let s = self.doc().find_shape(id)?;
-        // The text as it lies on the page, the groups and clip frames it
-        // is in included: a layout in its own space put the caret, and
-        // the Text tool's click, where a moved group had left the letters
-        // in the file, not where they showed.
+        // A text in a group or a clip frame is laid out where the groups
+        // around it show it: with the identity, the caret, the click and
+        // the selection of a text in a moved group sat where the group's
+        // own space had the letters, far from them (#4015, #4037).
         let parent = self.doc().parent_transform(id).unwrap_or(Affine::IDENTITY);
         layout_of_text_shape(s, parent)
     }
@@ -2516,6 +2516,24 @@ mod tests {
     }
 
     #[test]
+    fn apply_outline_width_routes_to_text_selection_when_active() {
+        let mut app = text_with_cd_selected();
+        assert!(app.text_selection_active());
+        let blue = Color::rgb8(0, 0, 255);
+        app.apply_outline_color(Some(blue));
+        app.apply_outline_width(0.75);
+        let spans = app.edit_spans().expect("spans");
+        let outline = spans[1].outline.clone().expect("outline");
+        assert!((outline.width - 0.75).abs() < 1e-6, "{:?}", outline);
+        assert_eq!(outline.color, blue);
+        assert!(spans[0].outline.is_none() && spans[2].outline.is_none());
+        assert_eq!(app.engine.undo_label(), Some("Character Outline"));
+        app.apply_outline_width(0.0);
+        let spans = app.edit_spans().expect("spans");
+        assert_eq!(spans[1].outline.as_ref().map(|o| o.width), Some(0.0));
+    }
+
+    #[test]
     fn a_colour_picked_with_characters_selected_colours_only_them() {
         let mut app = text_with_cd_selected();
         let object_fill = edited_shape(&app).fill.clone();
@@ -2634,6 +2652,63 @@ mod tests {
         assert_eq!(app.vertical_columns(), None);
         app.set_vertical_text(true);
         assert_eq!(app.vertical_columns(), Some(C::LeftToRight));
+    }
+
+    /// A text in a moved group (#4015, #4037): the caret sits on its
+    /// letters where the group shows them, and a click on a letter puts
+    /// the caret there.
+    #[test]
+    fn a_text_in_a_moved_group_takes_the_caret_on_its_letters() {
+        use tracedraw_core::geometry::{Shape as _, Vec2};
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new("abcdef", "Selawik", 24.0)],
+                origin: Point::new(50.0, 100.0),
+                frame: None,
+                align: Default::default(),
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("a layer");
+        let other = app
+            .new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(10.0, 10.0, 20.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("a layer");
+        app.select(vec![id, other]);
+        app.group_selection();
+        app.nudge(Vec2::new(200.0, 150.0));
+        app.begin_text_edit(id);
+        let Some((layout, to_page)) = app.text_layout_of(id) else {
+            panic!("a layout");
+        };
+        if layout.glyphs == 0 {
+            return;
+        }
+        let ink = to_page.transform_rect_bbox(layout.path.bounding_box());
+        let shown = app
+            .doc()
+            .shape_on_page(id)
+            .expect("on the page")
+            .page_path()
+            .bounding_box();
+        assert!(
+            (ink.center() - shown.center()).hypot() < 20.0,
+            "{ink:?} {shown:?}"
+        );
+        // The caret after "abc" by a click between the third and fourth
+        // letters, as they show.
+        let line = &layout.lines[0];
+        let x = (line.ends[2] + line.starts[3]) / 2.0;
+        let y = (layout.path.bounding_box().y0 + layout.path.bounding_box().y1) / 2.0;
+        let click = to_page * Point::new(x, y);
+        assert!(shown.inflate(2.0, 2.0).contains(click), "{click:?} {shown:?}");
+        assert_eq!(app.text_hit_char(click), Some(3));
+        let (top, _, _) = app.text_caret_geometry().expect("caret");
+        assert!(shown.inflate(30.0, 30.0).contains(top), "{top:?} {shown:?}");
     }
 
     /// Vertical text (#257): the caret is a bar across the column, the

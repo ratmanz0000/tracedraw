@@ -1825,9 +1825,30 @@ pub struct App {
     /// a printer's spooler can take minutes and the window stays usable
     /// meanwhile (#810). The status it ends with.
     pub print_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// How far the print on its way has come, for the status bar.
+    pub print_progress: std::sync::Arc<crate::printers::PrintProgress>,
     /// A large `.tdraw` being read off the interface's thread, with its
     /// progress window (#2849).
     pub opening: Option<crate::opening::Opening>,
+    /// A large drawing being written off the interface's thread (#4011):
+    /// while it is, nothing typed or clicked reaches the drawing.
+    pub saving: Option<crate::saving::Saving>,
+    /// Save, Save As and their shortcuts write a large drawing on a
+    /// worker thread, and File > Export runs on one (never in a browser,
+    /// nor in the tests unless one asks for it, which write at once).
+    pub save_on_worker: bool,
+    /// An export running off the interface's thread, with its progress
+    /// window; nothing typed or clicked reaches the drawing meanwhile.
+    pub exporting: Option<crate::exporting::Exporting>,
+    /// A large file of another format about to be opened (its path, the
+    /// password given and the frames its notice has been shown): the
+    /// window says so before the reading stops it.
+    pub open_notice: Option<(PathBuf, String, u8)>,
+    /// More large files to open after that one, in their order.
+    open_notice_next: Vec<(PathBuf, String)>,
+    /// The file whose notice was shown, or that is read at once (Revert):
+    /// it is read now.
+    pub(crate) open_noticed: Option<PathBuf>,
     /// What that read gave, for the open it finishes.
     pub opened_read: Option<(PathBuf, crate::opening::OpenRead)>,
     /// Manual two-sided printing: the settings of a print whose fronts
@@ -2124,6 +2145,10 @@ pub struct App {
     pub text_hyphenation: bool,
     /// Macro recording in progress: the commands run since Record started.
     pub recording: Option<Vec<Command>>,
+    /// Lines of the macro being recorded for steps that are not commands
+    /// of the drawing (Zoom To Fit #4020, a dimension style #4026), each
+    /// after the number of commands recorded before it.
+    pub recorded_lines: Vec<(usize, String)>,
     pub workspace: Workspace,
     pub palettes: Vec<crate::palette::Palette>,
     pub visible_palettes: Vec<usize>,
@@ -2228,6 +2253,10 @@ pub struct App {
     pub glyph_size: f32,
     pub glyph_picked: Option<char>,
     pub table_edit: Option<crate::table::TableEdit>,
+    /// The clip frame whose contents are being edited as it was before
+    /// they came out: its envelope and other effects, shadow, opacity and
+    /// name go back onto it when the editing ends (#4070).
+    pub clip_edit_shell: Option<tracedraw_core::Shape>,
     /// The Table tool's drag and bar choices.
     pub table_ui: crate::table_tool::TableUi,
     pub missing_fonts: Vec<String>,
@@ -2708,11 +2737,13 @@ pub enum DockerTab {
     PixelEffects,
     PixelImage,
     PixelHistogram,
+    PixelHints,
 }
 
 impl DockerTab {
     /// The image editing mode's panels, in Window > Panels order there.
-    pub const PIXEL: [DockerTab; 7] = [
+    pub const PIXEL: [DockerTab; 8] = [
+        DockerTab::PixelHints,
         DockerTab::PixelLayers,
         DockerTab::PixelEffects,
         DockerTab::PixelSelection,
@@ -2901,6 +2932,7 @@ impl DockerTab {
             DockerTab::PixelEffects => "pixel.section.effects",
             DockerTab::PixelImage => "pixel.section.picture",
             DockerTab::PixelHistogram => "pixel.section.histogram",
+            DockerTab::PixelHints => "pixel.section.hints",
         }
     }
 
@@ -3603,7 +3635,14 @@ impl App {
             print_preview: None,
             printer_fetch: None,
             print_job: None,
+            print_progress: Default::default(),
             opening: None,
+            saving: None,
+            save_on_worker: !crate::files::WEB && !cfg!(test),
+            exporting: None,
+            open_notice: None,
+            open_notice_next: Vec::new(),
+            open_noticed: None,
             opened_read: None,
             duplex_backs: None,
             printers_seen: Vec::new(),
@@ -3737,6 +3776,7 @@ impl App {
             show_non_printing: false,
             text_hyphenation: false,
             recording: None,
+            recorded_lines: Vec::new(),
             workspace: Workspace::Default,
             palettes: crate::palette::builtin_palettes(),
             visible_palettes: vec![0],
@@ -3794,6 +3834,7 @@ impl App {
             glyph_size: crate::ui::glyphs_docker::CELL,
             glyph_picked: None,
             table_edit: None,
+            clip_edit_shell: None,
             table_ui: Default::default(),
             missing_fonts: Vec::new(),
             ask_missing_fonts: true,
@@ -4138,6 +4179,17 @@ impl App {
 
     /// The colour around the page (Options > Customization): the theme's
     /// until one is picked (white included, #530).
+    /// The colour round the page in the full-screen preview (F9): the
+    /// one picked in Options, or, while none is, the drawing window's
+    /// colour round the page, so a dark theme's grey stays (#4027).
+    pub fn preview_background_color(&self) -> egui::Color32 {
+        if !self.settings.preview_background_custom && self.settings.preview_background == [255, 255, 255] {
+            return self.desktop_color();
+        }
+        let [r, g, b] = self.settings.preview_background;
+        egui::Color32::from_rgb(r, g, b)
+    }
+
     pub fn desktop_color(&self) -> egui::Color32 {
         // The default white desktop follows the theme.
         if !self.settings.desktop_custom && self.settings.desktop_rgb == [255, 255, 255] {
@@ -4701,6 +4753,7 @@ impl App {
             rasterize_complex_effects: self.rasterize_complex_effects,
             mode: self.view_mode.id().into(),
             grid_frequency: self.grid_frequency,
+            multipage: self.multipage,
         }
     }
 
@@ -4720,6 +4773,10 @@ impl App {
         self.rasterize_complex_effects = v.rasterize_complex_effects;
         self.view_mode = ViewMode::from_id(&v.mode);
         self.grid_frequency = v.grid_frequency;
+        self.multipage = v.multipage;
+        if v.multipage {
+            self.page_sorter = false;
+        }
     }
 
     /// Dockers' own choices now (see [`crate::settings::PanelPrefs`]).
@@ -6985,7 +7042,12 @@ impl App {
         let angle = base.atan2();
         let dir = base / len;
         let normal = Vec2::new(-dir.y, dir.x);
-        let height = (c - a).dot(normal);
+        let mut height = (c - a).dot(normal);
+        // Ctrl held at the third point of the 3-Point Ellipse: a circle
+        // with the base as its diameter, wherever the point is (#4086).
+        if self.tool == Tool::ThreePointEllipse && arc {
+            height = circle_on_base_height(len, height);
+        }
         match self.tool {
             Tool::ThreePointRectangle | Tool::ThreePointEllipse => {
                 if height.abs() < 0.05 {
@@ -9104,6 +9166,24 @@ impl App {
                 return;
             }
         }
+        // A large file of another format is read on the interface's
+        // thread: the window says it is being opened first
+        // ([`App::poll_open_notice`]).
+        if ext != "tdraw"
+            && self.save_on_worker
+            && self.open_noticed.as_ref() != Some(&path)
+            && std::fs::metadata(&path)
+                .is_ok_and(|m| m.len() >= crate::opening::BACKGROUND_FROM)
+        {
+            if self.open_notice.is_some() {
+                self.open_notice_next.push((path, password.to_string()));
+            } else {
+                self.status =
+                    crate::i18n::trf("status.opening", &[("p", &path.display().to_string())]);
+                self.open_notice = Some((path, password.to_string(), 0));
+            }
+            return;
+        }
         // A package's fonts, beside the drawing, before its text is laid
         // out (#852).
         if ext == "tdraw" {
@@ -9424,6 +9504,10 @@ impl App {
                     });
                 }
                 doc2.set_ids(ids);
+                // An RGB drawing opens as an RGB document, as the command
+                // line's does, so a .cdr saved from it keeps its RGB
+                // colours (#4096).
+                tracedraw_io::pdf_import::open_in_colour_mode(&mut doc2);
                 // The paragraph frames the file's text continues in are
                 // linked (#2323).
                 let links = {
@@ -9651,6 +9735,18 @@ impl App {
     }
 
     pub fn save(&mut self, save_as: bool) {
+        self.save_with(save_as, false);
+    }
+
+    /// File > Save and Save As from the menus, the toolbar and the
+    /// keyboard: as [`App::save`], a large drawing written off the
+    /// interface's thread with a window saying so, so the program does
+    /// not stand still with nothing on screen while it is saved (#4011).
+    pub fn save_showing_progress(&mut self, save_as: bool) {
+        self.save_with(save_as, true);
+    }
+
+    fn save_with(&mut self, save_as: bool, progress: bool) {
         // A drawing from GitHub saves back as a commit (Save As saves a
         // file as usual).
         if !save_as && self.remote.is_some() {
@@ -9670,7 +9766,7 @@ impl App {
         // write back to.
         if !save_as && !crate::files::WEB {
             if let Some(path) = self.file.clone() {
-                self.save_to(path);
+                self.save_to_with(path, progress);
                 return;
             }
         }
@@ -9704,6 +9800,18 @@ impl App {
     }
 
     pub(crate) fn save_to(&mut self, path: PathBuf) {
+        self.save_to_with(path, false);
+    }
+
+    /// As [`App::save_to`], a large `.tdraw` drawing written off the
+    /// interface's thread (see [`App::save_showing_progress`]).
+    pub(crate) fn save_to_showing_progress(&mut self, path: PathBuf) {
+        self.save_to_with(path, true);
+    }
+
+    fn save_to_with(&mut self, path: PathBuf, progress: bool) {
+        // A save still being written ends first: two never write at once.
+        self.wait_for_saving();
         // Time counted for the active task goes into the file too.
         self.flush_tracked_time();
         // Mesh fills a `.cdr` file gets as one colour each: the status
@@ -9762,6 +9870,23 @@ impl App {
             } else {
                 std::borrow::Cow::Borrowed(&*carried)
             };
+            if progress && self.save_on_worker && crate::saving::is_large(&path, &doc) {
+                let state = (self.engine.instance(), self.engine.revision());
+                let copy = doc.into_owned();
+                match crate::saving::Saving::start(path.clone(), copy, version, state) {
+                    Ok(job) => {
+                        self.status = crate::i18n::trf(
+                            "status.saving",
+                            &[("p", &path.display().to_string())],
+                        );
+                        self.saving = Some(job);
+                        return;
+                    }
+                    Err(e) => {
+                        return self.saved_to(path, Err(e));
+                    }
+                }
+            }
             // Written to the file as it is made: the JSON of a large
             // drawing is several times its size.
             let result = crate::files::write_with(&path, |w| {
@@ -9781,6 +9906,103 @@ impl App {
                 self.status,
                 crate::i18n::trf("status.saved_mesh_as_colour", &[("n", &meshes.to_string())])
             );
+        }
+    }
+
+    /// A large file of another format about to be opened: once its
+    /// notice has been on screen for a frame, read it. Whether one is
+    /// waiting.
+    pub fn poll_open_notice(&mut self) -> bool {
+        let Some((_, _, frames)) = &mut self.open_notice else {
+            return false;
+        };
+        if *frames < 2 {
+            *frames += 1;
+            return true;
+        }
+        if let Some((path, password, _)) = self.open_notice.take() {
+            self.open_noticed = Some(path.clone());
+            self.open_path_with_password(path, &password);
+            self.open_noticed = None;
+        }
+        // The next one's notice shows before it is read in its turn.
+        if self.open_notice.is_none() && !self.open_notice_next.is_empty() {
+            let (path, password) = self.open_notice_next.remove(0);
+            self.status =
+                crate::i18n::trf("status.opening", &[("p", &path.display().to_string())]);
+            self.open_notice = Some((path, password, 0));
+        }
+        self.open_notice.is_some()
+    }
+
+    /// The export running off the interface's thread, once it is over:
+    /// the status line, as after any export. Whether it is still running.
+    pub fn poll_exporting(&mut self) -> bool {
+        let Some(job) = &self.exporting else {
+            return false;
+        };
+        let Some(result) = job.poll() else {
+            return true;
+        };
+        if let Some(job) = self.exporting.take() {
+            crate::ui::dialogs::export_done(self, result, job.last_options);
+        }
+        false
+    }
+
+    /// Wait for the export running off the interface's thread, if one is
+    /// (the program closes, or another export starts).
+    pub fn wait_for_exporting(&mut self) {
+        if let Some(job) = self.exporting.take() {
+            let result = job.wait();
+            crate::ui::dialogs::export_done(self, result, job.last_options);
+        }
+    }
+
+    /// The large drawing being written off the interface's thread, once
+    /// its file is written: its state, the status line and the recent
+    /// files, as after any save. Whether it is still being written.
+    pub fn poll_saving(&mut self) -> bool {
+        let Some(job) = &self.saving else {
+            return false;
+        };
+        let Some(result) = job.poll() else {
+            return true;
+        };
+        if let Some(job) = self.saving.take() {
+            self.finish_saving(job, result);
+        }
+        false
+    }
+
+    /// Wait for the drawing being written off the interface's thread, if
+    /// one is (the program closes, or the drawing is saved again).
+    pub fn wait_for_saving(&mut self) {
+        if let Some(job) = self.saving.take() {
+            let result = job.wait();
+            self.finish_saving(job, result);
+        }
+    }
+
+    fn finish_saving(&mut self, job: crate::saving::Saving, result: Result<(), String>) {
+        // Another drawing is the active one now: the file is written,
+        // and that is all there is to say here.
+        if self.engine.instance() != job.state.0 {
+            self.status = match result {
+                Ok(()) => {
+                    crate::i18n::trf("status.saved", &[("p", &job.path.display().to_string())])
+                }
+                Err(e) => crate::i18n::trf("status.save_failed", &[("e", &e)]),
+            };
+            return;
+        }
+        let changed_since = self.engine.revision() != job.state.1;
+        let saved = result.is_ok();
+        self.saved_to(job.path, result);
+        // Changed while it was written (a macro, an agent): the file holds
+        // the drawing as it was, so it still has unsaved changes.
+        if saved && changed_since {
+            self.engine.mark_unsaved();
         }
     }
 
@@ -10659,7 +10881,22 @@ impl App {
         };
         let done = match rx.try_recv() {
             Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // A long print says how far it is: the sheets drawn,
+                // then the sheets the printer's queue took.
+                if let Some((stage, done, total)) = self.print_progress.get() {
+                    let key = if stage == crate::printers::PrintProgress::DRAWING {
+                        "status.print_drawing"
+                    } else {
+                        "status.print_sending"
+                    };
+                    self.status = crate::i18n::trf(
+                        key,
+                        &[("n", &done.to_string()), ("total", &total.to_string())],
+                    );
+                }
+                return true;
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(crate::i18n::tr("dialog.print_failed"))
             }
@@ -11092,6 +11329,8 @@ impl App {
             tracedraw_cdr::open_bytes(&bytes, &title).map_err(|e| e.to_string())?;
         // Clones saved by TraceDraw follow their masters again (#2879).
         crate::object_clone::rebase_clone_links(&mut doc);
+        // Text that continues in other frames flows on into them (#4104).
+        crate::textflow::link_and_flow_marked_frames(&mut doc);
         Ok((doc, report))
     }
 
@@ -11444,6 +11683,11 @@ impl App {
     // ----- view --------------------------------------------------------------
 
     pub fn zoom_to_page(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::FitPage);
+        self.fit_page_view();
+    }
+
+    fn fit_page_view(&mut self) {
         // In the Multipage View the page in use fills the window, not
         // every page shown (#3780); a new view still fits them all.
         if self.multipage && self.canvas_rect.is_positive() {
@@ -11568,9 +11812,10 @@ impl App {
     }
 
     pub fn zoom_to_fit(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::FitAll);
         // In the Multipage View, the objects of the page in use (#3780).
         if self.multipage && self.drawn_bounds().is_none() {
-            self.zoom_to_page();
+            self.fit_page_view();
             return;
         }
         let Some(b) = self.drawn_bounds() else {
@@ -11606,6 +11851,7 @@ impl App {
     }
 
     pub fn zoom_to_selection(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::FitSelection);
         if let Some(b) = self.selection_bounds() {
             self.view.fit(
                 b.inflate(b.width() * 0.1 + 1.0, b.height() * 0.1 + 1.0),
@@ -12337,6 +12583,17 @@ pub fn three_point_box(tool: Tool, len: f64, height: f64) -> Rect {
         Rect::new(0.0, -height.abs(), len, height.abs())
     } else {
         Rect::new(0.0, height.min(0.0), len, height.max(0.0))
+    }
+}
+
+/// The height (see [`three_point_box`]) of the 3-Point Ellipse that is
+/// the circle with the base of length `len` as its diameter, on the side
+/// of `height` (#4086: Ctrl at the third point).
+pub fn circle_on_base_height(len: f64, height: f64) -> f64 {
+    if height < 0.0 {
+        -len / 2.0
+    } else {
+        len / 2.0
     }
 }
 
@@ -13732,6 +13989,8 @@ mod tests {
         use crate::ui::bars::{move_bar, Bar, Dock};
         assert_eq!(app.settings.bars.dock(Bar::Palette), Dock::Bottom);
         move_bar(&mut app, Bar::Palette, Dock::Right, None);
+        // The Multipage View stays on for the drawings opened next (#3724).
+        app.set_multipage(true);
         app.sync_settings();
         let json = serde_json::to_string(&app.settings).expect("json");
         let saved: crate::settings::Settings = serde_json::from_str(&json).expect("read back");
@@ -13744,6 +14003,7 @@ mod tests {
         assert!(next.eraser_square);
         assert!(next.show_grid && !next.show_page_border);
         assert_eq!(next.view_mode, ViewMode::Wireframe);
+        assert!(next.multipage);
         assert!(next.snap.dynamic_guides && next.snap.off);
         assert_eq!(next.settings.snap.dynamic.angles, vec![30.0, 60.0]);
         assert!(next.settings.snap.align.each_object);

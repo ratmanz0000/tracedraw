@@ -1586,6 +1586,12 @@ impl App {
             .filter(|id| *id != clip.id)
             .collect();
         let before = self.engine.last_step_id();
+        // Its effects (an envelope over it all), shadow and opacity stay
+        // with the clip frame, not with the frame that comes out: kept
+        // aside and given back when the editing ends (#4070: the
+        // envelope was lost as soon as a content was clicked in the
+        // Objects docker).
+        self.clip_edit_shell = Some(clip.clone());
         self.run(Command::ExtractContents { clip: clip.id });
         self.mark_clip_edit_step(before, clip.id, &outside, true);
         self.clip_frame_edit = Some((clip.id, outside));
@@ -1796,8 +1802,51 @@ impl App {
         }
         let before = self.engine.last_step_id();
         self.place_inside(contents, frame);
+        if let Some(shell) = self.clip_edit_shell.take().filter(|s| s.id == frame) {
+            self.give_back_clip_look(&shell);
+        }
         self.mark_clip_edit_step(before, frame, &outside, false);
         self.select(vec![frame]);
+    }
+
+    /// The clip frame `frame`, just made again from its edited contents,
+    /// takes back the look `shell` (the clip frame before the editing)
+    /// had: effects, shadow, opacity, name and the rest, in the space of
+    /// its old transform so an envelope bends it as before. Part of the
+    /// step that put the contents back.
+    fn give_back_clip_look(&mut self, shell: &tracedraw_core::Shape) {
+        let has_look = !shell.effects.is_empty()
+            || shell.shadow.is_some()
+            || shell.opacity < 1.0
+            || shell.raster_fx.is_some();
+        if !has_look {
+            return;
+        }
+        let Some(now) = self.doc().find_shape(shell.id).cloned() else {
+            return;
+        };
+        let ShapeKind::ClipFrame { frame, contents } = now.kind else {
+            return;
+        };
+        // Frame and contents moved from the new clip frame's space into
+        // the old one's.
+        let m = shell.transform.inverse() * now.transform;
+        let mut frame = frame;
+        frame.transform_by(m);
+        let contents = contents
+            .into_iter()
+            .map(|mut c| {
+                c.transform_by(m);
+                c
+            })
+            .collect();
+        let mut back = shell.clone();
+        // A picture its bitmap effects made is made again from what it
+        // holds now (its source no longer matches).
+        back.kind = ShapeKind::ClipFrame { frame, contents };
+        let _ = self.engine.amend(&Command::ReplaceShapes {
+            replacements: vec![(shell.id, back)],
+        });
     }
 
     /// The contents of the clip frame being edited: the page's objects
@@ -4695,7 +4744,8 @@ impl App {
     pub fn toggle_recording(&mut self) {
         match self.recording.take() {
             Some(cmds) => {
-                let script = crate::scripting::commands_to_script(&cmds);
+                let views = std::mem::take(&mut self.recorded_lines);
+                let script = crate::scripting::commands_and_views_to_script(&cmds, &views);
                 self.script_source = script;
                 self.show_dockers = true;
                 self.docker_tab = crate::app::DockerTab::Scripts;
@@ -4703,6 +4753,7 @@ impl App {
             }
             None => {
                 self.recording = Some(Vec::new());
+                self.recorded_lines.clear();
                 self.status = tr("status.recording");
             }
         }
@@ -10524,7 +10575,10 @@ mod text_dialog_tests {
             "the docker follows the text being edited"
         );
         assert!(
-            !app.settings.properties_closed.iter().any(|s| s == "character"),
+            !app.settings
+                .properties_closed
+                .iter()
+                .any(|s| s == "character"),
             "the character section is open"
         );
         let Dialog::EditText { shape, text, .. } = &app.dialog else {
@@ -10601,6 +10655,33 @@ mod text_dialog_tests {
             ]
         );
         assert_eq!(app.engine.undo_label(), Some("Edit Text"));
+
+        // The character formatting controls of Edit Text applied to a span.
+        let mut spans = spans.clone();
+        tracedraw_core::spans_apply(&mut spans, 0, 5, |s| {
+            s.outline = Some(tracedraw_core::Stroke::new(
+                tracedraw_core::Color::rgb8(0, 0, 255),
+                0.4,
+            ));
+            s.tracking_pct = 10.0;
+            s.width_pct = 110.0;
+            s.position = tracedraw_core::TextPosition::Superscript;
+            s.all_caps = true;
+            s.background = Some(tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(
+                255, 255, 0,
+            )));
+        });
+        app.set_text_spans(id, spans);
+        let ShapeKind::Text { spans, .. } = app.doc().find_shape(id).expect("text").kind.clone()
+        else {
+            panic!("text");
+        };
+        assert_eq!(spans[0].outline.as_ref().map(|o| o.width), Some(0.4));
+        assert_eq!(spans[0].tracking_pct, 10.0);
+        assert_eq!(spans[0].width_pct, 110.0);
+        assert_eq!(spans[0].position, tracedraw_core::TextPosition::Superscript);
+        assert!(spans[0].all_caps);
+        assert!(spans[0].background.is_some());
     }
 
 }

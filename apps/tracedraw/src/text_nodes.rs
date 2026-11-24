@@ -993,6 +993,14 @@ mod tests {
         assert_eq!(s.fill, object_fill);
         assert!(s.stroke.is_none());
         assert_eq!(app.engine.undo_label(), Some("Character Outline"));
+        // Outline width routing through apply_outline_width.
+        app.apply_outline_width(0.8);
+        let spans = spans_of(&app);
+        assert!((spans[1].outline.as_ref().map(|o| o.width).unwrap_or(0.0) - 0.8).abs() < 1e-6);
+        assert_eq!(spans[1].outline.as_ref().map(|o| o.color), Some(blue));
+        app.apply_outline_width(0.0);
+        let spans = spans_of(&app);
+        assert_eq!(spans[1].outline.as_ref().map(|o| o.width), Some(0.0));
         // With nothing chosen, the whole text, as before: the fields read
         // the first character again, and bold turned on there goes to all.
         app.node_selection.clear();
