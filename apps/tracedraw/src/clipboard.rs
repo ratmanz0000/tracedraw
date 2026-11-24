@@ -315,6 +315,13 @@ fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> 
     })
 }
 
+/// [`with_clipboard`] for the other parts of the app (a table's cells as
+/// HTML, #4146).
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+pub(crate) fn with_system_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
+    with_clipboard(f)
+}
+
 /// Whether the clipboard offers text and a list of files, where
 /// TraceDraw reads its list of types before the clipboard library reads
 /// it (an X11 desktop: no `WAYLAND_DISPLAY`); `None` elsewhere, where the
@@ -497,7 +504,7 @@ fn without_line_end(path: std::path::PathBuf) -> std::path::PathBuf {
 /// The resolution of the picture a copy offers (#2288): 150 dpi, less
 /// for a selection so large that its longer side would pass 4000 pixels.
 #[cfg_attr(
-    not(all(unix, not(any(target_os = "macos", target_os = "android")))),
+    not(all(unix, not(target_os = "android"))),
     allow(dead_code)
 )]
 fn copy_picture_dpi(width_mm: f64, height_mm: f64) -> f64 {
@@ -659,8 +666,45 @@ impl App {
             return;
         };
         self.copy();
+        // A table alone: its cells as tab-separated text and an HTML
+        // table, for spreadsheet apps (#4146).
+        if let Some(id) = self.lone_selected_table() {
+            if let Some(tsv) = self.copy_table_cells_to_system(id, &[]) {
+                self.mark_system_clipboard(Some(tsv.as_str()));
+                return;
+            }
+        }
+        // macOS: the drawing as a picture, which other programs paste as
+        // the drawing; its SVG source went as text alone, and a mail, a
+        // chat or a note pasted that markup (#4170). The copy kept here
+        // still pastes here as objects.
+        #[cfg(target_os = "macos")]
+        if self.offer_picture_copy() {
+            self.mark_system_clipboard(None);
+            return;
+        }
         let written = self.offer_copy(&svg) || write_text(&svg);
         self.mark_system_clipboard(written.then_some(svg.as_str()));
+    }
+
+    /// The selection drawn as a picture on the system clipboard, on a
+    /// transparent ground at [`copy_picture_dpi`]; whether it went there.
+    #[cfg(target_os = "macos")]
+    fn offer_picture_copy(&self) -> bool {
+        let Some(bounds) = self.selection_bounds() else {
+            return false;
+        };
+        let Some(alone) = self.selection_alone(bounds) else {
+            return false;
+        };
+        let dpi = copy_picture_dpi(bounds.width(), bounds.height());
+        let Some((png, _, _)) = crate::ops2::render_alone_png(&alone, dpi, true, true) else {
+            return false;
+        };
+        let Ok(img) = image::load_from_memory(&png) else {
+            return false;
+        };
+        write_image(img.to_rgba8())
     }
 
     /// Offer the copy `svg` to other programs as SVG, as a picture and as
@@ -1243,7 +1287,19 @@ impl App {
         } else if let Some(img) = content.image {
             self.paste_as_bitmap(img);
         } else if let Some(t) = content.text {
-            self.paste_as_text(&t);
+            self.paste_as_text_or_table(&t);
+        }
+    }
+
+    /// Text pasted on the page: cells copied in a spreadsheet app (rows
+    /// of tab-separated cells) come as a table (#4146), other text as a
+    /// text.
+    pub fn paste_as_text_or_table(&mut self, text: &str) {
+        if crate::table_clipboard::looks_tabular(text) {
+            let rows = crate::table_clipboard::parse_tsv(text);
+            self.paste_rows_as_table(&rows);
+        } else {
+            self.paste_as_text(text);
         }
     }
 
@@ -1590,7 +1646,10 @@ impl App {
             let since = now.duration_since(last);
             if since < gap {
                 if let Some(ctx) = ctx {
-                    if !self.linked_mtimes.is_empty() || !self.object_files.is_empty() {
+                    if !self.linked_mtimes.is_empty()
+                        || !self.object_files.is_empty()
+                        || !self.table_files.is_empty()
+                    {
                         ctx.request_repaint_after(gap - since);
                     }
                 }
@@ -1601,6 +1660,8 @@ impl App {
         // Insert What It Saves (#3391): a picture saved for the first
         // time comes in, linked, and follows its file from then on.
         self.watch_object_files();
+        // A table's workbook saved in the spreadsheet program (#4145).
+        self.watch_table_files();
         let linked: Vec<(ShapeId, String)> = self
             .doc()
             .all_layers()

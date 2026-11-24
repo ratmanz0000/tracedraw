@@ -3803,6 +3803,13 @@ fn command_items(app: &App, category: Option<&str>, filter: &str) -> Vec<Command
             let label = command_label(e);
             let name = match crate::macros::command_name(&e.key) {
                 Some((name, _)) => name,
+                // View > Snap To's rows say what they snap to, so in the
+                // list they read "Snap To Guidelines" and come together
+                // with the other Snap commands (#3754).
+                None if e.path.last().map(String::as_str) == Some("menu.view.snap_to") => trf(
+                    "options.snap_to_command",
+                    &[("name", tr(&e.key).trim_end_matches("..."))],
+                ),
                 None => tr(&e.key).trim_end_matches("...").to_string(),
             };
             out.push(CommandItem {
@@ -5784,6 +5791,60 @@ pub fn text_size_unread_key() -> &'static str {
     }
 }
 
+/// The program Edit in Spreadsheet opens a table's workbook in (#4144):
+/// empty for the system's program for `.xlsx` files, named under the
+/// field when it is known.
+fn spreadsheet_editor_field(app: &mut App, ui: &mut Ui) {
+    ui.label(tr("options.spreadsheet_editor"));
+    let system = crate::spreadsheet_editor::system_default();
+    let hint = match &system {
+        Some(a) => trf("options.spreadsheet_editor_system_named", &[("name", &a.name)]),
+        None => tr("options.spreadsheet_editor_system"),
+    };
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.settings.spreadsheet_editor)
+                .desired_width(300.0)
+                .hint_text(hint),
+        )
+        .rich_tip(crate::ui::tips::pair(
+            "options.spreadsheet_editor",
+            "options.spreadsheet_editor_tip",
+        ));
+        if ui
+            .button(tr("options.browse"))
+            .rich_tip(crate::ui::tips::pair(
+                "options.browse",
+                "options.browse_tip",
+            ))
+            .clicked()
+        {
+            crate::files::Dialog::new().pick_file(app, |app, path| {
+                app.settings.spreadsheet_editor = path.display().to_string();
+            });
+        }
+        if ui
+            .add_enabled(
+                !app.settings.spreadsheet_editor.is_empty(),
+                egui::Button::new(tr("options.clear_folder")),
+            )
+            .clicked()
+        {
+            app.settings.spreadsheet_editor.clear();
+        }
+    });
+    let note = match &system {
+        Some(a) => format!(
+            "{} {}",
+            tr("options.spreadsheet_editor_hint"),
+            trf("options.spreadsheet_editor_found", &[("path", &a.path.display().to_string())])
+        ),
+        None => tr("options.spreadsheet_editor_hint"),
+    };
+    ui.label(egui::RichText::new(note).color(Tokens::text_dim()).size(11.0));
+    ui.add_space(10.0);
+}
+
 fn file_locations_page(app: &mut App, ui: &mut Ui) {
     // The program Edit Bitmap opens pictures in (#593). Android has no
     // programs to name: it asks which app edits the picture (#1398).
@@ -5835,6 +5896,7 @@ fn file_locations_page(app: &mut App, ui: &mut Ui) {
                 .size(11.0),
         );
         ui.add_space(10.0);
+        spreadsheet_editor_field(app, ui);
     }
     ui.label(tr("options.save_hint"));
     if let Some(p) = crate::settings::Settings::path() {
@@ -6520,6 +6582,13 @@ mod tests {
         );
         let found = command_items(&app, None, "open");
         assert!(!found.is_empty() && found.len() < all.len());
+        // The Snap To rows are named for the list (#3754).
+        let snap = command_items(&app, None, "");
+        for id in ["menu.view.snap_guidelines", "menu.view.snap_objects"] {
+            let name = trf("options.snap_to_command", &[("name", &tr(id))]);
+            assert_ne!(name, tr(id));
+            assert!(snap.iter().any(|c| c.id == id && c.name == name), "{id}");
+        }
         // Table's commands come under Text, where their submenu sits;
         // there is no Table category.
         let text = command_items(&app, Some("menu.text"), "");

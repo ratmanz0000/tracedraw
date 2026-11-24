@@ -2843,6 +2843,11 @@ pub struct Table {
     /// boxes, mm; `None` = cells share their borders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing: Option<[f64; 2]>,
+    /// The spreadsheet workbook (`.xlsx` bytes) the table was imported
+    /// from, or last edited in with the spreadsheet app (#4143): saved
+    /// with the drawing so the sheet can be opened again as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_xlsx: Option<crate::SharedBytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2892,6 +2897,7 @@ impl Table {
             padding: 1.0,
             margins: None,
             spacing: None,
+            source_xlsx: None,
         }
     }
 
@@ -5277,10 +5283,34 @@ impl Shape {
                     .unwrap_or_else(|| self.local_path().bounding_box())
             }
             ShapeKind::ClipFrame { frame, .. } => frame.bounds(),
-            ShapeKind::Text { .. } => {
-                let mut plain = self.clone();
-                plain.transform = Affine::IDENTITY;
-                plain.own_bounds()
+            // A text's box from the engine's cached outline box, moved as
+            // `local_path` moves the outline (a plain shift): copying the
+            // outline of every letter only to measure it cost most of the
+            // time on drawings with thousands of labels (#4192).
+            ShapeKind::Text {
+                spans,
+                origin,
+                frame,
+                align,
+                para,
+                on_path,
+            } => {
+                let req = text_outline::TextRequest {
+                    spans,
+                    frame: *frame,
+                    align: *align,
+                    para,
+                    on_path: on_path.as_ref(),
+                };
+                let shift = if on_path.is_some() {
+                    Affine::translate(origin.to_vec2())
+                } else {
+                    text_layout_shift(*origin, *frame, false, para.columns_from_right())
+                };
+                match text_outline::bounds(&req) {
+                    Some(r) => shift.transform_rect_bbox(r),
+                    None => self.local_path().bounding_box(),
+                }
             }
             _ => match self.kind.known_box() {
                 Some(r) => r,
@@ -6746,6 +6776,10 @@ pub struct Document {
     /// markers and their true coordinates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gk42: Option<GkCalibration>,
+    /// Name and value pairs scripts and plugins keep with the drawing
+    /// (`ActiveDocument.Data`, #4137), like an object's own data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<(String, String)>,
     /// Where the object found last by its id lay, so looking up the
     /// objects of a selection one after the other does not walk the
     /// whole drawing for each (never saved, never compared).
@@ -7158,6 +7192,7 @@ impl Document {
             inks: Vec::new(),
             comments: Vec::new(),
             gk42: None,
+            data: Vec::new(),
             find_hint: FindHint::default(),
         }
     }
@@ -9028,6 +9063,7 @@ mod tests {
                     padding: 0.0,
                     margins: None,
                     spacing: None,
+                    source_xlsx: None,
                 }),
             ),
         ];

@@ -188,6 +188,10 @@ pub struct Settings {
     /// system's program for PNG files, #593).
     #[serde(default)]
     pub bitmap_editor: String,
+    /// The program Edit in Spreadsheet opens a table's workbook in (a
+    /// path; empty for the system's program for `.xlsx` files, #4144).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spreadsheet_editor: String,
     pub last_dir: Option<PathBuf>,
     /// The folder of pictures the bitmap pattern picker lists as tiles
     /// (#3323).
@@ -667,6 +671,15 @@ pub struct Settings {
     /// from before it came (once; closed after, it stays closed).
     #[serde(default)]
     pub pixel_hints_added: bool,
+    /// The image editing mode's layers stay after Finish while the
+    /// drawing is open: Edit Inside on the picture again opens them
+    /// (#4112). Turned off, they go and their memory is freed.
+    #[serde(default = "default_true")]
+    pub pixel_keep_layers: bool,
+    /// The image editing mode's layers are saved with the picture in the
+    /// drawing's file too (#4112), off by default: the file grows.
+    #[serde(default)]
+    pub pixel_save_layers: bool,
     /// The font lists' fonts used last, newest first.
     #[serde(default)]
     pub recent_fonts: Vec<String>,
@@ -857,6 +870,9 @@ pub struct Settings {
     /// The looks saved in the Effects docker's Presets (#2160).
     #[serde(default)]
     pub style_presets: Vec<crate::style_presets::StylePreset>,
+    /// The outlines saved in the Outline Pen dialog's Presets (#4090).
+    #[serde(default)]
+    pub outline_presets: Vec<crate::outline_presets::OutlinePreset>,
     /// The settings saved in a bitmap effect's dialog, by effect (#1129).
     #[serde(default)]
     pub fx_presets: Vec<crate::ui::effect_dialog::FxPreset>,
@@ -912,6 +928,9 @@ pub struct DockerSetup {
     /// The dockers shown under the front one of a column (#2312).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stacks: Vec<StackSetup>,
+    /// The dockers locked in front of their column (#3953).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<String>,
     pub floating: Vec<FloatingSetup>,
 }
 
@@ -2454,6 +2473,7 @@ impl Default for Settings {
             node_shortcuts: Vec::new(),
             command_icons: Vec::new(),
             bitmap_editor: String::new(),
+            spreadsheet_editor: String::new(),
             last_dir: None,
             pattern_folder: None,
             last_export_dir: None,
@@ -2580,6 +2600,8 @@ impl Default for Settings {
             dockers: None,
             pixel_dockers: None,
             pixel_hints_added: false,
+            pixel_keep_layers: true,
+            pixel_save_layers: false,
             recent_fonts: Vec::new(),
             font_filter_open: false,
             font_english_names: true,
@@ -2630,6 +2652,7 @@ impl Default for Settings {
             path_tick_mm: default_path_tick(),
             screen_margins: crate::ui::screen_margins::ScreenMargins::default(),
             style_presets: Vec::new(),
+            outline_presets: Vec::new(),
             fx_presets: Vec::new(),
             fx_settings_only: false,
             object_apps: Vec::new(),

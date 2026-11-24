@@ -157,6 +157,8 @@ pub(crate) const KNOWN_ARGS: &[u32] = &[
     ARG_PAGE_SIZE,
     ARG_PAGE_BACKGROUND,
     ARG_HIDDEN,
+    ARG_WRAP_STYLE,
+    ARG_WRAP_OFFSET,
     ARG_MESH,
     ARG_GUIDE_LINE,
     ARG_BLEND_STEPS,
@@ -195,6 +197,12 @@ pub(crate) const ARG_SYMBOL: u32 = 19201;
 const ARG_PAGE_BACKGROUND: u32 = 17000;
 /// Object argument 16016: 1 hides the object (version 21).
 const ARG_HIDDEN: u32 = 16016;
+/// Object argument 13001: the paragraph text wrap style around the
+/// object (u32; 1 to 3 along its outline, 4 to 7 along its box), and
+/// 13000: the room kept free around it (u32, coordinate units). Seen on
+/// a rectangle of a version 20 file (#4142).
+const ARG_WRAP_STYLE: u32 = 13001;
+const ARG_WRAP_OFFSET: u32 = 13000;
 /// Byte 0 of an object's `flgs`: the object is locked (#2347).
 pub(crate) const OBJECT_LOCKED: u8 = 0x10;
 
@@ -674,6 +682,10 @@ struct Ctx<'a> {
     /// The node types a curve's node bytes give where its handles read
     /// otherwise, for the shape being read.
     pending_node_types: std::collections::BTreeMap<usize, tracedraw_core::nodes::NodeType>,
+    /// The corners of the rectangle being read whose radius the file
+    /// gives as a length (version 15+), by corner: a length the corner
+    /// measures on the page, not in the rectangle's own space (#4126).
+    pending_length_corners: [bool; 4],
     /// The CMYK profile the file carries, for CMYK bitmaps.
     cmyk_profile: Option<tracedraw_core::icc::Profile>,
     /// CMYK to RGB through that profile, built for the first CMYK bitmap.
@@ -758,6 +770,7 @@ impl<'a> Ctx<'a> {
             pending_frame_number: None,
 
             pending_node_types: Default::default(),
+            pending_length_corners: [false; 4],
             cmyk_profile: None,
             cmyk_lut: None,
             static_ids: None,
@@ -2687,7 +2700,18 @@ impl<'a> Ctx<'a> {
             own.push((chars, own_align, fmt));
             for (k, run) in para.runs.iter().enumerate() {
                 let style = run.style.over(&base);
-                let mut text = text::line_breaks(&self.run_text(run, &style));
+                let raw = self.run_text(run, &style);
+                // A carriage return inside a paragraph of paragraph text
+                // (version 16+, whose paragraphs are records of their
+                // own) is the line break inside the paragraph
+                // (Shift+Enter): the lines of a verse kept together, the
+                // space between paragraphs only after the verse (#4162).
+                let raw = if kind_code == OBJ_PARAGRAPH_TEXT && self.v >= 16 {
+                    text::soft_line_breaks(&raw)
+                } else {
+                    raw
+                };
+                let mut text = text::line_breaks(&raw);
                 if i + 1 < n && k + 1 == para.runs.len() {
                     text.push('\n');
                 }
@@ -4592,6 +4616,7 @@ impl<'a> Ctx<'a> {
         self.pending_on_path = None;
         self.pending_text_transform = None;
         self.pending_frame_number = None;
+        self.pending_length_corners = [false; 4];
         let mut v3_envelope_of: Option<(Affine, Rect, tracedraw_core::envelope::Frame, Affine)> =
             None;
         let chain = trfd
@@ -4634,6 +4659,8 @@ impl<'a> Ctx<'a> {
         let mut stroke: Option<Stroke> = None;
         let mut name: Option<String> = None;
         let mut hidden = false;
+        let mut wrap_style: Option<u32> = None;
+        let mut wrap_offset: Option<u32> = None;
         let mut coords: Option<Arg> = None;
         let mut polygon: Option<PolygonInfo> = None;
         let mut style_id: Option<u32> = None;
@@ -4719,6 +4746,8 @@ impl<'a> Ctx<'a> {
                 ARG_POLYGON => polygon = self.read_polygon_info(d, *arg),
                 ARG_CLIP_CONTENTS => self.pending_clip = self.reader_at(d, arg.off).u32(),
                 ARG_HIDDEN => hidden = self.reader_at(d, arg.off).u32().is_some_and(|h| h != 0),
+                ARG_WRAP_STYLE => wrap_style = self.reader_at(d, arg.off).u32(),
+                ARG_WRAP_OFFSET => wrap_offset = self.reader_at(d, arg.off).u32(),
                 ARG_MESH if kind_code == OBJ_MESH => mesh = Some(*arg),
                 _ => {}
             }
@@ -5065,12 +5094,62 @@ impl<'a> Ctx<'a> {
         // rectangle its preview leaves out, over the page's dark
         // background) is kept but not drawn.
         shape.visible = !hidden;
+        // Paragraph text keeps away from an object that wraps it (#4142):
+        // the text ran under such objects.
+        if let Some(code) = wrap_style.filter(|&c| c != 0) {
+            use tracedraw_core::text_flow::{TextWrap, WrapMode, WrapSide};
+            // 1 to 3 along the outline, 4 to 7 along the bounding box;
+            // round both sides, then the left, then the right, then above
+            // and below (1, 2 and 4 seen, #4142 and #4162).
+            let (mode, side) = match code {
+                1 => (WrapMode::Contour, WrapSide::Straddle),
+                2 => (WrapMode::Contour, WrapSide::Left),
+                3 => (WrapMode::Contour, WrapSide::Right),
+                4 => (WrapMode::Square, WrapSide::Straddle),
+                5 => (WrapMode::Square, WrapSide::Left),
+                6 => (WrapMode::Square, WrapSide::Right),
+                7 => (WrapMode::Square, WrapSide::AboveBelow),
+                _ => {
+                    self.report.warn(format!(
+                        "text wrap style {code} not read; the text wraps round both sides"
+                    ));
+                    (WrapMode::Contour, WrapSide::Straddle)
+                }
+            };
+            shape.wrap_text = true;
+            shape.wrap_style = TextWrap {
+                mode,
+                side,
+                offset: wrap_offset
+                    .map(|o| f64::from(o) * UNIT_MM)
+                    .unwrap_or(TextWrap::default().offset),
+            };
+        }
         shape.fill = fill;
         shape.stroke = stroke;
         // A drawn embedded object's objects carry their own colours.
         if matches!(shape.kind, ShapeKind::Group { .. }) {
             shape.fill = Fill::None;
             shape.stroke = None;
+        }
+        // A corner the file gives as a length measures that on the page,
+        // whatever the rectangle's transform scales it by: a rectangle
+        // enlarged with its corners kept opened with corners enlarged
+        // with it (#4126).
+        let lengths = std::mem::take(&mut self.pending_length_corners);
+        if lengths.contains(&true) {
+            let (sx, sy) = tracedraw_core::document::axis_scale(shape.transform);
+            let k = sx.min(sy);
+            if let (Some((rect, mut c)), true) = (shape.kind.rect_corners(), k > 1e-12) {
+                if !c.fixed {
+                    for (r, length) in c.radii.iter_mut().zip(lengths) {
+                        if length {
+                            *r /= k;
+                        }
+                    }
+                    shape.kind = ShapeKind::rect_with_corners(rect, c);
+                }
+            }
         }
         // Rounded corners keep their size when the rectangle is resized,
         // as new rectangles do, rather than stretch with it (#619); after
@@ -6258,16 +6337,21 @@ impl<'a> Ctx<'a> {
                     // Each radius is followed by 16 bytes of corner data
                     // (corner type and unknown fields) except the last.
                     let mut radii = Vec::new();
+                    let mut lengths = Vec::new();
                     for gap in [16usize, 16, 16, 0] {
                         let Some(raw) = r.f64() else { break };
                         if raw.is_finite() {
-                            radii.push(if raw > RADIUS_LENGTH_FROM {
-                                raw * UNIT_MM
-                            } else {
-                                raw * half
-                            });
+                            let length = raw > RADIUS_LENGTH_FROM;
+                            radii.push(if length { raw * UNIT_MM } else { raw * half });
+                            lengths.push(if length { 1.0 } else { 0.0 });
                         }
                         r.skip(gap);
+                    }
+                    // A length is the corner's size on the page: a
+                    // rectangle the file scales keeps it (#4126).
+                    if lengths.contains(&1.0) {
+                        let mask = file_corners(&lengths, w, h);
+                        self.pending_length_corners = mask.radii.map(|m| m > 0.5);
                     }
                     (w, h, radii)
                 };
@@ -8681,7 +8765,13 @@ fn paragraph_spacing(style: &text::RunStyle, base: &ParagraphStyle) -> Paragraph
     }
     // Space before: the distance from the paragraph before, so only what
     // goes past the line spacing is extra room (100 % of the character
-    // height, the default, is none). Space after: all extra room.
+    // height, the default, is none). Space after in points: all extra
+    // room. In the character height, the larger of the space after and
+    // the space before parts two paragraphs: what the space after goes
+    // past the space before is extra room. Paragraphs of 160 % before
+    // and after, and verses of 150 % both, lie about half a character
+    // height apart in the program that saved them; added up they opened
+    // two character heights apart (#4162).
     if method <= 2 {
         let baseline_mm = p.line_step(line_mm, size_mm);
         if let Some(b) = style.para_before {
@@ -8697,6 +8787,11 @@ fn paragraph_spacing(style: &text::RunStyle, base: &ParagraphStyle) -> Paragraph
                 (method == 0 && b.is_finite()).then(|| (b * 100.0).clamp(0.0, 10000.0));
         }
         if let Some(a) = style.para_after {
+            let a = if method == 0 {
+                (a - style.para_before.unwrap_or(1.0).max(1.0)).max(0.0)
+            } else {
+                a
+            };
             p.space_after = to_mm(a).clamp(0.0, 1000.0);
             p.space_after_pct =
                 (method == 0 && a.is_finite()).then(|| (a * 100.0).clamp(0.0, 10000.0));
@@ -8946,13 +9041,28 @@ pub(crate) mod tests {
         let p = paragraph_spacing(&st, &ParagraphStyle::default());
         let line_mm = st.size_pt.unwrap_or(12.0) * 25.4 / 72.0 * 1.15;
         assert!((p.space_before - line_mm).abs() < 1e-9, "{p:?}");
-        assert!((p.space_after - line_mm / 2.0).abs() < 1e-9, "{p:?}");
+        // The space after is less than the space before: no more room
+        // (#4162).
+        assert_eq!(p.space_after, 0.0, "{p:?}");
         // Kept in percent of the character height too (#2613).
         assert_eq!(
             (p.space_before_pct, p.space_after_pct),
-            (Some(200.0), Some(50.0))
+            (Some(200.0), Some(0.0))
         );
         assert!((p.leading_pct - 120.0).abs() < 1e-9);
+        // A space after past the space before adds what goes past it;
+        // the same space before and after adds none (#4162).
+        let more = text::parse_style_string(
+            r#"{"paragraph":{"beforeParaSpacing":"1500000","afterParaSpacing":"2000000"}}"#,
+        );
+        let p = paragraph_spacing(&more, &ParagraphStyle::default());
+        assert!((p.space_after_pct.unwrap() - 50.0).abs() < 1e-9, "{p:?}");
+        let same = text::parse_style_string(
+            r#"{"paragraph":{"beforeParaSpacing":"1500000","afterParaSpacing":"1500000"}}"#,
+        );
+        let p = paragraph_spacing(&same, &ParagraphStyle::default());
+        assert_eq!(p.space_after_pct, Some(0.0), "{p:?}");
+        assert!((p.space_before_pct.unwrap() - 150.0).abs() < 1e-9, "{p:?}");
         // The defaults files hold: no extra room.
         let d = text::parse_style_string(
             r#"{"paragraph":{"beforeParaSpacing":"1000000","afterParaSpacing":"0"}}"#,
@@ -10580,6 +10690,107 @@ pub(crate) mod tests {
         // 20000 units are 2 mm, not 20000 times half the side (a capsule).
         assert!((read(15, 20000.0) - 2.0).abs() < 1e-9);
         assert!((read(22, 20000.0) - 2.0).abs() < 1e-9);
+    }
+
+    /// An object the file has paragraph text wrap round (arguments 13001
+    /// and 13000, a version 20 file of #4142) wraps it, with the room the
+    /// file keeps free; an object without them does not.
+    #[test]
+    fn text_wrap_round_an_object_is_read() {
+        let read = |wrap: Option<(u32, u32)>| {
+            let mut c = f64s(&[254000.0, 127000.0]);
+            c.extend_from_slice(&f64s(&[1.0, 1.0]));
+            c.extend_from_slice(&[0; 8]);
+            for gap in [16usize, 16, 16, 0] {
+                c.extend_from_slice(&f64s(&[0.0]));
+                c.extend_from_slice(&vec![0u8; gap]);
+            }
+            let mut args = vec![(ARG_COORDS, c)];
+            if let Some((style, offset)) = wrap {
+                args.push((ARG_WRAP_STYLE, style.to_le_bytes().to_vec()));
+                args.push((ARG_WRAP_OFFSET, offset.to_le_bytes().to_vec()));
+            }
+            let obj = list(
+                b"obj ",
+                &[
+                    chunk(b"loda", &loda(OBJ_RECT, &args)),
+                    chunk(b"trfd", &trfd(20, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])),
+                ]
+                .concat(),
+            );
+            let body = [
+                chunk(b"mcfg", &mcfg(20, 2_540_000, 2_540_000)),
+                list(b"page", &list(b"layr", &obj)),
+            ]
+            .concat();
+            let (doc, rep) = parse(&riff(b"CDRK", &body), 20);
+            assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+            let s = first_shape(&doc);
+            (s.wrap_text, s.wrap_style)
+        };
+        let (on, style) = read(Some((1, 20000)));
+        assert!(on);
+        assert!((style.offset - 2.0).abs() < 1e-9, "{style:?}");
+        assert_eq!(style.side, tracedraw_core::text_flow::WrapSide::Straddle);
+        assert_eq!(style.mode, tracedraw_core::text_flow::WrapMode::Contour);
+        // 2 keeps to the outline on the object's left, 4 to the box
+        // (#4162).
+        let (_, two) = read(Some((2, 25400)));
+        assert_eq!(
+            (two.mode, two.side),
+            (
+                tracedraw_core::text_flow::WrapMode::Contour,
+                tracedraw_core::text_flow::WrapSide::Left
+            )
+        );
+        let (_, four) = read(Some((4, 14000)));
+        assert_eq!(four.mode, tracedraw_core::text_flow::WrapMode::Square);
+        assert!((four.offset - 1.4).abs() < 1e-9);
+        assert!(!read(None).0);
+        assert!(!read(Some((0, 20000))).0);
+    }
+
+    /// A radius the file gives as a length is the corner's size on the
+    /// page: a rectangle enlarged three times by its transform with its
+    /// 2 mm corners kept opens with 2 mm corners, not 6 mm ones, while a
+    /// radius given as a share grows with the rectangle (#4126).
+    #[test]
+    fn length_radii_keep_their_size_on_a_scaled_rectangle() {
+        let read = |raw: f64| {
+            let mut c = f64s(&[254000.0, 127000.0]);
+            c.extend_from_slice(&f64s(&[3.0, 3.0]));
+            c.push(1);
+            c.extend_from_slice(&[0; 7]);
+            for gap in [16usize, 16, 16, 0] {
+                c.extend_from_slice(&f64s(&[raw]));
+                c.extend_from_slice(&vec![0u8; gap]);
+            }
+            let obj = list(
+                b"obj ",
+                &[
+                    chunk(b"loda", &loda(OBJ_RECT, &[(ARG_COORDS, c)])),
+                    chunk(b"trfd", &trfd(22, [3.0, 0.0, 0.0, 0.0, 3.0, 0.0])),
+                ]
+                .concat(),
+            );
+            let body = [
+                chunk(b"mcfg", &mcfg(22, 2_540_000, 2_540_000)),
+                list(b"page", &list(b"layr", &obj)),
+            ]
+            .concat();
+            let (doc, rep) = parse(&riff(b"CDRM", &body), 22);
+            assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+            let page = first_shape(&doc).page_corners().expect("a rectangle");
+            assert!(page.radii.iter().all(|r| (r - page.radii[0]).abs() < 1e-9));
+            page.radii[0]
+        };
+        // 20000 units: 2 mm on the page.
+        let got = read(20000.0);
+        assert!((got - 2.0).abs() < 1e-9, "{got}");
+        // A share of 0.4: 2.54 mm in the rectangle's own space, 7.62 mm
+        // on the page.
+        let got = read(0.4);
+        assert!((got - 7.62).abs() < 1e-9, "{got}");
     }
 
     #[test]

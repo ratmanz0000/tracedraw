@@ -989,6 +989,22 @@ fn inline_rename_field(app: &mut App, ui: &mut Ui, act: &mut Actions) {
     }
 }
 
+/// `s` is selected, or holds a selected object: one of a group's or a
+/// clip frame's own (#4135).
+fn holds_selection(selection: &[ShapeId], s: &Shape) -> bool {
+    if selection.contains(&s.id) {
+        return true;
+    }
+    match &s.kind {
+        ShapeKind::Group { children } => children.iter().any(|c| holds_selection(selection, c)),
+        ShapeKind::ClipFrame { frame, contents } => {
+            holds_selection(selection, frame)
+                || contents.iter().any(|c| holds_selection(selection, c))
+        }
+        _ => false,
+    }
+}
+
 /// A layer's row, then its objects when it is open.
 fn layer_rows(
     app: &App,
@@ -1006,7 +1022,28 @@ fn layer_rows(
         active: is_active,
         selected: is_selected,
     });
-    let resp = resp.rich_tip_with(|| format!("{}\n{}", layer.name, tr("docker.layer_row_desc")));
+    // A collapsed layer shows that it holds the selection: a mark at the
+    // end of its row, as its hidden rows would be highlighted (#4135).
+    let holds = !open && layer.shapes.iter().any(|s| holds_selection(&app.selection, s));
+    let resp = resp.rich_tip_with(|| {
+        let mut tip = format!("{}\n{}", layer.name, tr("docker.layer_row_desc"));
+        if holds {
+            tip.push('\n');
+            tip.push_str(&tr("docker.layer_holds_selection"));
+        }
+        tip
+    });
+    if holds {
+        let c = Pos2::new(rect.right() - 10.0, rect.center().y);
+        let mark = Rect::from_center_size(c, Vec2::splat(7.0));
+        ui.painter().rect_filled(mark, 1.0, Tokens::ACCENT);
+        ui.painter().rect_stroke(
+            mark,
+            1.0,
+            Stroke::new(1.0, crate::theme::Tokens::selected_row_line()),
+            egui::epaint::StrokeKind::Outside,
+        );
+    }
     let base = egui::Id::new(("objects_layer", layer.id.raw()));
     let mut x = rect.left() + 3.0 + INDENT;
     let (ar, a) = hot(ui, rect, x, 14.0, base.with("arrow"));
@@ -3400,19 +3437,38 @@ fn clip_rows(app: &mut App, ids: &[ShapeId], frame: ShapeId) {
 /// contents, and the object is selected. False when `id` is in no
 /// PowerClip.
 fn select_clip_content(app: &mut App, id: ShapeId) -> bool {
-    let doc = app.doc();
-    let Some(frame) = doc.ancestors(id).last().copied() else {
-        return false;
-    };
-    let in_contents = doc.find_shape(frame).is_some_and(|f| match &f.kind {
-        ShapeKind::ClipFrame { contents, .. } => contents.iter().any(|c| c.id == id),
-        _ => false,
-    });
-    if !in_contents || doc.shape(frame).is_err() {
+    // Into each clip frame on the way to the object, outermost first: a
+    // content of a clip frame inside another is reached through both
+    // (#4110: only the innermost one was looked at, and editing it while
+    // the outer one was edited dropped the outer one's editing).
+    let mut entered = false;
+    for _ in 0..32 {
+        let doc = app.doc();
+        let ancestors = doc.ancestors(id);
+        let Some(&top) = ancestors.first() else {
+            break;
+        };
+        let next = ancestors.get(1).copied().unwrap_or(id);
+        let in_contents = doc.find_shape(top).is_some_and(|f| match &f.kind {
+            ShapeKind::ClipFrame { contents, .. } => contents.iter().any(|c| c.id == next),
+            _ => false,
+        });
+        let next_is_clip = doc
+            .find_shape(next)
+            .is_some_and(|s| matches!(s.kind, ShapeKind::ClipFrame { .. }));
+        if !in_contents || doc.shape(top).is_err() || (next != id && !next_is_clip) {
+            break;
+        }
+        app.select(vec![top]);
+        app.edit_clip_frame();
+        if app.doc().shape(next).is_err() {
+            break;
+        }
+        entered = true;
+    }
+    if !entered {
         return false;
     }
-    app.select(vec![frame]);
-    app.edit_clip_frame();
     if app.doc().shape(id).is_ok() {
         app.select(vec![id]);
     }
@@ -3539,6 +3595,13 @@ fn drag_rows(
         return hold_menu;
     }
     if let Some((drop, _, _)) = target {
+        // A content's row of a PowerClip not being edited, dragged out
+        // straight away: the contents are taken out for editing with it
+        // chosen, as a click on its row does, and then it is dropped, so
+        // one drag frees it with no click first (#4061).
+        if app.clip_frame_edit.is_none() && !app.doc().ancestors(dragged).is_empty() {
+            select_clip_content(app, dragged);
+        }
         let ids = dragged_objects(app, dragged);
         drop_rows(app, &ids, drop);
     }
@@ -5011,6 +5074,27 @@ pub(crate) mod tests {
             draw(&mut app);
         }
         assert_eq!(app.selection, vec![id]);
+    }
+
+    /// A collapsed layer marks that it holds the selection, a group
+    /// selected in it or an object inside one of its groups (#4135).
+    #[test]
+    fn a_collapsed_layer_shows_it_holds_the_selection() {
+        let mut app = App::headless();
+        let a = app.new_shape(rect_kind()).expect("a");
+        let b = app.new_shape(rect_kind()).expect("b");
+        app.select(vec![a, b]);
+        app.group_selection();
+        let g = app.selection[0];
+        let layer = app.doc().pages[0].layers[0].id;
+        let shapes = app.doc().pages[0].layers[0].shapes.clone();
+        let holds = |sel: &[ShapeId]| shapes.iter().any(|s| holds_selection(sel, s));
+        assert!(holds(&[g]));
+        assert!(holds(&[b]), "an object inside a group");
+        assert!(!holds(&[]));
+        app.objects_collapsed.insert(layer);
+        draw(&mut app);
+        assert_eq!(app.selection, vec![g]);
     }
 
     #[test]
@@ -6548,6 +6632,40 @@ mod drag_tests {
         assert!(app.doc().shape(c).is_ok(), "c on the layer, free");
     }
 
+    /// A clip frame inside another (#4110): a click on a content of the
+    /// inner one edits both, the inner inside the outer; finishing the
+    /// inner one goes back to editing the outer one, and finishing that
+    /// leaves both clip frames whole, nothing loose on the page.
+    #[test]
+    fn a_clip_frame_inside_another_is_edited_inside_it() {
+        let mut app = App::headless();
+        let content = app.new_shape(rect_kind()).expect("content");
+        let inner = app.new_shape(rect_kind()).expect("inner");
+        let outer = app.new_shape(rect_kind()).expect("outer");
+        clip_rows(&mut app, &[content], inner);
+        clip_rows(&mut app, &[inner], outer);
+        let layer_count = |app: &App| app.page_layers().iter().map(|l| l.shapes.len()).sum::<usize>();
+        assert_eq!(layer_count(&app), 1, "one clip frame on the page");
+        assert!(select_clip_content(&mut app, content));
+        assert_eq!(app.clip_frame_edit.as_ref().map(|(f, _)| *f), Some(inner));
+        assert_eq!(app.clip_edit_outer.len(), 1, "the outer one waits");
+        assert_eq!(app.selection, vec![content]);
+        app.finish_clip_frame_edit();
+        assert_eq!(app.clip_frame_edit.as_ref().map(|(f, _)| *f), Some(outer), "back in the outer one");
+        assert_eq!(app.selection, vec![inner]);
+        app.finish_clip_frame_edit();
+        assert!(app.clip_frame_edit.is_none());
+        assert_eq!(layer_count(&app), 1, "nothing left loose");
+        let ShapeKind::ClipFrame { contents, .. } = &app.doc().find_shape(outer).expect("outer").kind else {
+            panic!("the outer clip frame");
+        };
+        assert_eq!(contents.len(), 1);
+        let ShapeKind::ClipFrame { contents, .. } = &contents[0].kind else {
+            panic!("the inner clip frame inside it");
+        };
+        assert_eq!(contents[0].id, content);
+    }
+
     /// An envelope on a clip frame stays when one of its contents is
     /// clicked in the list to be edited: the contents come out, and when
     /// the edit ends the clip frame has its envelope again, bending it all
@@ -6580,6 +6698,36 @@ mod drag_tests {
         for (x, y) in [(now.x0, drawn.x0), (now.y0, drawn.y0), (now.x1, drawn.x1), (now.y1, drawn.y1)] {
             assert!((x - y).abs() < 1e-6, "{now:?} {drawn:?}");
         }
+    }
+
+    /// #4061: a content's row dragged onto the layer's row frees it from
+    /// the PowerClip with no click on it first; the other contents stay
+    /// inside.
+    #[test]
+    fn a_content_row_drags_out_of_a_powerclip_without_a_click_first() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let a = app.new_shape(rect_kind()).expect("a");
+        let b = app.new_shape(rect_kind()).expect("b");
+        let c = app.new_shape(rect_kind()).expect("c");
+        clip_rows(&mut app, &[b, c], a);
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.clip_frame_edit.is_none());
+        let rc = object_row(&ctx, c);
+        let layer = app.active_layer().expect("layer");
+        let rl = layer_row(&ctx, layer);
+        drag(&ctx, &mut app, rc.center(), rl.center());
+        if app.clip_frame_edit.is_some() {
+            app.finish_clip_frame_edit();
+        }
+        let contents = match &app.doc().find_shape(a).expect("a").kind {
+            ShapeKind::ClipFrame { contents, .. } => contents.iter().map(|s| s.id).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(contents, [b]);
+        assert!(app.doc().shape(c).is_ok(), "c on the layer, free");
     }
 
     /// PowerClips in the list (#3053): a row let go in the middle of

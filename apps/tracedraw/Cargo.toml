@@ -88,6 +88,10 @@ jiff = "0.2"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd.workspace = true
 
+# Nonblocking, bounded printer-list output on CUPS desktops.
+[target.'cfg(all(unix, not(any(target_arch = "wasm32", target_os = "android"))))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The window drawn with OpenGL (glow). wgpu is the optional `gpu`
 # feature: the graphics card chosen in Options, or its software adapter

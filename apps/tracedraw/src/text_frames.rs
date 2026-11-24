@@ -1086,6 +1086,7 @@ mod tests {
                 even: false,
             },
             snapped: (false, false),
+            flat: (false, false),
             start_geometry: None,
         };
         assert!(glyph_scale_drag(&drag));

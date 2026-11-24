@@ -1411,6 +1411,9 @@ pub enum Dialog {
         gap_x: f64,
         gap_y: f64,
     },
+    /// Text > Text Height (#4094): the height of the text's capitals, in
+    /// the drawing's units.
+    TextHeight { height: f64 },
     /// Object > Outline Offset (#2622): the distance, in the drawing's
     /// units, and whether the new outline goes outside or inside.
     OutlineOffset {
@@ -1551,6 +1554,11 @@ pub enum Dialog {
     /// Tools > Sizes and Areas: the selected objects' and the pages'
     /// sizes and areas (`ui::sizes`, #2098).
     SizesAreas(crate::ui::sizes::SizesTab),
+    /// The image editing mode's Finish puts the layers together for good:
+    /// go on? (Options > Global > Warnings, #4112.)
+    ConfirmPixelFlatten {
+        dont_ask: bool,
+    },
     /// Take an item off the Shelf? (Options > Global > Warnings.)
     ConfirmShelfRemove {
         uid: u64,
@@ -3054,6 +3062,7 @@ pub fn show(app: &mut App, ctx: &Context) {
             crate::ui::arrowhead_editor::dialog(app, ctx, st, &mut close)
         }
         Dialog::EditFill(st) => crate::ui::edit_fill::dialog(app, ctx, st, &mut close),
+        Dialog::TextHeight { height } => crate::text_height::dialog(app, ctx, height, &mut close),
         Dialog::PdfText(st) => crate::ui::pdf_import_dialog::dialog(app, ctx, st, &mut close),
         Dialog::PdfPages(st) => crate::ui::pdf_pages::dialog(app, ctx, st, &mut close),
         Dialog::OldCdrVersion { version } => {
@@ -3454,6 +3463,36 @@ pub fn show(app: &mut App, ctx: &Context) {
                     crate::ui::gpu_hint::Answer::from_button(i),
                     dont_show,
                 );
+                close = true;
+            }
+        }
+        Dialog::ConfirmPixelFlatten { dont_ask } => {
+            let (flatten, keep, back) = (
+                tr("pixel.flatten_ask.flatten"),
+                tr("pixel.flatten_ask.keep"),
+                tr("pixel.flatten_ask.back"),
+            );
+            if let Some(i) = crate::ui::chrome::message_box_check(
+                ctx,
+                crate::ui::chrome::MessageIcon::Question,
+                &tr("pixel.flatten_ask.text"),
+                &[&flatten, &keep, &back],
+                &tr("shelf.dont_ask"),
+                dont_ask,
+            ) {
+                if *dont_ask && i < 2 {
+                    app.settings.warnings.pixel_flatten = false;
+                    app.settings.save();
+                }
+                match i {
+                    0 => app.finish_pixel_edit_now(),
+                    1 => {
+                        app.settings.pixel_keep_layers = true;
+                        app.settings.save();
+                        app.finish_pixel_edit_now();
+                    }
+                    _ => {}
+                }
                 close = true;
             }
         }

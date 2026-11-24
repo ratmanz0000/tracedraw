@@ -1003,6 +1003,7 @@ fn handle_modifiers_shape_the_scale() {
             grab: tracedraw_core::geometry::Vec2::ZERO,
             mods,
             snapped: (false, false),
+            flat: (false, false),
             start_geometry: None,
         })
         .expect("transform")
@@ -1326,6 +1327,7 @@ fn the_status_bar_tells_how_far_how_much_and_what_angle() {
         grab: tracedraw_core::geometry::Vec2::ZERO,
         mods: HandleMods::default(),
         snapped: (false, false),
+        flat: (false, false),
         start_geometry: None,
     };
     let text = info(&app);
@@ -5407,6 +5409,60 @@ fn bspline_preview_is_the_curve_that_is_made() {
     assert_eq!(last_path(&app), bspline_path(&controls, false));
 }
 
+/// #4087, #4076: while a B-spline is drawn, Space places a control
+/// point where the pointer is and the curve goes on (the Pick tool is not
+/// chosen); a right click places a fixed point there, with no context
+/// menu; a press that drifted into a drag does not hold back the next
+/// click.
+#[test]
+fn bspline_space_and_right_click_place_points() {
+    let (ctx, mut app, _) = setup();
+    app.select(Vec::new());
+    app.set_tool(Tool::BSpline);
+    let none = Modifiers::NONE;
+    let count = |app: &App| app.curve.as_ref().map_or(0, |c| c.nodes.len());
+    let at = app.view.to_screen(Point::new(100.0, 150.0));
+    click_at(&ctx, &mut app, at, none);
+    assert_eq!(count(&app), 1);
+    // Space with the pointer elsewhere: a second point, still drawing.
+    let at = app.view.to_screen(Point::new(140.0, 190.0));
+    frame(&ctx, &mut app, vec![Event::PointerMoved(at)], none);
+    frame(&ctx, &mut app, vec![key(egui::Key::Space, none)], none);
+    frame(&ctx, &mut app, vec![key_up(egui::Key::Space, none)], none);
+    assert_eq!(app.tool, Tool::BSpline, "Space picked no tool");
+    assert_eq!(count(&app), 2, "Space placed a point");
+    assert!(!app.curve.as_ref().expect("drawing").spline_fixed[1]);
+    // Space again on the same spot places no second point there.
+    frame(&ctx, &mut app, vec![key(egui::Key::Space, none)], none);
+    frame(&ctx, &mut app, vec![key_up(egui::Key::Space, none)], none);
+    assert_eq!(count(&app), 2);
+    // A right click: a fixed point, no context menu.
+    let at = app.view.to_screen(Point::new(180.0, 160.0));
+    frame(&ctx, &mut app, vec![Event::PointerMoved(at)], none);
+    frame(&ctx, &mut app, vec![button(at, true, PointerButton::Secondary, none)], none);
+    frame(&ctx, &mut app, vec![button(at, false, PointerButton::Secondary, none)], none);
+    for _ in 0..20 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    assert_eq!(count(&app), 3, "the right click placed a point");
+    assert!(app.curve.as_ref().expect("drawing").spline_fixed[2], "fixed");
+    assert!(app.context_menu.is_none(), "no context menu");
+    // A press that drifts: a point; the click after it: one more.
+    let from = app.view.to_screen(Point::new(200.0, 140.0));
+    drag(&ctx, &mut app, from, from + egui::vec2(8.0, 0.0), none, Vec::new());
+    for _ in 0..20 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    let n = count(&app);
+    app.curve.as_mut().expect("drawing").dragging_handle = true;
+    let at = app.view.to_screen(Point::new(230.0, 170.0));
+    click_at(&ctx, &mut app, at, none);
+    assert_eq!(count(&app), n + 1, "the click after a drag placed its point");
+    // Ctrl+Z takes the points back one at a time.
+    app.undo();
+    assert_eq!(count(&app), n);
+}
+
 /// The B-Spline tool: a point placed with C or V held is fixed, the
 /// curve passing through it with a corner, in the preview and in the
 /// curve made, which keeps the flags for the Shape tool (#2060).
@@ -8036,7 +8092,8 @@ fn a_freehand_click_on_the_first_node_closes_the_line() {
 }
 
 /// Space ends the curve being drawn with any of the line tools, as a
-/// right click or Enter does, with the nodes placed so far (d#2595).
+/// right click or Enter does, with the nodes placed so far (d#2595). Not
+/// the B-spline tool, where Space places a point (#4087; Enter ends it).
 #[test]
 fn space_ends_the_curve_of_every_line_tool() {
     for tool in [
@@ -8044,7 +8101,6 @@ fn space_ends_the_curve_of_every_line_tool() {
         Tool::Freehand,
         Tool::Pen,
         Tool::Polyline,
-        Tool::BSpline,
     ] {
         let (ctx, mut app, _id) = setup();
         app.set_tool(tool);
@@ -21050,10 +21106,8 @@ fn picture_dialogs(app: &App) -> Vec<(&'static str, crate::ui::dialogs::Dialog)>
         ("black_and_white", Dialog::BitmapBw(Default::default())),
         ("duotone", Dialog::BitmapDuotone(Default::default())),
         ("paletted", Dialog::BitmapPaletted(Default::default())),
-        (
-            "gaussian_blur",
-            Dialog::Effect(crate::ui::effect_dialog::EffectState::new("gaussian_blur")),
-        ),
+        // Gaussian Blur opens as the compact window, its setting alone
+        // (#4091), so it is not here.
         (
             "image_adjustments",
             Dialog::Effect(crate::ui::effect_dialog::EffectState::new(
@@ -30993,6 +31047,55 @@ fn ctrl_and_shift_wheel_scroll_sideways_alt_wheel_up_and_down() {
     assert!(app.view.zoom > zoom * 1.1);
 }
 
+/// With the wheel scrolling (Options > Tools > Zoom/Pan), Shift+wheel
+/// scrolls sideways, also when the system sends the turn sideways already,
+/// as Windows does (#4114: that turn went up and down).
+#[test]
+fn shift_wheel_scrolls_sideways_when_the_wheel_scrolls() {
+    let (ctx, mut app, _) = setup();
+    app.settings.wheel_zooms = false;
+    let at = Pos2::new(700.0, 500.0);
+    let mut t = 10.0;
+    let mut step = |app: &mut App, events: Vec<Event>, modifiers: Modifiers| {
+        t += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            events: std::iter::once(Event::ModifiersChanged(modifiers))
+                .chain(events)
+                .collect(),
+            time: Some(t),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+    };
+    step(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+    step(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+    for delta in [egui::vec2(0.0, -1.0), egui::vec2(-1.0, 0.0)] {
+        let zoom = app.view.zoom;
+        let origin = app.view.origin;
+        let wheel = Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::SHIFT,
+        };
+        step(&mut app, vec![wheel], Modifiers::SHIFT);
+        for _ in 0..30 {
+            step(&mut app, Vec::new(), Modifiers::SHIFT);
+        }
+        assert!((app.view.zoom - zoom).abs() < 1e-9, "no zoom");
+        let moved = app.view.origin - origin;
+        assert!(
+            moved.x.abs() > 1.0 && moved.y.abs() < 1e-6,
+            "{delta:?}: {moved:?}"
+        );
+    }
+}
+
 /// Options > Tools > Zoom/Pan > Ctrl+wheel zooms (#3473): ticked, a
 /// Ctrl+wheel turn zooms about the pointer as the plain wheel does,
 /// without scrolling; unticked it scrolls sideways (#3087).
@@ -31916,4 +32019,60 @@ fn a_common_shape_is_adjusted_by_its_handles() {
     assert!(crate::kind_nodes::nodes(&s).is_empty());
     frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
     assert!(app.node_at(app.view.to_page(tip)).is_some(), "nodes back");
+}
+
+/// A perfectly vertical line has no width of its own: its box is only as
+/// wide as its outline. Dragging its right side handle used to scale
+/// about the box's left edge by the pointer's distance over that sliver,
+/// flinging the line sideways ever faster (#4173). The line now stays
+/// where it is; the top handle still stretches it along its length.
+#[test]
+fn a_straight_lines_flat_axis_is_not_scaled_by_its_side_handle() {
+    let (ctx, mut app, id) = setup();
+    app.select(vec![id]);
+    app.delete_selection();
+    let mut path = tracedraw_core::BezPath::new();
+    path.move_to((30.0, 20.0));
+    path.line_to((30.0, 60.0));
+    let line = app
+        .new_shape(ShapeKind::Path {
+            path,
+            closed: false,
+        })
+        .expect("line");
+    app.select(vec![line]);
+    app.apply_outline_width(2.0);
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let before = bounds(&app, line);
+    assert!(before.width() < 1e-9, "{before:?}");
+    let from = handle(&app, Handle::E);
+    drag(
+        &ctx,
+        &mut app,
+        from,
+        from + egui::vec2(4.0, 0.0),
+        Modifiers::NONE,
+        Vec::new(),
+    );
+    let after = bounds(&app, line);
+    assert!(
+        close(after.x0, before.x0) && close(after.x1, before.x1),
+        "{before:?} -> {after:?}"
+    );
+    assert!(close(after.height(), before.height()), "{after:?}");
+    // Along its length it still scales.
+    let from = handle(&app, Handle::N);
+    drag(
+        &ctx,
+        &mut app,
+        from,
+        from + egui::vec2(0.0, -40.0),
+        Modifiers::NONE,
+        Vec::new(),
+    );
+    let stretched = bounds(&app, line);
+    assert!(stretched.height() > before.height() + 1.0, "{stretched:?}");
+    assert!(close(stretched.x0, before.x0), "{stretched:?}");
 }

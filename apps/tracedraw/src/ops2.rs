@@ -1574,6 +1574,19 @@ impl App {
         let ShapeKind::ClipFrame { contents, .. } = &clip.kind else {
             return;
         };
+        // A clip frame among the contents of the one being edited: it is
+        // edited inside that one, which is edited again when it finishes
+        // (#4110: the outer one's editing was dropped, its contents left
+        // loose on the page). Not from a symbol's objects.
+        if let Some((edited, _)) = &self.clip_frame_edit {
+            if !self.editing_clip_contents() || *edited == clip.id || self.outside_clip_edit(clip.id) {
+                return;
+            }
+            if let Some((f, o)) = self.clip_frame_edit.take() {
+                let shell = self.clip_edit_shell.take();
+                self.clip_edit_outer.push((f, o, shell));
+            }
+        }
         let ids: Vec<ShapeId> = contents.iter().map(|c| c.id).collect();
         // What is on the page besides: everything else that comes along
         // while editing (the members of a content ungrouped, objects
@@ -1671,6 +1684,12 @@ impl App {
             return;
         }
         if mark.begins != undone {
+            // Back into a clip frame inside the one being edited (#4110).
+            if mark.symbol.is_none() && self.editing_clip_contents() {
+                if let Some((f, o)) = self.clip_frame_edit.take().filter(|(f, _)| *f != mark.frame) {
+                    self.clip_edit_outer.push((f, o, None));
+                }
+            }
             self.clip_frame_edit = Some((mark.frame, mark.outside));
             self.symbol_edit = mark.symbol;
             let contents = self.clip_edit_contents();
@@ -1684,6 +1703,20 @@ impl App {
         } else {
             let prev = self.symbol_edit.take();
             self.clip_frame_edit = None;
+            // Out of a clip frame inside another: editing the one round it
+            // again (#4110).
+            if mark.symbol.is_none() && prev.is_none() {
+                if let Some((f, o, shell)) = self.clip_edit_outer.pop() {
+                    if self.doc().find_shape(f).is_some() {
+                        self.clip_frame_edit = Some((f, o));
+                        self.clip_edit_shell = shell;
+                        self.select(vec![mark.frame]);
+                        self.status = tr("status.editing_clip_frame");
+                        return;
+                    }
+                    self.clip_edit_outer.clear();
+                }
+            }
             if let Some(se) = mark.symbol.or(prev) {
                 self.restore_symbol_edit_view(&se);
             } else {
@@ -1761,13 +1794,43 @@ impl App {
     /// clip frame, or out of the one being edited.
     pub fn toggle_clip_frame_edit(&mut self) {
         if self.editing_clip_contents() {
-            self.finish_clip_frame_edit();
+            // A clip frame among the contents picked: into it (#4110).
+            let edited = self.clip_frame_edit.as_ref().map(|(f, _)| *f);
+            let inner = self.selected_shapes().iter().any(|s| {
+                matches!(s.kind, ShapeKind::ClipFrame { .. }) && Some(s.id) != edited
+            });
+            if inner {
+                self.edit_clip_frame();
+            } else {
+                self.finish_clip_frame_edit();
+            }
         } else if self.clip_frame_edit.is_none() {
             self.edit_clip_frame();
         }
     }
 
+    /// Finish editing the contents of the clip frame edited now; when it
+    /// is inside another one being edited, that one is edited again, the
+    /// finished clip frame selected among its contents (#4110).
     pub fn finish_clip_frame_edit(&mut self) {
+        let nested = self.editing_clip_contents() && !self.clip_edit_outer.is_empty();
+        self.finish_clip_frame_edit_level();
+        if !nested {
+            return;
+        }
+        let Some((frame, outside, shell)) = self.clip_edit_outer.pop() else {
+            return;
+        };
+        if self.doc().find_shape(frame).is_none() {
+            self.clip_edit_outer.clear();
+            return;
+        }
+        self.clip_frame_edit = Some((frame, outside));
+        self.clip_edit_shell = shell;
+        self.status = tr("status.editing_clip_frame");
+    }
+
+    fn finish_clip_frame_edit_level(&mut self) {
         let contents = self.clip_edit_contents();
         let Some((frame, outside)) = self.clip_frame_edit.take() else {
             return;
@@ -4725,6 +4788,23 @@ impl App {
             match tracedraw_vba::convert::js_run_name(src) {
                 Some(name) => self.run_macro_js(src, &name, "Scripts".into()),
                 None => self.scripts_output.push(tr("convert.nothing_to_run")),
+            }
+            return;
+        }
+        // A script that asks the user for a value runs on a thread of its
+        // own, which waits for the input box (#4139).
+        if !crate::files::WEB && crate::scripting::vba_run::asks_user(src) {
+            if self.macros.run.is_some() {
+                self.status = tr("macros.already_running");
+                return;
+            }
+            match crate::scripting::vba_run::start_script(self, src, None, None, "Scripts".into())
+            {
+                Ok(run) => {
+                    self.macros.run = Some(run);
+                    self.macros.applied = None;
+                }
+                Err(e) => self.scripts_output.push(format!("Error: {e}")),
             }
             return;
         }

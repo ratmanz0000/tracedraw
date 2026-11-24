@@ -106,7 +106,10 @@ pub fn tab_strip(app: &mut App, ui: &mut Ui, place: DockerPlace) {
             let icon_h = if tab_icon(tab).is_some() { 24.0 } else { 0.0 };
             // A slot at the top of the tab for the close cross, shown while
             // the pointer is over the tab.
-            let h = tab_height(icon_h, w, compact);
+            // Pictures alone: the panel in front still shows its name, so
+            // the one open is read at a glance (#4121).
+            let named = !compact || active;
+            let h = tab_height(icon_h, w, !named);
             let (r, resp) =
                 ui.allocate_exact_size(egui::vec2(full.width(), h), egui::Sense::click_and_drag());
             laid.push((tab, r));
@@ -144,7 +147,7 @@ pub fn tab_strip(app: &mut App, ui: &mut Ui, place: DockerPlace) {
                 );
                 icon(ui.painter(), ir);
             }
-            if !compact {
+            if named {
                 let text_top = r.min.y + CLOSE_SLOT + 7.0 + icon_h;
                 let mut ts = egui::epaint::TextShape::new(
                     egui::pos2(bg.center().x + gh / 2.0, text_top),
@@ -176,8 +179,12 @@ pub fn tab_strip(app: &mut App, ui: &mut Ui, place: DockerPlace) {
                 let on_close = resp
                     .interact_pointer_pos()
                     .is_some_and(|p| close.contains(p));
+                // A locked docker keeps its place: its close button does
+                // nothing until it is unlocked (#3953).
                 if on_close {
-                    app.close_docker(tab);
+                    if !app.docker_locked(tab) {
+                        app.close_docker(tab);
+                    }
                 } else {
                     click_tab(app, place, tab);
                 }
@@ -189,8 +196,10 @@ pub fn tab_strip(app: &mut App, ui: &mut Ui, place: DockerPlace) {
                     crate::ui::menus::body(ui, |ui| {
                         place_menu(app, ui, tab);
                         stack_item(app, ui, tab);
+                        lock_item(app, ui, tab);
                         crate::ui::menus::sep(ui);
-                        if crate::ui::menus::item(ui, "docker.close_docker", "", true) {
+                        let open = !app.docker_locked(tab);
+                        if crate::ui::menus::item(ui, "docker.close_docker", "", open) {
                             app.close_docker(tab);
                         }
                     })
@@ -393,6 +402,20 @@ fn stack_item(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         } else {
             app.stack_docker(tab, place);
         }
+    }
+}
+
+/// Lock Docker in a docker's menus (#3953): a locked docker stays in
+/// front of its column and cannot be closed; a docker opened there goes
+/// under it (or to the side's second column when the one under it is
+/// locked too). Off by default. Offered for a docker in a column.
+fn lock_item(app: &mut App, ui: &mut Ui, tab: DockerTab) {
+    if app.docker_place(tab).is_none_or(|p| p == DockerPlace::Floating) {
+        return;
+    }
+    let locked = app.docker_locked(tab);
+    if crate::ui::menus::check_if(ui, "docker.lock_docker", locked, true) {
+        app.set_docker_locked(tab, !locked);
     }
 }
 
@@ -792,7 +815,7 @@ fn tab_height(icon_h: f32, name_w: f32, compact: bool) -> f32 {
 }
 
 /// Whether a column's tabs show their pictures alone (the name stays in
-/// the tip): only when Options > Customization > Appearance asks for it
+/// the tip, and on the tab in front, #4121): only when Options > Customization > Appearance asks for it
 /// (`chosen`) and every tab has a picture. Otherwise each tab shows its
 /// picture and its name, however short the column: a column too short
 /// for its tabs slides (#950, #2902).
@@ -1125,7 +1148,9 @@ pub(crate) fn click_tab(app: &mut App, place: DockerPlace, tab: DockerTab) {
         app.set_docker_column(place, false, None);
     } else if below {
         app.set_docker_column(place, true, None);
-    } else {
+    } else if !app.open_beside_locked(tab, place) {
+        // A locked front docker stays; the clicked one goes under it
+        // (#3953).
         app.set_docker_column(place, true, Some(tab));
     }
 }
@@ -1304,8 +1329,10 @@ fn docker_title(app: &mut App, ui: &mut Ui, tab: DockerTab, place: DockerPlace) 
             crate::ui::menus::body(ui, |ui| {
                 place_menu(app, ui, tab);
                 stack_item(app, ui, tab);
+                lock_item(app, ui, tab);
                 crate::ui::menus::sep(ui);
-                if crate::ui::menus::item(ui, "docker.close_docker", "", true) {
+                let open = !app.docker_locked(tab);
+                if crate::ui::menus::item(ui, "docker.close_docker", "", open) {
                     app.close_docker(tab);
                 }
             })
@@ -5379,6 +5406,8 @@ pub(crate) mod tests {
         let tabs = [DockerTab::Properties, DockerTab::Objects, DockerTab::Blend];
         assert!(!icons_only(&tabs, false), "names by default");
         assert!(icons_only(&tabs, true), "pictures alone when chosen");
+        // The tab in front keeps its name below its picture (#4121).
+        assert!(tab_height(24.0, 60.0, false) > tab_height(24.0, 60.0, true));
         assert!(!crate::settings::Settings::default().docker_tabs_icons_only);
         // Drawn: five panels in a tall column, then a short one.
         let ctx = crate::theme::ui_context();
@@ -5417,13 +5446,18 @@ pub(crate) mod tests {
         for ((_, a), (_, b)) in short.iter().zip(&tall) {
             assert!((a.height() - b.height()).abs() < 0.5, "{a:?} {b:?}");
         }
-        // Icons only chosen: the pictures alone, in any column.
+        // Icons only chosen: the pictures alone, in any column, but for
+        // the panel in front, which keeps its name (#4121).
         app.settings.docker_tabs_icons_only = true;
         let compact = run(&mut app, 2000.0);
-        assert!(
-            compact.iter().all(|(_, r)| (r.height() - 54.0).abs() < 0.5),
-            "{compact:?}"
-        );
+        let (_, front, _) = app.docker_column(DockerPlace::Right);
+        for (tab, r) in &compact {
+            if *tab == front {
+                assert!(r.height() > 60.0, "{tab:?} {r:?}");
+            } else {
+                assert!((r.height() - 54.0).abs() < 0.5, "{tab:?} {r:?}");
+            }
+        }
     }
 
     /// The pointer over a docker tab shows a close cross at its top; a

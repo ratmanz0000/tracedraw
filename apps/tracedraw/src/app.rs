@@ -422,6 +422,11 @@ pub enum Drag {
         /// snapped axis alone, so the side stays on what it snapped to
         /// (#2004).
         snapped: (bool, bool),
+        /// The axes, x and y, on which the selection has no size of its
+        /// own (a perfectly vertical or horizontal line: its box is only
+        /// as wide as its outline). They are kept at 100 %: scaled about
+        /// the box's edge, the line was flung sideways ever faster (#4173).
+        flat: (bool, bool),
         /// Where the selection stood when the handle was grabbed, built
         /// once the handle has left the snapping radius of its start: the
         /// handle then snaps to the selection's own nodes and edges as
@@ -1778,6 +1783,9 @@ pub struct App {
     pub pixel_edit: Option<Box<crate::pixel_edit_app::PixelEdit>>,
     /// The brush settings of picture editing, kept between pictures.
     pub pixel_opts: crate::pixel_edit::BrushOpts,
+    /// The layers of pictures edited inside, kept after Finish while the
+    /// drawings are open (#4112).
+    pub pixel_kept: crate::pixel_keep::KeptLayers,
     pub show_guides: bool,
     /// Selected guidelines of the active page (indices).
     pub selected_guides: Vec<usize>,
@@ -1967,6 +1975,9 @@ pub struct App {
     /// handed to programs, with their time stamps when handed over; one
     /// that is saved comes into the drawing.
     pub object_files: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    /// Tables' workbooks open in the spreadsheet program (#4145): saved
+    /// there, they give their tables the cells again.
+    pub table_files: Vec<crate::table_external::TableFile>,
     /// Session recovery: this session's marker in the auto-backup folder
     /// (made on the first frame; in a browser once its storage is read).
     pub session: Option<crate::recovery::Session>,
@@ -2257,6 +2268,15 @@ pub struct App {
     /// they came out: its envelope and other effects, shadow, opacity and
     /// name go back onto it when the editing ends (#4070).
     pub clip_edit_shell: Option<tracedraw_core::Shape>,
+    /// The clip frames being edited round the one edited now, outermost
+    /// first, when a clip frame inside another is edited (#4110): each
+    /// with what was outside it and its look kept aside. Finishing the
+    /// inner one goes back to editing the one round it.
+    pub clip_edit_outer: Vec<(
+        ShapeId,
+        std::collections::HashSet<ShapeId>,
+        Option<tracedraw_core::Shape>,
+    )>,
     /// The Table tool's drag and bar choices.
     pub table_ui: crate::table_tool::TableUi,
     pub missing_fonts: Vec<String>,
@@ -2363,6 +2383,9 @@ pub struct App {
     /// [`DockerPlace::column_index`]), the two stacked in the column's
     /// height (#2312).
     pub docker_stacks: [DockerStack; 4],
+    /// Dockers locked in front of their column (#3953): a docker opened
+    /// there goes under a locked one instead of taking its place.
+    pub locked_dockers: Vec<DockerTab>,
     /// A docker being moved by its tab or its title (see ui/dockers.rs).
     pub docker_drag: Option<DockerDrag>,
     /// The default column's front tab and whether it was open, as the
@@ -3616,6 +3639,7 @@ impl App {
             symmetry_doc: Default::default(),
             pixel_edit: None,
             pixel_opts: Default::default(),
+            pixel_kept: Default::default(),
             show_guides: true,
             selected_guides: Vec::new(),
             edit_master_guides: true,
@@ -3692,6 +3716,7 @@ impl App {
             linked_mtimes: Default::default(),
             linked_checked: None,
             object_files: Vec::new(),
+            table_files: Vec::new(),
             session: None,
             recovery_offer: Vec::new(),
             highlight_whats_new: false,
@@ -3835,6 +3860,7 @@ impl App {
             glyph_picked: None,
             table_edit: None,
             clip_edit_shell: None,
+            clip_edit_outer: Vec::new(),
             table_ui: Default::default(),
             missing_fonts: Vec::new(),
             ask_missing_fonts: true,
@@ -3872,6 +3898,7 @@ impl App {
             closed_own_windows: Vec::new(),
             docked_before: Vec::new(),
             docker_stacks: Default::default(),
+            locked_dockers: Vec::new(),
             docker_drag: None,
             docker_last: (DockerTab::Hints, true),
             free_transform_last: Point::ZERO,
@@ -4923,6 +4950,7 @@ impl App {
                     })
                 })
                 .collect(),
+            locked: keys(&self.locked_dockers),
             floating: self
                 .floating_dockers
                 .iter()
@@ -5059,8 +5087,93 @@ impl App {
                 }
             }
         }
+        self.locked_dockers = setup.locked.iter().filter_map(|k| by_key(k)).collect();
+        self.locked_dockers.dedup();
         self.settle_columns();
         self.docker_last = (self.docker_tab, self.show_dockers);
+    }
+
+    /// Whether `tab` is locked in front of its column (#3953).
+    pub fn docker_locked(&self, tab: DockerTab) -> bool {
+        self.locked_dockers.contains(&tab)
+    }
+
+    /// Lock or unlock `tab` (#3953). A locked docker stays where it is
+    /// when another docker opens: that one goes under it.
+    pub fn set_docker_locked(&mut self, tab: DockerTab, locked: bool) {
+        self.locked_dockers.retain(|t| *t != tab);
+        if locked {
+            self.locked_dockers.push(tab);
+        }
+    }
+
+    /// Open `tab` in the column at `place` without moving a locked docker
+    /// (#3953): with a locked docker in front, `tab` goes under it; when
+    /// the docker under it is locked too, `tab` goes to the side's second
+    /// column (floating when that is full of locked dockers as well).
+    /// False when the front docker there is not locked, so `tab` opens
+    /// the usual way.
+    pub fn open_beside_locked(&mut self, tab: DockerTab, place: DockerPlace) -> bool {
+        let Some(i) = place.column_index() else {
+            return false;
+        };
+        let (tabs, front, shown) = self.docker_column(place);
+        if tabs.is_empty() || front == tab || !self.docker_locked(front) {
+            return false;
+        }
+        let below = self.docker_stacks[i].below;
+        if below == Some(tab) {
+            self.set_docker_column(place, true, None);
+            return true;
+        }
+        if below.is_none_or(|b| !self.docker_locked(b)) {
+            if self.docker_place(tab) != Some(place) {
+                self.take_docker(tab);
+                // Taking it may have moved the column (a side's second
+                // column becomes the edge one when that empties).
+                let Some(dest) = self.docker_place(front) else {
+                    return false;
+                };
+                if let Some(tabs) = self.column_tabs_mut(dest) {
+                    let at = tabs
+                        .iter()
+                        .position(|t| *t == front)
+                        .map_or(tabs.len(), |i| i + 1);
+                    tabs.insert(at, tab);
+                }
+                return self.stack_under_front(tab, dest);
+            }
+            if !shown {
+                self.set_docker_column(place, true, None);
+            }
+            return self.stack_under_front(tab, place);
+        }
+        // Both dockers of the column are locked: the side's second column.
+        let inner = match place {
+            DockerPlace::Right => Some(DockerPlace::RightInner),
+            DockerPlace::Left => Some(DockerPlace::LeftInner),
+            _ => None,
+        };
+        match inner {
+            Some(inner) if self.open_beside_locked(tab, inner) => {}
+            Some(inner) if self.docker_place(tab) == Some(inner) => {
+                self.set_docker_column(inner, true, Some(tab));
+            }
+            Some(inner) => self.move_docker(tab, inner, None),
+            None => self.move_docker(tab, DockerPlace::Floating, None),
+        }
+        true
+    }
+
+    /// Show `tab`, one of the column's tabs, under the column's front
+    /// docker, the column open.
+    fn stack_under_front(&mut self, tab: DockerTab, place: DockerPlace) -> bool {
+        let Some(i) = place.column_index() else {
+            return false;
+        };
+        self.docker_stacks[i].below = Some(tab);
+        self.set_docker_column(place, true, None);
+        true
     }
 
     /// The docker shown under the one in front of the column at `place`
@@ -5289,6 +5402,16 @@ impl App {
                 return;
             }
         }
+        // A locked docker in front of the column it opens in stays (#3953).
+        let place = match self.docker_place(tab) {
+            Some(DockerPlace::Floating) => None,
+            Some(p) => Some(p),
+            None if self.closed_own_windows.iter().any(|f| f.tab == tab) => None,
+            None => Some(DockerPlace::Right),
+        };
+        if place.is_some_and(|p| self.open_beside_locked(tab, p)) {
+            return;
+        }
         match self.docker_place(tab) {
             Some(DockerPlace::Left) => {
                 self.left_tab = tab;
@@ -5497,6 +5620,19 @@ impl App {
     /// default column goes back to how the last frame left it; one open
     /// nowhere joins the default column.
     pub fn reconcile_dockers(&mut self) {
+        // A docker brought to the front of the default column over a
+        // locked one goes under it instead (#3953).
+        let (last, last_shown) = self.docker_last;
+        if self.show_dockers
+            && last_shown
+            && self.docker_tab != last
+            && self.docker_locked(last)
+            && self.open_dockers.contains(&last)
+        {
+            let tab = self.docker_tab;
+            self.docker_tab = last;
+            self.open_docker(tab);
+        }
         if self.show_dockers && !self.open_dockers.contains(&self.docker_tab) {
             let tab = self.docker_tab;
             match self.docker_place(tab) {
@@ -5700,9 +5836,11 @@ impl App {
             return;
         }
         self.close_active_document();
-        // The last drawing gone: the kept fill pictures go with it.
+        // The last drawing gone: the kept fill pictures and picture
+        // layers go with it.
         if !self.has_document() {
             tracedraw_render::clear_procedural_cache();
+            self.pixel_kept.clear();
         }
     }
 
@@ -6669,7 +6807,7 @@ impl App {
             // Cancel undoes only what the Shape Builder made since it was
             // chosen (#3220).
             if tool == Tool::ShapeBuilder {
-                self.builder.session_steps = 0;
+                self.builder_forget_session();
             }
             // Another tool ends a pick of Image > Color Mask (#2479).
             if tool != Tool::ColorEyedropper {
@@ -9383,12 +9521,12 @@ impl App {
                     (doc, format!("HPGL: {n} stroke(s)"))
                 })
         } else if crate::spreadsheet_import::is_spreadsheet(&ext) {
-            crate::spreadsheet_import::read_rows(&path).map(|rows| {
+            crate::spreadsheet_import::read_sheet(&path).map(|(rows, source)| {
                 let title = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(App::untitled_name);
-                let doc = crate::spreadsheet_import::document(&title, &rows);
+                let doc = crate::spreadsheet_import::document_from(&title, &rows, source);
                 let n = rows.len();
                 (doc, format!("{n} row(s)"))
             })
@@ -13725,6 +13863,57 @@ mod tests {
             Some(DockerTab::Properties)
         );
         assert_eq!(side.docker_below(DockerPlace::RightInner), None);
+    }
+
+    /// #3953: a locked docker stays in front of its column; a docker
+    /// opened after it goes under it, and with the one under it locked
+    /// too, to the side's second column. Clicking another tab of the
+    /// column stacks it the same way, and the lock is kept with the
+    /// workspace. Unlocked, a new docker takes the front as before.
+    #[test]
+    fn a_locked_docker_keeps_its_place_when_another_opens() {
+        let mut app = App::headless();
+        app.set_docker_setup(&crate::settings::DockerSetup {
+            open: vec!["docker.properties".into(), "docker.hints".into()],
+            front: "docker.properties".into(),
+            ..Default::default()
+        });
+        app.show_dockers = true;
+        app.open_docker(DockerTab::Objects);
+        assert_eq!(app.docker_tab, DockerTab::Objects, "unlocked: replaced");
+        app.open_docker(DockerTab::Properties);
+        app.set_docker_locked(DockerTab::Properties, true);
+        app.open_docker(DockerTab::Undo);
+        assert_eq!(app.docker_tab, DockerTab::Properties, "locked stays");
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Undo));
+        assert!(app.docker_shown(DockerTab::Undo));
+        // Another one replaces the unlocked lower docker.
+        app.open_docker(DockerTab::Objects);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        // A tab of the column clicked: it goes under too.
+        crate::ui::dockers::click_tab(&mut app, DockerPlace::Right, DockerTab::Hints);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Hints));
+        // Brought to the front the old way, through docker_tab.
+        app.docker_tab = DockerTab::Objects;
+        app.reconcile_dockers();
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        // Both locked: the next one opens in a new column beside.
+        app.set_docker_locked(DockerTab::Objects, true);
+        app.open_docker(DockerTab::Color);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        assert_eq!(app.docker_place(DockerTab::Color), Some(DockerPlace::RightInner));
+        assert!(app.docker_shown(DockerTab::Color));
+        // Kept with the workspace.
+        let setup = app.docker_setup();
+        assert_eq!(setup.locked, ["docker.properties", "docker.objects"]);
+        let mut other = App::headless();
+        other.set_docker_setup(&setup);
+        assert!(other.docker_locked(DockerTab::Properties) && other.docker_locked(DockerTab::Objects));
+        assert!(!other.docker_locked(DockerTab::Color));
     }
 
     #[test]
