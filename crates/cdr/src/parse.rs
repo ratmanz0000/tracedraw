@@ -113,6 +113,11 @@ fn plan_bitmap_scale(datas: &[&[u8]], v: u16, free_ram: u64) -> f64 {
     if max_side as f64 * k > 32_768.0 {
         k = 32_768.0 / max_side as f64;
     }
+    // Limit total pixels across all bitmaps to 120 MP to avoid multi-gigabyte
+    // allocation and 20+ second PNG re-compression stalls.
+    if (px as f64 * k * k) > 120_000_000.0 {
+        k = (120_000_000.0 / px as f64).sqrt();
+    }
     let k = k.clamp(0.02, 1.0);
     if k < 1.0 {
         log::warn!(
@@ -3784,20 +3789,9 @@ impl<'a> Ctx<'a> {
                     self.pending_renumber = true;
                     return Some(ShapeKind::Group { children: vec![b] });
                 }
-                let r = rect();
                 self.report.warn(format!(
-                    "embedded object \"{name}\" has no picture we can show; placeholder kept on layer"
+                    "embedded object \"{name}\" has no picture we can show"
                 ));
-                if let Some(rect) = r {
-                    self.pending_unreadable_bitmap = Some(0);
-                    return Some(ShapeKind::Bitmap {
-                        rect,
-                        width_px: 1,
-                        height_px: 1,
-                        png: placeholder_bitmap_png(),
-                        fx: None,
-                    });
-                }
                 return None;
             };
             let rect = rect()?;

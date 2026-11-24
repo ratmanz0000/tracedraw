@@ -174,10 +174,15 @@ pub fn open_bytes_keeping(
         &kept_data,
     );
     doc_report.0.title = title.to_string();
-    doc_report.0.palette = container::document_palette(bytes, &container)
-        .into_iter()
-        .map(|(_, c)| c)
-        .collect();
+    let palette_named = container::document_palette(bytes, &container);
+    doc_report.0.palette = palette_named.iter().map(|(_, c)| c.clone()).collect();
+    for ink in &mut doc_report.0.inks {
+        if let Some((_, c)) = palette_named.iter().find(|(n, _)| n.eq_ignore_ascii_case(&ink.name)) {
+            if let tracedraw_core::Color::Cmyk { c, m, y, k } = c {
+                ink.cmyk = [*c, *m, *y, *k];
+            }
+        }
+    }
     // Spot library colours take what the file's page preview shows; a
     // version 3 file's thumbnail (`imhd`, a `.bmp` of the drawing) serves
     // the same way.

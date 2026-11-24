@@ -276,6 +276,11 @@ pub fn colours_from_preview(doc: &mut Document, preview: &Preview) -> usize {
         if solid.is_none() && fountain.is_none() {
             continue;
         }
+        if let Some((k, _)) = solid {
+            if samples.get(&k).is_some_and(|list| list.len() >= 8) {
+                continue;
+            }
+        }
         let Some(path) = paths.get(i) else {
             continue;
         };
@@ -291,7 +296,7 @@ pub fn colours_from_preview(doc: &mut Document, preview: &Preview) -> usize {
             }
             f
         });
-        let n = if placed.is_some() { 48 } else { 24 };
+        let n = if shapes.len() > 100 { 8 } else if placed.is_some() { 32 } else { 16 };
         for gy in 0..n {
             for gx in 0..n {
                 let p = Point::new(

@@ -275,6 +275,19 @@ pub fn parse_palette_xml(xml: &str) -> Vec<(String, Color)> {
                 q: *q,
             },
             ("REGISTRATION", _) => Color::Registration,
+            // When tints has 4 components, it gives CMYK values for the colour.
+            (_, [c, m, y, k]) if !cs.is_empty() => Color::Cmyk {
+                c: *c,
+                m: *m,
+                y: *y,
+                k: *k,
+            },
+            // When tints has 3 components, it gives RGB values.
+            (_, [r, g, b]) if !cs.is_empty() => Color::Rgb {
+                r: *r,
+                g: *g,
+                b: *b,
+            },
             _ => {
                 log::warn!("document palette colour {name:?} in {cs:?} skipped");
                 continue;
