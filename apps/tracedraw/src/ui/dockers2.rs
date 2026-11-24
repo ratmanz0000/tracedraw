@@ -703,9 +703,14 @@ pub(crate) fn put_in_field(text: &mut String, from: usize, to: usize, put: &str)
 /// A Find or Replace field with a right-click menu: Cut, Copy, Paste,
 /// Select All, and the special characters as their codes (#3678, #3679).
 /// `spaces`: the menu offers `^w` (two or more spaces), a Find code only.
-fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> egui::Response {
+/// Returns the response, and whether Enter left the field (Find Next).
+fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> (egui::Response, bool) {
     let id = ui.make_persistent_id(name);
     let out = egui::TextEdit::singleline(text).id(id).show(ui);
+    // A single-line field gives the keyboard up on Enter: that is the
+    // sign to run Find Next, whether one letter or ten were typed in.
+    let enter =
+        out.response.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     let all = text.chars().count();
     let (from, to) = egui::TextEdit::load_state(ui.ctx(), id)
         .and_then(|s| s.cursor.char_range())
@@ -781,7 +786,27 @@ fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> egui:
         }
         ui.memory_mut(|m| m.request_focus(id));
     }
-    response
+    (response, enter)
+}
+
+/// Find Next of the Text or Objects panel: search again, then select the
+/// one after the last one shown, or the first when nothing was shown yet
+/// or what was shown is no longer among the results. A first press shows
+/// the first result, not the second.
+fn find_next_now(app: &mut App, st: &mut crate::ui::dialogs::FindReplaceState) {
+    let was = st.results.get(st.cursor).copied();
+    st.results =
+        crate::export::find_shapes(app, &st.find, st.kind, st.match_case, st.whole_word);
+    if st.results.is_empty() {
+        return;
+    }
+    let at = was.and_then(|b| st.results.iter().position(|h| *h == b));
+    st.cursor = match at {
+        Some(i) => (i + 1) % st.results.len(),
+        None => 0,
+    };
+    let id = st.results[st.cursor];
+    app.select(vec![id]);
 }
 
 fn find_replace(app: &mut App, ui: &mut Ui) {
@@ -810,17 +835,26 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
     }
     ui.horizontal(|ui| {
         ui.label(tr("dialog.find"));
-        find_field(ui, &mut st.find, "find_replace_find", true).rich_tip(crate::ui::tips::pair(
+        let (resp, enter) = find_field(ui, &mut st.find, "find_replace_find", true);
+        resp.rich_tip(crate::ui::tips::pair(
             "docker.find_field",
             "docker.find_field_desc",
         ));
+        // Enter in the Find field is Find Next, with the keyboard left
+        // in the field for the next word.
+        if enter {
+            find_next_now(app, &mut st);
+            ui.memory_mut(|m| m.request_focus(ui.make_persistent_id("find_replace_find")));
+        }
     });
     if st.kind == 0 {
         ui.horizontal(|ui| {
             ui.label(tr("dialog.replace_with"));
-            find_field(ui, &mut st.replace, "find_replace_replace", false).rich_tip(
-                crate::ui::tips::pair("docker.replace_field", "docker.replace_field_desc"),
-            );
+            let (resp, _) = find_field(ui, &mut st.replace, "find_replace_replace", false);
+            resp.rich_tip(crate::ui::tips::pair(
+                "docker.replace_field",
+                "docker.replace_field_desc",
+            ));
         });
         ui.checkbox(&mut st.match_case, tr("dialog.match_case"))
             .rich_tip(crate::ui::tips::pair(
@@ -842,13 +876,7 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
             ))
             .clicked()
         {
-            st.results =
-                crate::export::find_shapes(app, &st.find, st.kind, st.match_case, st.whole_word);
-            if !st.results.is_empty() {
-                st.cursor = (st.cursor + 1) % st.results.len();
-                let id = st.results[st.cursor];
-                app.select(vec![id]);
-            }
+            find_next_now(app, &mut st);
         }
         if ui
             .button(tr("dialog.find_all"))
@@ -860,6 +888,8 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
         {
             st.results =
                 crate::export::find_shapes(app, &st.find, st.kind, st.match_case, st.whole_word);
+            // The next Find Next starts at the first of them.
+            st.cursor = st.results.len();
             app.select(st.results.clone());
         }
         if st.kind == 0 {
@@ -4865,5 +4895,159 @@ mod find_field_tests {
         for (key, _) in FIND_CODES {
             assert_ne!(tr(key), key, "{key} is in the language files");
         }
+    }
+}
+
+#[cfg(test)]
+mod find_text_panel_tests {
+    use super::*;
+    use tracedraw_core::{geometry::Rect, TextSpan};
+
+    /// An artistic text as the Find panel tests keep making one.
+    fn art(spans: Vec<TextSpan>) -> ShapeKind {
+        ShapeKind::Text {
+            spans,
+            origin: tracedraw_core::Point::new(10.0, 10.0),
+            frame: None,
+            align: tracedraw_core::TextAlign::Left,
+            para: Default::default(),
+            on_path: None,
+        }
+    }
+
+    fn run(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| find_replace(app, ui));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    Some((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn click_at(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
+        run(ctx, app, vec![egui::Event::PointerMoved(at)]);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(ctx, app, vec![button(true)]);
+        run(ctx, app, vec![button(false)]);
+        for _ in 0..5 {
+            run(ctx, app, Vec::new());
+        }
+    }
+
+    fn click_label(ctx: &egui::Context, app: &mut App, texts: &[(String, egui::Rect)], key: &str) {
+        let what = tr(key);
+        let at = texts
+            .iter()
+            .find(|(t, _)| *t == what)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("{what} is on the panel"));
+        click_at(ctx, app, at);
+    }
+
+    /// Three letters typed one after another land in the Find field, and
+    /// Enter runs the search: the text inside a clip frame is found with
+    /// the three-letter needle, and the keyboard stays in the field.
+    #[test]
+    fn three_letters_typed_then_enter_find_text_in_a_clip_frame() {
+        crate::i18n::set_language("en");
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let inner = app
+            .new_shape(art(vec![TextSpan::new("hello clip", "Arial", 12.0)]))
+            .expect("text");
+        let frame = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.place_inside(vec![inner], frame);
+        app.find_state.kind = 0;
+        app.find_state.find = "h".into();
+        let texts = run(&ctx, &mut app, Vec::new());
+        let at = texts
+            .iter()
+            .find(|(t, _)| t == "h")
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("the Find field: {texts:?}"));
+        click_at(&ctx, &mut app, at);
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the Find field has the keyboard"
+        );
+        run(&ctx, &mut app, vec![key(egui::Key::End, egui::Modifiers::NONE)]);
+        // Two more letters, one at a time: three in the field altogether.
+        for c in ["e", "l"] {
+            run(&ctx, &mut app, vec![egui::Event::Text(c.into())]);
+        }
+        assert_eq!(app.find_state.find, "hel", "three letters typed in");
+        // Enter is Find Next: the clip frame holding the text is selected.
+        run(&ctx, &mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert_eq!(app.selection, vec![frame], "the clip frame was found");
+        // One more frame: the keyboard is back in the field.
+        run(&ctx, &mut app, Vec::new());
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the Find field keeps the keyboard"
+        );
+    }
+
+    /// Find Next shows the first result first, then the next, wrapping
+    /// round; it did not skip the first one.
+    #[test]
+    fn find_next_shows_the_first_result_first() {
+        crate::i18n::set_language("en");
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let a = app
+            .new_shape(art(vec![TextSpan::new("hello one", "Arial", 12.0)]))
+            .expect("a");
+        let b = app
+            .new_shape(art(vec![TextSpan::new("hello two", "Arial", 12.0)]))
+            .expect("b");
+        app.find_state.find = "hello".into();
+        app.find_state.kind = 0;
+        let texts = run(&ctx, &mut app, Vec::new());
+        click_label(&ctx, &mut app, &texts, "dialog.find_next");
+        assert_eq!(app.selection, vec![a], "the first result first");
+        let texts = run(&ctx, &mut app, Vec::new());
+        click_label(&ctx, &mut app, &texts, "dialog.find_next");
+        assert_eq!(app.selection, vec![b], "then the next one");
+        let texts = run(&ctx, &mut app, Vec::new());
+        click_label(&ctx, &mut app, &texts, "dialog.find_next");
+        assert_eq!(app.selection, vec![a], "wraps round to the first");
     }
 }

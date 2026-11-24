@@ -3259,36 +3259,35 @@ pub(crate) fn find_matches(
     found
 }
 
-/// Find text objects containing `needle` (kind 0) or objects whose kind or
-/// name matches it (kind 1).
-pub fn find_shapes(
-    app: &App,
-    needle: &str,
+/// What a Find walks the drawing with: the needle, Text or Objects, and
+/// how letters match.
+struct FindQuery<'a> {
+    needle: &'a str,
     kind: usize,
-    match_case: bool,
-    whole_word: bool,
-) -> Vec<ShapeId> {
-    let Ok(page) = app.doc().page(app.page) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    fn walk(
-        s: &tracedraw_core::Shape,
-        needle: &str,
-        kind: usize,
-        mc: bool,
-        ww: bool,
-        out: &mut Vec<ShapeId>,
-    ) {
-        let hit = match (kind, &s.kind) {
+    mc: bool,
+    ww: bool,
+    symbols: &'a [tracedraw_core::Symbol],
+}
+
+impl FindQuery<'_> {
+    fn walk(&self, s: &tracedraw_core::Shape, seen: &mut [bool], out: &mut Vec<ShapeId>) {
+        let hit = match (self.kind, &s.kind) {
             (0, ShapeKind::Text { spans, .. }) => {
                 let t: String = spans.iter().map(|x| x.text.as_str()).collect();
-                matches_text(&t, needle, mc, ww)
+                matches_text(&t, self.needle, self.mc, self.ww)
             }
+            // A table's cells hold text of their own: each cell is
+            // searched as one text, the table is found when one of them
+            // has the needle.
+            (0, ShapeKind::Table(t)) => t.cells.iter().any(|c| {
+                let cell: String = c.text.iter().map(|x| x.text.as_str()).collect();
+                matches_text(&cell, self.needle, self.mc, self.ww)
+            }),
             (1, k) => {
                 let name = s.name.clone().unwrap_or_default();
                 let kind_name = crate::ui::dockers::kind_name(k);
-                matches_text(&name, needle, mc, ww) || matches_text(&kind_name, needle, mc, false)
+                matches_text(&name, self.needle, self.mc, self.ww)
+                    || matches_text(&kind_name, self.needle, self.mc, false)
             }
             _ => false,
         };
@@ -3298,22 +3297,59 @@ pub fn find_shapes(
         match &s.kind {
             ShapeKind::Group { children } => children
                 .iter()
-                .for_each(|c| walk(c, needle, kind, mc, ww, out)),
+                .for_each(|c| self.walk(c, seen, out)),
             ShapeKind::ClipFrame { frame, contents } => {
-                walk(frame, needle, kind, mc, ww, out);
-                contents
-                    .iter()
-                    .for_each(|c| walk(c, needle, kind, mc, ww, out));
+                self.walk(frame, seen, out);
+                contents.iter().for_each(|c| self.walk(c, seen, out));
+            }
+            // The text of a symbol definition is what its instances draw:
+            // an instance is found when the definition holds the needle.
+            // A symbol already being walked is not walked again, so a
+            // cycle in the definitions ends.
+            ShapeKind::SymbolInstance { index } => {
+                if let Some(sym) = self.symbols.get(*index) {
+                    if !seen[*index] {
+                        seen[*index] = true;
+                        self.walk(&sym.shape, seen, out);
+                        seen[*index] = false;
+                    }
+                }
             }
             _ => {}
         }
     }
+}
+
+/// Find text objects containing `needle` (kind 0) or objects whose kind or
+/// name matches it (kind 1).
+pub fn find_shapes(
+    app: &App,
+    needle: &str,
+    kind: usize,
+    match_case: bool,
+    whole_word: bool,
+) -> Vec<ShapeId> {
+    let doc = app.doc();
+    let Ok(page) = doc.page(app.page) else {
+        return Vec::new();
+    };
+    let q = FindQuery {
+        needle,
+        kind,
+        mc: match_case,
+        ww: whole_word,
+        symbols: &doc.symbols,
+    };
+    let mut out = Vec::new();
     // Only top-level objects are selectable: a text found inside a group
     // or a frame selects the object it is in (it was left out, so Find
-    // found no grouped text).
+    // found no grouped text). `seen` comes out of every walk all false
+    // again, so one of it serves the whole page.
+    let mut seen = vec![false; q.symbols.len()];
+    let mut hits = Vec::new();
     for s in page.layers.iter().flat_map(|l| &l.shapes) {
-        let mut hits = Vec::new();
-        walk(s, needle, kind, match_case, whole_word, &mut hits);
+        hits.clear();
+        q.walk(s, &mut seen, &mut hits);
         if !hits.is_empty() {
             out.push(s.id);
         }
@@ -3368,6 +3404,19 @@ pub fn replace_text(
             ShapeKind::ClipFrame { frame, contents } => {
                 walk(frame, find, out);
                 contents.iter().for_each(|c| walk(c, find, out));
+            }
+            ShapeKind::Table(t) => {
+                let mut table = t.clone();
+                let mut any = false;
+                for cell in &mut table.cells {
+                    if let Some(spans) = find(&cell.text) {
+                        cell.text = spans;
+                        any = true;
+                    }
+                }
+                if any {
+                    out.push((s.id, ShapeKind::Table(table)));
+                }
             }
             _ => {}
         }
@@ -5853,6 +5902,104 @@ mod tests {
             replace_in("cat concat", "cat", "dog", false, true),
             "dog concat"
         );
+    }
+
+    /// An artistic text as the Find tests keep making one.
+    fn art_text(spans: Vec<TextSpan>) -> ShapeKind {
+        ShapeKind::Text {
+            spans,
+            origin: tracedraw_core::Point::new(10.0, 10.0),
+            frame: None,
+            align: tracedraw_core::TextAlign::Left,
+            para: Default::default(),
+            on_path: None,
+        }
+    }
+
+    /// Find reads the text inside a clip frame (a PowerClip), also a
+    /// three-letter needle typed in, and Replace changes that text. The
+    /// top-level frame is what is selected, not the text inside it.
+    #[test]
+    fn find_reads_text_inside_a_clip_frame_and_a_three_letter_needle() {
+        let mut app = App::headless();
+        let inner = app
+            .new_shape(art_text(vec![TextSpan::new("hello clip", "Arial", 12.0)]))
+            .expect("text");
+        let frame = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.place_inside(vec![inner], frame);
+        // The whole word, and the first three letters as typed in.
+        assert_eq!(find_shapes(&app, "hello", 0, false, false), vec![frame]);
+        assert_eq!(find_shapes(&app, "hel", 0, false, false), vec![frame]);
+        assert_eq!(find_shapes(&app, "lip", 0, false, false), vec![frame]);
+        assert!(find_shapes(&app, "zzz", 0, false, false).is_empty());
+        // Whole words only: "hel" is not a word of "hello".
+        assert!(find_shapes(&app, "hel", 0, false, true).is_empty());
+        assert_eq!(find_shapes(&app, "hello", 0, false, true), vec![frame]);
+        replace_text(&mut app, "clip", "frame", false, false, true);
+        let spans = match &app.doc().find_shape(inner).expect("text").kind {
+            ShapeKind::Text { spans, .. } => spans.clone(),
+            other => panic!("the text inside is still a text, got {other:?}"),
+        };
+        assert_eq!(tracedraw_core::spans_text(&spans), "hello frame");
+    }
+
+    /// Find reads the text of a table's cells, and Replace changes it.
+    #[test]
+    fn find_reads_the_text_of_table_cells() {
+        let mut app = App::headless();
+        let mut table = tracedraw_core::Table::new(Rect::new(0.0, 0.0, 40.0, 20.0), 1, 2, None);
+        table.cells[0].text = vec![TextSpan::new("one two", "Arial", 12.0)];
+        table.cells[1].text = vec![TextSpan::new("three", "Arial", 12.0)];
+        let id = app.new_shape(ShapeKind::Table(table)).expect("table");
+        assert_eq!(find_shapes(&app, "three", 0, false, false), vec![id]);
+        // Three letters, across the first cell's two words.
+        assert_eq!(find_shapes(&app, "two", 0, false, false), vec![id]);
+        assert!(find_shapes(&app, "four", 0, false, false).is_empty());
+        replace_text(&mut app, "two", "2", false, false, true);
+        let ShapeKind::Table(t) = &app.doc().find_shape(id).expect("table").kind else {
+            panic!("still a table")
+        };
+        assert_eq!(tracedraw_core::spans_text(&t.cells[0].text), "one 2");
+        assert_eq!(tracedraw_core::spans_text(&t.cells[1].text), "three");
+    }
+
+    /// Find reads the text a symbol instance draws (the definition is
+    /// searched), and a symbol that draws itself ends.
+    #[test]
+    fn find_reads_the_text_a_symbol_instance_draws() {
+        let mut app = App::headless();
+        let inner = app
+            .new_shape(art_text(vec![TextSpan::new("sym hello", "Arial", 12.0)]))
+            .expect("text");
+        app.select(vec![inner]);
+        app.create_symbol_from_selection();
+        let inst = app.selection[0];
+        assert!(matches!(
+            app.doc().find_shape(inst).expect("instance").kind,
+            ShapeKind::SymbolInstance { .. }
+        ));
+        assert_eq!(find_shapes(&app, "hello", 0, false, false), vec![inst]);
+        assert_eq!(find_shapes(&app, "sym", 0, false, false), vec![inst]);
+        assert!(find_shapes(&app, "qqq", 0, false, false).is_empty());
+    }
+
+    /// A needle of three letters, and one of three Cyrillic letters,
+    /// matches; an empty needle matches nothing.
+    #[test]
+    fn a_needle_of_three_letters_matches() {
+        assert!(matches_text("hello", "llo", false, false));
+        assert!(!matches_text("hello", "ell", false, true), "not a whole word");
+        assert!(matches_text("ell", "ell", false, true));
+        assert!(matches_text("кот кота", "кот", false, true), "two words");
+        assert!(!matches_text("кот", "КОТ", true, false), "case");
+        assert!(matches_text("КОТ", "кот", false, false));
+        assert!(!matches_text("anything", "", false, false));
     }
 
     /// The special characters of Find and Replace (#3679): ^p paragraph

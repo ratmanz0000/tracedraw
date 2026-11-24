@@ -763,18 +763,19 @@ fn symbol_id(seed: u64, index: usize) -> [u8; 16] {
 
 /// The tiny 24-bit device-independent bitmap of a symbol's preview for
 /// its `symi` record. A symbol drawn from scratch has no rendered
-/// thumbnail here; a valid one-pixel picture keeps the catalog readable.
+/// thumbnail here; a valid one-pixel picture (with the leading u32 8
+/// prefix seen in `symi` and `DISP`) keeps the catalog readable.
 fn symbol_thumbnail() -> Vec<u8> {
-    let mut b = Vec::with_capacity(44);
-    for word in [40u32, 1, 1] {
+    let mut b = Vec::with_capacity(48);
+    for word in [8u32, 40u32, 1, 1] {
         b.extend_from_slice(&word.to_le_bytes());
     }
     b.extend_from_slice(&1u16.to_le_bytes());
     b.extend_from_slice(&24u16.to_le_bytes());
-    for word in [0u32, 4, 0, 0, 0, 0] {
+    for word in [0u32, 4, 4000, 4000, 0, 0] {
         b.extend_from_slice(&word.to_le_bytes());
     }
-    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(&[255, 255, 255, 0]);
     b
 }
 
@@ -947,10 +948,13 @@ fn build_number() -> u32 {
 }
 
 /// RIFF streams before version 16 keep their contents in two compressed
-/// lists after the picture and info: the first with the bitmaps (or
-/// nothing), the second with the document tables and the pages.
+/// lists after the picture, info and symbol catalog: the first with
+/// the bitmaps (or nothing), the second with the document tables and
+/// the pages. `LIST syst` stays at the top level (each `syse` inside
+/// it already has its own `cmpr`, as the version 15 file holds it).
 fn compress_riff(tree: Vec<Node>) -> Vec<Node> {
     const INFO: [u8; 4] = *b"INFO";
+    const SYST: [u8; 4] = *b"syst";
     const BMPT: [u8; 4] = *b"bmpt";
     let mut head = Vec::new();
     let mut bitmaps = Vec::new();
@@ -958,7 +962,7 @@ fn compress_riff(tree: Vec<Node>) -> Vec<Node> {
     for n in tree {
         match &n {
             Node::Chunk(id, _) if [b"vrsn", b"DISP"].contains(&id) => head.push(n),
-            Node::List(INFO, _) => head.push(n),
+            Node::List(INFO, _) | Node::List(SYST, _) => head.push(n),
             Node::List(BMPT, _) => bitmaps.push(n),
             _ => body.push(n),
         }
@@ -1009,7 +1013,7 @@ fn pack_redirected(v: Ver, tree: &[Node]) -> (Vec<u8>, DataFiles) {
         let file = match node {
             Node::List(kind, _) => match kind {
                 b"bmpt" => Some("Bitmaps.dat".to_string()),
-                b"doc " => Some("data1.dat".to_string()),
+                b"syst" | b"doc " => Some("data1.dat".to_string()),
                 b"page" => {
                     page += 1;
                     Some(if page == 1 {
@@ -4158,6 +4162,7 @@ struct Writer<'a> {
     /// itself goes out drawn).
     symbol_groups: Vec<Node>,
     symbol_numbers: HashMap<usize, (u32, Rect)>,
+    symbol_order: Vec<usize>,
     symbols_writing: Vec<usize>,
     /// The `sblk` rows of the instances written: (instance `spnd`, the
     /// `spnd` of its definition). A real file has one row per instance,
@@ -4306,6 +4311,7 @@ impl<'a> Writer<'a> {
             clip_depth: 0,
             symbol_groups: Vec::new(),
             symbol_numbers: HashMap::new(),
+            symbol_order: Vec::new(),
             symbols_writing: Vec::new(),
             symbol_links: Vec::new(),
             next_object: 1,
@@ -5480,16 +5486,17 @@ impl<'a> Writer<'a> {
 
     /// The document's `LIST syst` catalog: one `syse` per definition,
     /// with its `syms` name and identifier and a small `symi` preview.
-    /// The version 15 file the layout comes from has the catalog before
-    /// the document's tables; without it the other program has no symbol
-    /// to attach the `symb` records to (#4036).
+    /// Before version 16 each `syse` sits inside its own `LIST cmpr`
+    /// (at the top level of the RIFF stream, outside `cmpr(&body)`), as
+    /// the version 15 file holds them; from version 16 the entries sit
+    /// directly in `LIST syst` so their payloads redirect into `data1.dat`
+    /// without mixing `cmpr` into the redirected root stream (#4036).
     fn symbol_catalog(&self) -> Node {
         let entries: Vec<Node> = self
-            .symbols
+            .symbol_order
             .iter()
-            .enumerate()
-            .filter(|(i, _)| self.symbol_numbers.contains_key(i))
-            .map(|(_, s)| {
+            .filter_map(|&i| self.symbols.get(i))
+            .map(|s| {
                 let mut syms = vec![0u8; 8];
                 syms[..4].copy_from_slice(&1u32.to_le_bytes());
                 for u in s.name.encode_utf16().take(255).chain([0]) {
@@ -5498,13 +5505,18 @@ impl<'a> Writer<'a> {
                 syms.resize(1560, 0);
                 syms.extend_from_slice(&SYMBOL_MARKER.to_le_bytes());
                 syms.resize(1580, 0);
-                list(
+                let syse = list(
                     b"syse",
                     vec![chunk(b"syms", syms), chunk(b"symi", symbol_thumbnail())],
-                )
+                );
+                if self.v.redirects() {
+                    syse
+                } else {
+                    cmpr(&[syse])
+                }
             })
             .collect();
-        list(b"syst", vec![cmpr(&entries)])
+        list(b"syst", entries)
     }
 
     /// The number of symbol `index` (#3250), its definition written
@@ -5572,8 +5584,8 @@ impl<'a> Writer<'a> {
         for u in name.encode_utf16().take(255).chain([0]) {
             record.extend_from_slice(&u.to_le_bytes());
         }
-        // 1580 bytes, as the definitions of the version 15 file seen.
-        record.resize(record.len().max(1580), 0);
+        // 1584 bytes, as the definitions of the version 15 file seen.
+        record.resize(record.len().max(1584), 0);
         let mut body = vec![chunk(b"spnd", number.to_le_bytes().to_vec())];
         body.extend(self.head([0, 0, 0, 0x10], b, 0.0, centre));
         body.push(list(
@@ -5586,6 +5598,7 @@ impl<'a> Writer<'a> {
         body.extend(inner.nodes);
         self.clip_depth = saved_clip;
         self.symbol_groups.push(list(b"grp ", body));
+        self.symbol_order.push(index);
         self.symbol_numbers.insert(index, (number, b));
         Some((number, b))
     }
@@ -5614,6 +5627,12 @@ impl<'a> Writer<'a> {
         let id = self.next_object;
         self.next_object += 1;
         let mut args = vec![(ARG_ID, id.to_le_bytes().to_vec()), (ARG_PROPS, vec![0; 4])];
+        if self.v.draw_flags() {
+            args.push((
+                ARG_DRAW_FLAGS,
+                [1u32, 1, 0].iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ));
+        }
         if let Some(n) = s.name.as_deref().filter(|n| !n.is_empty()) {
             args.push((ARG_NAME, name_bytes(self.v, n)));
         }

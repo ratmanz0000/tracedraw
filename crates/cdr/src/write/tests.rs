@@ -10384,6 +10384,36 @@ fn symbols_are_saved_as_symbols_and_their_instances() {
         assert!(has_live_symbol_chunks(&bytes), "version {v}");
         let (catalog, rows) = symbol_tables(&bytes);
         assert!(catalog, "version {v}: the syst catalog is written");
+        let (_, tree, main) = chunk_ids(&bytes);
+        let top_syst = tree.root.children.iter().find(|c| c.is(b"syst"));
+        let syst = top_syst.expect("version {v}: syst is a top-level list");
+        if v < 16 {
+            assert!(
+                !syst.children.is_empty() && syst.children.iter().all(|c| c.is(b"cmpr")),
+                "version {v}: each syse inside syst sits in its own cmpr"
+            );
+        } else {
+            assert!(
+                !syst.children.is_empty() && syst.children.iter().all(|c| c.is(b"syse")),
+                "version {v}: v16+ syst holds syse directly without cmpr"
+            );
+            let mut has_cmpr = false;
+            tree.root.walk(&mut |c, _| {
+                if c.is(b"cmpr") {
+                    has_cmpr = true;
+                }
+            });
+            assert!(!has_cmpr, "version {v}: no cmpr list in v16+ root stream");
+        }
+        let mut symi_ok = false;
+        syst.walk(&mut |c, _| {
+            if c.is(b"symi") {
+                let d = tree.data(&main, c);
+                assert!(d.len() >= 48 && &d[0..8] == &[8, 0, 0, 0, 40, 0, 0, 0], "version {v}: symi header");
+                symi_ok = true;
+            }
+        });
+        assert!(symi_ok, "version {v}: symi present");
         assert_eq!(rows.len(), 3, "version {v}: one sblk row per instance");
         assert!(rows.iter().all(|r| r[0] == 0), "version {v}: {rows:?}");
         let instances = symbol_spnds(&bytes, b"symb");

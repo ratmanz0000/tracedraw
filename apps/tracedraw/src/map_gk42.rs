@@ -632,10 +632,10 @@ fn plate(painter: &Painter, anchor: Pos2, lines: &[String]) {
 }
 
 /// Lines shown in the floating readout next to the cursor: the real
-/// ruler coordinates first, then GK-42 (`XX XX X...` without commas)
-/// whenever a live or applied calibration resolves. The two pairs are
-/// written Y then X, as geography reads them; the values keep their own
-/// axis and the maths is untouched.
+/// ruler coordinates first (X then Y, matching the status bar and the
+/// page axes), then GK-42 (`XX XX X...` without commas, Y easting then
+/// X northing, so both lines put the horizontal coordinate first and
+/// the vertical one second).
 pub fn cursor_lines(app: &App) -> Option<Vec<String>> {
     let active_t = preview_transform(app).map(|(t, _)| t);
     if !app.map_gk42.on && active_t.is_none() {
@@ -645,9 +645,9 @@ pub fn cursor_lines(app: &App) -> Option<Vec<String>> {
     let r = app.to_ruler(p);
     let u = app.units;
     let mut lines = vec![format!(
-        "Y: {}  X: {} {}",
-        fmt_mm(u.world_from_mm(r.y)),
+        "X: {}  Y: {} {}",
         fmt_mm(u.world_from_mm(r.x)),
+        fmt_mm(u.world_from_mm(r.y)),
         u.label()
     )];
     if let Some(t) = active_t {
@@ -1401,9 +1401,10 @@ mod tests {
     }
 
     /// The floating window next to the cursor carries both the real
-    /// coordinates and the GK-42 coordinates ("XX XX X..." without
-    /// commas) as soon as the two markers have GK-42 values, before and
-    /// after Apply, and even when the pick mode is switched off.
+    /// coordinates (X horizontal, Y vertical) and the GK-42 coordinates
+    /// ("XX XX X..." without commas, Y easting then X northing) as soon
+    /// as the markers have GK-42 values, before and after Apply, and
+    /// even when the pick mode is switched off.
     #[test]
     fn cursor_plate_shows_both_real_and_gk42_in_two_two_rest_format() {
         let mut app = App::headless();
@@ -1414,13 +1415,13 @@ mod tests {
         app.map_gk42.gk1 = ("5416000".into(), "7490000".into());
         app.map_gk42.gk2 = ("5416748.56".into(), "7492139.86".into());
         app.map_gk42.gk3 = ("5416748.56".into(), "7490000".into());
-        app.pointer_page = Some(Point::new(100.0, 100.0));
+        app.pointer_page = Some(Point::new(120.0, 80.0));
 
         // Before Apply: draft GK-42 coordinates already resolve on the cursor plate.
         let before = cursor_lines(&app).expect("cursor lines");
         assert_eq!(before.len(), 2, "{before:?}");
-        assert_eq!(before[0], "Y: 100.00  X: 100.00 mm");
-        assert_eq!(before[1], "GK-42: Y 74 91 070  X 54 16 374");
+        assert_eq!(before[0], "X: 120.00  Y: 80.00 mm");
+        assert_eq!(before[1], "GK-42: Y 74 91 498  X 54 16 225");
         assert!(!before[1].contains(','));
 
         // After Apply with pick mode turned off: the cursor plate still shows both.

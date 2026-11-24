@@ -308,7 +308,7 @@ fn cursor_coordinates(app: &App) -> String {
             if let Some((t, _)) = crate::map_gk42::preview_transform(app) {
                 let g = t.to_gk(raw_p);
                 s.push_str(&format!(
-                    "  GK-42: Y {} X {}",
+                    "  GK-42: Y {}  X {}",
                     crate::map_gk42::fmt_gk_cursor(g.y),
                     crate::map_gk42::fmt_gk_cursor(g.x)
                 ));
@@ -1245,11 +1245,15 @@ mod tests {
         crate::map_gk42::set_mode(&mut app, true);
         crate::map_gk42::click(&mut app, tracedraw_core::geometry::Point::new(50.0, 50.0));
         crate::map_gk42::click(&mut app, tracedraw_core::geometry::Point::new(150.0, 150.0));
+        crate::map_gk42::click(&mut app, tracedraw_core::geometry::Point::new(50.0, 150.0));
         app.map_gk42.gk1 = ("6519000".into(), "42531000".into());
         app.map_gk42.gk2 = ("6523200".into(), "42536000".into());
+        app.map_gk42.gk3 = ("6523200".into(), "42531000".into());
         assert!(crate::map_gk42::apply(&mut app));
-        app.pointer_page = Some(tracedraw_core::geometry::Point::new(100.0, 100.0));
+        app.pointer_page = Some(tracedraw_core::geometry::Point::new(120.0, 80.0));
         let text = cursor_coordinates(&app);
-        assert!(text.contains("GK-42: Y 42 53 3500  X 65 21 100"), "{text}");
+        assert!(text.starts_with("(120."), "{text}");
+        assert!(text.contains("80."), "{text}");
+        assert!(text.contains("GK-42: Y 42 53 4500  X 65 20 260"), "{text}");
     }
 }

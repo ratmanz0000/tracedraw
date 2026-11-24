@@ -8,7 +8,8 @@
 //! with a thumbnail (the object itself drawn small, see
 //! `object_thumbs.rs`) and its name (or what it is when it has no name).
 //! The thumbnail size is set by the control in the bottom bar, the wheel
-//! over it, or Ctrl+wheel over the list. Groups open to show their objects. Clicking an object
+//! over it, or Ctrl+wheel over the list. Groups open to show their objects;
+//! symbol instances show a read-only tree of their definition. Clicking an object
 //! selects it (Shift adds it) and makes its layer active; double-clicking
 //! a name renames the layer or object; a layer's context menu moves,
 //! renames, moves, shows, locks, empties into the master page or deletes
@@ -24,7 +25,7 @@ use crate::theme::Tokens;
 use crate::ui::dockers::kind_name;
 use crate::ui::tips::RichTip;
 use egui::{Color32, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2};
-use tracedraw_core::document::GuideLine;
+use tracedraw_core::document::{GuideLine, Symbol};
 use tracedraw_core::{Command, Layer, LayerId, MasterScope, PageId, Shape, ShapeId, ShapeKind};
 
 /// Height of a row.
@@ -579,6 +580,7 @@ pub(crate) fn layer_search(ui: &mut Ui) {
         let width = (ui.available_width() - 24.0).max(40.0);
         ui.add(
             egui::TextEdit::singleline(&mut text)
+                .id(id.with("edit"))
                 .hint_text(tr("docker.search_layers"))
                 .desired_width(width),
         )
@@ -610,13 +612,14 @@ fn layer_hit(layer: &Layer, needle: &str) -> bool {
 /// The docker: the tree above the bar with its buttons.
 pub fn objects_docker(app: &mut App, ui: &mut Ui) {
     let content_h = (ui.available_height() - BAR_H - 4.0).max(40.0);
-    let out = egui::ScrollArea::vertical()
+    let mut out = egui::ScrollArea::vertical()
         .max_height(content_h)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             objects(app, ui);
         });
+    scroll_dragged_row(ui, &mut out);
     // Ctrl+wheel over the list makes the thumbnails larger or smaller, a
     // step a notch on the desktop and in the browser alike (#1406).
     if let Some(steps) =
@@ -625,6 +628,54 @@ pub fn objects_docker(app: &mut App, ui: &mut Ui) {
         zoom_thumbs(app, steps);
     }
     bottom_bar(app, ui);
+}
+
+/// Advance the list for the next frame, after hit testing the rows at
+/// their actual positions this frame. The pointer can pass the top or
+/// bottom of the list, but must stay within its horizontal span.
+fn scroll_dragged_row(ui: &Ui, out: &mut egui::scroll_area::ScrollAreaOutput<()>) {
+    let Some((pos, dt)) = ui.input(|i| {
+        i.pointer
+            .latest_pos()
+            .filter(|_| i.pointer.primary_down())
+            .map(|p| (p, i.stable_dt))
+    }) else {
+        return;
+    };
+    let viewport = out.inner_rect.intersect(ui.clip_rect());
+    if !viewport.x_range().contains(pos.x) || viewport.height() <= 0.0 {
+        return;
+    }
+    let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
+    if max_offset == 0.0 {
+        return;
+    }
+    let edge = 32.0_f32.min(viewport.height() / 2.0);
+    let velocity = if pos.y < viewport.top() + edge {
+        -((viewport.top() + edge - pos.y) / edge).min(1.0)
+    } else if pos.y > viewport.bottom() - edge {
+        ((pos.y - viewport.bottom() + edge) / edge).min(1.0)
+    } else {
+        return;
+    };
+    let offset =
+        (out.state.offset.y + velocity * 720.0 * dt.clamp(0.0, 0.05)).clamp(0.0, max_offset);
+    if offset == out.state.offset.y {
+        return;
+    }
+    let dragging = ui.data(|d| {
+        let object = d.get_temp::<ShapeId>(egui::Id::new(ROW_DRAG)).is_some()
+            && d.get_temp::<(ShapeId, Pos2, Option<PageId>)>(egui::Id::new(ROW_HOLD))
+                .is_none_or(|(_, at, _)| pos.distance(at) > HOLD_SLOP);
+        object
+            || d.get_temp::<(Option<PageId>, usize)>(egui::Id::new(GUIDE_DRAG))
+                .is_some()
+    });
+    if dragging {
+        out.state.offset.y = offset;
+        out.state.store(ui.ctx(), out.id);
+        ui.ctx().request_repaint();
+    }
 }
 
 /// The thumbnails `steps` steps larger (smaller when negative).
@@ -652,7 +703,10 @@ fn scroll_target(app: &App, ui: &Ui) -> Option<ShapeId> {
         d.insert_temp(seen, app.selection.clone());
         last.as_ref() != Some(&app.selection)
     });
-    changed.then(|| app.selection.first().copied()).flatten()
+    if !changed || ui.data(|d| d.get_temp::<ShapeId>(egui::Id::new(ROW_DRAG)).is_some()) {
+        return None;
+    }
+    app.selection.first().copied()
 }
 
 /// The tree: the pages and their layers (all of them, or the current
@@ -1447,7 +1501,9 @@ fn guides_row(
     {
         let (over, released) = ui.input(|i| {
             (
-                i.pointer.interact_pos().is_some_and(|p| rect.contains(p)),
+                i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| rect.contains(p) && ui.clip_rect().contains(p)),
                 i.pointer.any_released(),
             )
         });
@@ -1840,8 +1896,7 @@ fn grid_row(app: &App, ui: &mut Ui, act: &mut Actions) {
     );
 }
 
-/// The row of `s` at nesting `depth`, then its children when it is an
-/// open group.
+/// The row of `s` at nesting `depth`, then its children when it is open.
 fn object_rows(app: &App, ui: &mut Ui, s: &Shape, depth: usize, act: &mut Actions) {
     let selected = act.selected.contains(&s.id);
     act.row_order.push(s.id);
@@ -1857,27 +1912,123 @@ fn object_rows(app: &App, ui: &mut Ui, s: &Shape, depth: usize, act: &mut Action
     let visible = ui.is_rect_visible(rect);
     let resp = (visible || ui.ctx().is_being_dragged(id))
         .then(|| ui.interact(rect, id, Sense::click_and_drag()));
-    let children: Option<&Vec<Shape>> = match &s.kind {
-        ShapeKind::Group { children } => Some(children),
-        // A PowerClip opens to its contents, front first (#3053).
-        ShapeKind::ClipFrame { contents, .. } if !contents.is_empty() => Some(contents),
-        _ => None,
-    };
+    let symbols = &app.doc().symbols;
+    let children = object_children(s, symbols, &[]);
     let expanded = app.objects_open_groups.contains(&s.id);
     // Rows scrolled out of sight are only laid out: nothing is drawn or
     // asked of them, so a long list costs little.
     if let (Some(resp), true) = (resp, visible) {
         paint_row(ui, Look::Object { selected }, rect, &resp);
-        object_row(app, ui, s, (rect, resp), depth, expanded, act);
+        object_row(
+            app,
+            ui,
+            s,
+            (rect, resp),
+            depth,
+            children.map(|_| expanded),
+            act,
+        );
     }
     if let (Some(children), true) = (children, expanded) {
-        for c in children.iter().rev() {
-            object_rows(app, ui, c, depth + 1, act);
+        if let ShapeKind::SymbolInstance { index } = s.kind {
+            let key = ui.make_persistent_id(("objects_symbol", act.drawing.0, s.id.raw(), index));
+            definition_rows(
+                ui,
+                children,
+                symbols,
+                &mut vec![index],
+                key,
+                depth + 1,
+                height,
+            );
+        } else {
+            for c in children.iter().rev() {
+                object_rows(app, ui, c, depth + 1, act);
+            }
         }
     }
 }
 
-/// The contents of the row of `s`: the group arrow, the thumbnail, the
+fn object_children<'a>(
+    s: &'a Shape,
+    symbols: &'a [Symbol],
+    ancestors: &[usize],
+) -> Option<&'a [Shape]> {
+    match &s.kind {
+        ShapeKind::Group { children } => Some(children),
+        // A PowerClip opens to its contents, front first (#3053).
+        ShapeKind::ClipFrame { contents, .. } if !contents.is_empty() => Some(contents),
+        ShapeKind::SymbolInstance { index } if !ancestors.contains(index) => {
+            match &symbols.get(*index)?.shape {
+                // The group at the root holds the symbol's objects.
+                Shape {
+                    kind: ShapeKind::Group { children },
+                    ..
+                } => (!children.is_empty()).then_some(children.as_slice()),
+                shape => Some(std::slice::from_ref(shape)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Definition rows never enter selection, rename or drop handling. Their
+/// disclosure state is keyed by each instance and child path, not by the
+/// definition's shape ids, which can be shared or absent in an imported file.
+fn definition_rows(
+    ui: &mut Ui,
+    shapes: &[Shape],
+    symbols: &[Symbol],
+    ancestors: &mut Vec<usize>,
+    parent: egui::Id,
+    depth: usize,
+    height: f32,
+) {
+    for (i, shape) in shapes.iter().enumerate().rev() {
+        let key = parent.with(i);
+        let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), height));
+        let children = object_children(shape, symbols, ancestors);
+        let open = children.is_some() && ui.data(|d| d.get_temp::<bool>(key).unwrap_or(false));
+        if ui.is_rect_visible(rect) {
+            let x = rect.left() + 3.0 + depth as f32 * INDENT;
+            if children.is_some() && object_disclosure(ui, rect, x, key, open) {
+                ui.data_mut(|d| d.insert_temp(key, !open));
+                ui.ctx().request_repaint();
+            }
+            let label = object_label(shape);
+            paint_object_name(ui, rect, x + 16.0, &label, Tokens::text_dim());
+        }
+        if let (Some(children), true) = (children, open) {
+            if let ShapeKind::SymbolInstance { index } = shape.kind {
+                ancestors.push(index);
+                definition_rows(ui, children, symbols, ancestors, key, depth + 1, height);
+                ancestors.pop();
+            } else {
+                definition_rows(ui, children, symbols, ancestors, key, depth + 1, height);
+            }
+        }
+    }
+}
+
+fn object_disclosure(ui: &mut Ui, rect: Rect, x: f32, id: egui::Id, open: bool) -> bool {
+    let (ar, a) = hot(ui, rect, x, 14.0, id);
+    let a = a.rich_tip_with(|| crate::ui::tips::keyed("docker.expand_row"));
+    paint_arrow(ui, ar, open);
+    a.clicked()
+}
+
+fn paint_object_name(ui: &Ui, rect: Rect, x: f32, label: &str, color: Color32) {
+    let name_room = Rect::from_min_max(rect.min, Pos2::new(rect.right() - 48.0, rect.max.y));
+    ui.painter().with_clip_rect(name_room).text(
+        Pos2::new(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        color,
+    );
+}
+
+/// The contents of the row of `s`: the disclosure arrow, the thumbnail, the
 /// name, the eye and the padlock.
 fn object_row(
     app: &App,
@@ -1885,28 +2036,20 @@ fn object_row(
     s: &Shape,
     (rect, resp): (Rect, egui::Response),
     depth: usize,
-    expanded: bool,
+    expanded: Option<bool>,
     act: &mut Actions,
 ) {
     let mut x = rect.left() + 3.0 + depth as f32 * INDENT;
-    let opens = match &s.kind {
-        ShapeKind::Group { .. } => true,
-        ShapeKind::ClipFrame { contents, .. } => !contents.is_empty(),
-        _ => false,
-    };
-    if opens {
-        let (ar, a) = hot(
+    if expanded.is_some_and(|open| {
+        object_disclosure(
             ui,
             rect,
             x,
-            14.0,
             egui::Id::new(("objects_group", s.id.raw())),
-        );
-        let a = a.rich_tip_with(|| crate::ui::tips::keyed("docker.expand_row"));
-        paint_arrow(ui, ar, expanded);
-        if a.clicked() {
-            act.expand_group = Some(s.id);
-        }
+            open,
+        )
+    }) {
+        act.expand_group = Some(s.id);
     }
     x += 16.0;
     let size = act.thumb_size;
@@ -1929,14 +2072,7 @@ fn object_row(
         Tokens::text_dim()
     };
     // The name stops short of the eye and padlock.
-    let name_room = Rect::from_min_max(rect.min, Pos2::new(rect.right() - 48.0, rect.max.y));
-    ui.painter().with_clip_rect(name_room).text(
-        Pos2::new(x, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        &label,
-        egui::FontId::proportional(13.0),
-        color,
-    );
+    paint_object_name(ui, rect, x, &label, color);
     // The field takes the name's place, not the eye and the padlock.
     let target = RenameTarget::Shape(s.id);
     let field = Rect::from_min_max(
@@ -3331,7 +3467,7 @@ fn drag_rows(
     let pos = latest.or_else(|| ui.ctx().data(|d| d.get_temp::<Pos2>(pos_id)));
     // Held and lifted where it was: the row's menu, not a drop.
     let hold_menu = held.filter(|(_, at, _)| pos.is_none_or(|p| p.distance(*at) <= HOLD_SLOP));
-    let target = pos.and_then(|p| {
+    let target = pos.filter(|p| ui.clip_rect().contains(*p)).and_then(|p| {
         if let Some((sid, r)) = rows.iter().find(|(_, r)| r.contains(p)) {
             if *sid == dragged {
                 return None;
@@ -5488,7 +5624,11 @@ mod drag_tests {
         }
     }
 
-    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+    fn draw_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -5497,8 +5637,11 @@ mod drag_tests {
             events,
             ..Default::default()
         };
-        let mut out = ctx.run_ui(input, |ui| objects_docker(app, ui));
-        out.textures_delta.clear();
+        ctx.run_ui(input, |ui| objects_docker(app, ui))
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        draw_frame(ctx, app, events);
     }
 
     fn object_row(ctx: &egui::Context, id: ShapeId) -> Rect {
@@ -5506,6 +5649,94 @@ mod drag_tests {
             .and_then(|rows| rows.into_iter().find(|(s, _)| *s == id))
             .map(|(_, r)| r)
             .expect("the object's row")
+    }
+
+    #[test]
+    fn a_symbol_disclosure_shows_a_read_only_definition_tree() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let mut leaf = Shape::new(ShapeId(0), rect_kind());
+        leaf.name = Some("Definition leaf".into());
+        app.run(Command::AddSymbol {
+            symbol: Symbol {
+                name: "Leaf".into(),
+                shape: leaf,
+            },
+        });
+        let mut nested = Shape::new(ShapeId(0), ShapeKind::SymbolInstance { index: 0 });
+        nested.name = Some("Definition child".into());
+        app.run(Command::AddSymbol {
+            symbol: Symbol {
+                name: "Parent".into(),
+                shape: Shape::new(
+                    ShapeId(0),
+                    ShapeKind::Group {
+                        children: vec![nested],
+                    },
+                ),
+            },
+        });
+        let id = app
+            .new_shape(ShapeKind::SymbolInstance { index: 1 })
+            .expect("instance");
+        app.select(Vec::new());
+        let has_label = |out: &egui::FullOutput, label: &str| {
+            out.shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == label))
+        };
+        let click = |app: &mut App, pos| {
+            frame(&ctx, app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &ctx,
+                    app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            draw_frame(&ctx, app, Vec::new())
+        };
+        let closed = draw_frame(&ctx, &mut app, Vec::new());
+        assert!(!has_label(&closed, "Definition child"));
+        let r = object_row(&ctx, id);
+        let root_arrow = Pos2::new(
+            r.left() + 10.0 + LAYER_OBJECT_DEPTH as f32 * INDENT,
+            r.center().y,
+        );
+        let open = click(&mut app, root_arrow);
+        assert!(has_label(&open, "Definition child"));
+        assert!(!has_label(&open, "Definition leaf"));
+        let child_arrow = root_arrow + Vec2::new(INDENT, r.height());
+        let nested = click(&mut app, child_arrow);
+        assert!(has_label(&nested, "Definition leaf"));
+        click(
+            &mut app,
+            Pos2::new(r.center().x, child_arrow.y + r.height()),
+        );
+        assert!(
+            app.selection.is_empty(),
+            "definition rows do not select objects"
+        );
+        let closed = click(&mut app, root_arrow);
+        assert!(!has_label(&closed, "Definition child"));
+        assert!(!has_label(&closed, "Definition leaf"));
+    }
+
+    #[test]
+    fn a_missing_or_cyclic_symbol_has_no_definition_children() {
+        let instance = Shape::new(ShapeId(0), ShapeKind::SymbolInstance { index: 0 });
+        let symbols = [Symbol {
+            name: "Self".into(),
+            shape: instance.clone(),
+        }];
+        assert!(object_children(&instance, &[], &[]).is_none());
+        let child = &object_children(&instance, &symbols, &[]).expect("definition")[0];
+        assert!(object_children(child, &symbols, &[0]).is_none());
     }
 
     fn layer_row(ctx: &egui::Context, id: LayerId) -> Rect {
@@ -6058,6 +6289,62 @@ mod drag_tests {
         assert!(drop_commands(&app, &ids, on(a)).is_empty());
         assert!(drop_commands(&app, &ids, on(d)).is_empty());
         assert_eq!(drop_commands(&app, &ids, on(c)).len(), 1);
+    }
+
+    #[test]
+    fn dragging_past_the_bottom_scrolls_to_a_lower_layer_and_allows_a_drop() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let low = app.doc().pages[0].layers[0].id;
+        app.run(Command::AddLayer {
+            page: app.page,
+            name: "Top".into(),
+        });
+        let high = app.doc().pages[0].layers[1].id;
+        app.picked_layer = Some(high);
+        for _ in 0..48 {
+            app.new_shape(rect_kind()).expect("filler");
+        }
+        let moving = app.new_shape(rect_kind()).expect("object to drag");
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new());
+        let start = object_row(&ctx, moving).center();
+        assert!(
+            layer_row(&ctx, low).top() > 800.0,
+            "the layer starts offscreen"
+        );
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start)]);
+        frame(&ctx, &mut app, vec![button(start, true)]);
+        let below = Pos2::new(start.x, 806.0);
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(below)]);
+        // Keep holding without motion events. The docker must keep scrolling
+        // on its own, even after the row that started the drag leaves view.
+        for _ in 0..160 {
+            if layer_row(&ctx, low).center().y < 720.0 {
+                break;
+            }
+            frame(&ctx, &mut app, Vec::new());
+        }
+        let target = layer_row(&ctx, low).center();
+        assert!(
+            (100.0..720.0).contains(&target.y),
+            "the lower layer is reachable: {target:?}"
+        );
+        assert!(
+            order(&app, 0).is_empty(),
+            "holding does not move the object yet"
+        );
+        assert_eq!(order(&app, 1).last(), Some(&moving));
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(target)]);
+        frame(&ctx, &mut app, vec![button(target, false)]);
+        assert_eq!(order(&app, 0), [moving]);
+        assert!(!order(&app, 1).contains(&moving));
     }
 
     /// A right click on an object's row opens the drawing's own object

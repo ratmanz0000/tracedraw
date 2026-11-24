@@ -8,7 +8,9 @@ three modes: Text, Objects and Properties.
   parts in their own looks) are searched as one text: a word half of it
   bold is found and replaced, the replacement taking the look of the run
   its match starts in. Texts inside groups and PowerClip frames are found
-  (Find selects the object they are in) and replaced. Without Match case
+  (Find selects the object they are in) and replaced, as is the text of a
+  table's cells and the text a symbol instance draws. Enter in the Find
+  field is Find Next, with the keyboard left in the field. Without Match case
   letters match one for one ignoring case; with Whole word a match has
   no letter or digit right before or after it. Before, a word in two
   looks was found but not replaced, grouped text was neither, and a
