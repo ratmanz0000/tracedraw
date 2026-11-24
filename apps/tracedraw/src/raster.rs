@@ -1506,12 +1506,16 @@ impl Raster {
                 if let Some((image, seconds)) = result {
                     self.last_seconds = seconds;
                     self.take_picture(ctx, image, job.filter, job.key, job.page_rect);
+                } else {
+                    self.key = Some(job.key);
                 }
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.job = None;
+                if let Some(job) = self.job.take() {
+                    self.key = Some(job.key);
+                }
                 false
             }
         }

@@ -591,6 +591,8 @@ struct Ctx<'a> {
     arrows: HashMap<u32, Arrowhead>,
     /// Crop outline of the bitmap object being read (local coordinates).
     pending_crop: Option<BezPath>,
+    /// Image ID of an unreadable or missing bitmap that was replaced with a placeholder (#4172).
+    pending_unreadable_bitmap: Option<u32>,
     /// The bitmap object being read shows a CMYK image.
     pending_cmyk: bool,
     /// The ink channels of the CMYK image it shows.
@@ -722,6 +724,7 @@ impl<'a> Ctx<'a> {
             styles: HashMap::new(),
             arrows: HashMap::new(),
             pending_crop: None,
+            pending_unreadable_bitmap: None,
             pending_cmyk: false,
             pending_inks: None,
             pending_mono: None,
@@ -3757,9 +3760,20 @@ impl<'a> Ctx<'a> {
                     self.pending_renumber = true;
                     return Some(ShapeKind::Group { children: vec![b] });
                 }
+                let r = rect();
                 self.report.warn(format!(
-                    "embedded object \"{name}\" has no picture we can show"
+                    "embedded object \"{name}\" has no picture we can show; placeholder kept on layer"
                 ));
+                if let Some(rect) = r {
+                    self.pending_unreadable_bitmap = Some(0);
+                    return Some(ShapeKind::Bitmap {
+                        rect,
+                        width_px: 1,
+                        height_px: 1,
+                        png: placeholder_bitmap_png(),
+                        fx: None,
+                    });
+                }
                 return None;
             };
             let rect = rect()?;
@@ -5062,6 +5076,15 @@ impl<'a> Ctx<'a> {
         // as new rectangles do, rather than stretch with it (#619); after
         // the outline, which decides whether the stretch may move.
         shape.keep_corner_size();
+        if let Some(img_id) = self.pending_unreadable_bitmap.take() {
+            if name.is_none() {
+                name = Some(if img_id > 0 {
+                    format!("Bitmap [Unreadable: Image {img_id}]")
+                } else {
+                    "Bitmap [Unreadable]".to_string()
+                });
+            }
+        }
         shape.name = name;
         shape.opacity = opacity;
         if let Some(style) = style_string.as_deref() {
@@ -6393,19 +6416,29 @@ impl<'a> Ctx<'a> {
                 let image_id = r.u16()? as u32;
                 let rect = Rect::new(x1.min(0.0), y1.min(0.0), x1.max(0.0), y1.max(0.0));
                 self.pending_crop = None;
-                let Some(bm) = self.bitmaps.get(&image_id) else {
-                    self.report
-                        .warn(format!("bitmap object refers to unknown image {image_id}"));
-                    return None;
+                let (bm_w, bm_h, bm_png) = match self.bitmaps.get(&image_id) {
+                    Some(bm) => {
+                        self.pending_cmyk = bm.cmyk;
+                        self.pending_inks = bm.inks.clone();
+                        self.pending_mono = bm.mono;
+                        (bm.width_px, bm.height_px, bm.png.clone())
+                    }
+                    None => {
+                        self.report.warn(format!(
+                            "bitmap object refers to unreadable image {image_id}; placeholder kept on layer"
+                        ));
+                        self.pending_cmyk = false;
+                        self.pending_inks = None;
+                        self.pending_mono = None;
+                        self.pending_unreadable_bitmap = Some(image_id);
+                        (1, 1, placeholder_bitmap_png())
+                    }
                 };
-                self.pending_cmyk = bm.cmyk;
-                self.pending_inks = bm.inks.clone();
-                self.pending_mono = bm.mono;
                 Some(ShapeKind::Bitmap {
                     rect,
-                    width_px: bm.width_px,
-                    height_px: bm.height_px,
-                    png: bm.png.clone(),
+                    width_px: bm_w,
+                    height_px: bm_h,
+                    png: bm_png,
                     fx: None,
                 })
             }
@@ -6447,20 +6480,30 @@ impl<'a> Ctx<'a> {
                         }
                     }
                 }
-                let Some(bm) = self.bitmaps.get(&image_id) else {
-                    self.report
-                        .warn(format!("bitmap object refers to unknown image {image_id}"));
-                    self.pending_crop = None;
-                    return None;
+                let (bm_w, bm_h, bm_png) = match self.bitmaps.get(&image_id) {
+                    Some(bm) => {
+                        self.pending_cmyk = bm.cmyk;
+                        self.pending_inks = bm.inks.clone();
+                        self.pending_mono = bm.mono;
+                        (bm.width_px, bm.height_px, bm.png.clone())
+                    }
+                    None => {
+                        self.report.warn(format!(
+                            "bitmap object refers to unreadable image {image_id}; placeholder kept on layer"
+                        ));
+                        self.pending_crop = None;
+                        self.pending_cmyk = false;
+                        self.pending_inks = None;
+                        self.pending_mono = None;
+                        self.pending_unreadable_bitmap = Some(image_id);
+                        (1, 1, placeholder_bitmap_png())
+                    }
                 };
-                self.pending_cmyk = bm.cmyk;
-                self.pending_inks = bm.inks.clone();
-                self.pending_mono = bm.mono;
                 Some(ShapeKind::Bitmap {
                     rect,
-                    width_px: bm.width_px,
-                    height_px: bm.height_px,
-                    png: bm.png.clone(),
+                    width_px: bm_w,
+                    height_px: bm_h,
+                    png: bm_png,
                     fx: None,
                 })
             }
@@ -6578,6 +6621,21 @@ fn decode_bitmap(
     lut: Option<&tracedraw_core::icc::CmykLut>,
     scale: f64,
 ) -> Option<Result<(u32, BitmapDef), String>> {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_bitmap_inner(d, v, lut, scale)
+    }));
+    match res {
+        Ok(r) => r,
+        Err(_) => Some(Err("bitmap decoding panicked or ran out of memory".into())),
+    }
+}
+
+fn decode_bitmap_inner(
+    d: &[u8],
+    v: u16,
+    lut: Option<&tracedraw_core::icc::CmykLut>,
+    scale: f64,
+) -> Option<Result<(u32, BitmapDef), String>> {
     let h = bitmap_header(d, v)?;
     let (image_id, width, height, bpp) = (h.id, h.width, h.height, h.bpp);
     if width == 0 || height == 0 {
@@ -6588,13 +6646,12 @@ fn decode_bitmap(
     // A scale under 1 samples the picture down as it is read, so a
     // 1600 mm scan does not allocate its full RGBA first. Large sources
     // are then allowed: the output is the smaller one.
-    let scale = if scale.is_finite() && scale > 0.0 { scale.min(1.0) } else { 1.0 };
-    let full = scale >= 1.0;
-    if full && (width > 32_768 || height > 32_768) {
-        return Some(Err(format!(
-            "bitmap {image_id}: size {width}x{height} rejected"
-        )));
+    let mut scale = if scale.is_finite() && scale > 0.0 { scale.min(1.0) } else { 1.0 };
+    let max_dim = width.max(height) as f64;
+    if max_dim * scale > 32_768.0 {
+        scale = 32_768.0 / max_dim;
     }
+    let full = scale >= 1.0;
     let mut r = Reader::new(d, v < 6);
     r.pos = h.body;
     let mut palette: Vec<[u8; 3]> = Vec::new();
@@ -8479,6 +8536,23 @@ pub(crate) fn encode_gray_png(width: u32, height: u32, gray: &[u8]) -> Vec<u8> {
         Vec::new()
     };
     png_file(width, height, 0, &idat)
+}
+
+/// A lightweight 2x2 placeholder PNG for bitmaps that could not be decoded.
+pub(crate) fn placeholder_bitmap_png() -> tracedraw_core::SharedBytes {
+    static PLACEHOLDER: std::sync::OnceLock<tracedraw_core::SharedBytes> =
+        std::sync::OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(|| {
+            let rgba = [
+                220, 220, 220, 180,
+                200, 200, 200, 180,
+                200, 200, 200, 180,
+                220, 220, 220, 180,
+            ];
+            encode_png(2, 2, &rgba).into()
+        })
+        .clone()
 }
 
 /// A PNG file of 8-bit samples of the colour type `color_type` from its
@@ -11225,6 +11299,35 @@ pub(crate) mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// When an embedded image is missing or unreadable, the bitmap object
+    /// is kept as a placeholder on its layer rather than dropped (#4172).
+    #[test]
+    fn unreadable_bitmap_keeps_placeholder_on_layer() {
+        let mut c = i32s(&[0, 0, 254000, 254000]);
+        c.extend_from_slice(&[0; 32]);
+        c.extend_from_slice(&u32s(&[999]));
+        c.extend_from_slice(&[0; 20]);
+        c.extend_from_slice(&u32s(&[0]));
+        let obj = list(
+            b"obj ",
+            &chunk(b"loda", &loda(OBJ_BITMAP, &[(ARG_COORDS, c)])),
+        );
+        let body = [
+            chunk(b"mcfg", &mcfg(13, 2_540_000, 2_540_000)),
+            list(b"page", &list(b"layr", &obj)),
+        ]
+        .concat();
+        let (doc, rep) = parse(&riff(b"CDRD", &body), 13);
+        assert_eq!(rep.shapes, 1);
+        let shape = first_shape(&doc);
+        assert!(matches!(shape.kind, ShapeKind::Bitmap { .. }));
+        assert_eq!(
+            shape.name.as_deref(),
+            Some("Bitmap [Unreadable: Image 999]")
+        );
+        assert!(!doc.pages[0].layers[0].shapes.is_empty());
     }
 
     /// A picture printed in a spot ink keeps the ink's description before

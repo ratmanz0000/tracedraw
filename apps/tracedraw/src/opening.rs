@@ -79,10 +79,16 @@ impl Opening {
         );
         let cdr = is_cdr(&path);
         std::thread::spawn(move || {
-            let read = if cdr {
-                read_cdr(&p, &d, &b, &c)
-            } else {
-                read_tdraw(&p, &d, &b, &c)
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if cdr {
+                    read_cdr(&p, &d, &b, &c)
+                } else {
+                    read_tdraw(&p, &d, &b, &c)
+                }
+            }));
+            let read = match res {
+                Ok(r) => r,
+                Err(_) => Err("file reading failed or ran out of memory".into()),
             };
             let _ = tx.send(read);
         });
