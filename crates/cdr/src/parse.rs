@@ -97,11 +97,10 @@ fn plan_bitmap_scale(datas: &[&[u8]], v: u16, free_ram: u64) -> f64 {
     if px == 0 {
         return 1.0;
     }
-    // Unknown RAM: assume 2 GiB free (a small desktop).
-    let free = if free_ram >= 512 << 20 { free_ram } else { 2 << 30 };
-    // Pictures together may take 35% of free RAM, 96 MiB at least,
-    // 1536 MiB at most.
-    let budget = (free * 35 / 100).clamp(96 << 20, 1536 << 20);
+    // Total physical RAM installed on the machine; 4 GiB fallback if unknown.
+    let ram = if free_ram >= 512 << 20 { free_ram } else { 4 << 30 };
+    // Pictures together may take up to 70% of total installed physical RAM.
+    let budget = (ram * 70 / 100).max(128 << 20);
     let rgba = px.saturating_mul(4);
     let mut k = if rgba > budget {
         (budget as f64 / rgba as f64).sqrt()
@@ -113,15 +112,10 @@ fn plan_bitmap_scale(datas: &[&[u8]], v: u16, free_ram: u64) -> f64 {
     if max_side as f64 * k > 32_768.0 {
         k = 32_768.0 / max_side as f64;
     }
-    // Limit total pixels across all bitmaps to 120 MP to avoid multi-gigabyte
-    // allocation and 20+ second PNG re-compression stalls.
-    if (px as f64 * k * k) > 120_000_000.0 {
-        k = (120_000_000.0 / px as f64).sqrt();
-    }
-    let k = k.clamp(0.02, 1.0);
+    let k = k.clamp(0.01, 1.0);
     if k < 1.0 {
         log::warn!(
-            "bitmaps: {n} picture(s), {px} px, sampling to {k:.2} (free {free} bytes)"
+            "bitmaps: {n} picture(s), {px} px, sampling to {k:.2} (free {ram} bytes)"
         );
     }
     k

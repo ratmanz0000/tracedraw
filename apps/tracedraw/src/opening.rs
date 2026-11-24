@@ -273,19 +273,19 @@ pub(crate) fn free_ram() -> u64 {
         let mut s: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         s.dw_length = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut s) } != 0 {
-            s.ull_avail_phys
+            s.ull_total_phys
         } else {
             0
         }
     }
     #[cfg(not(windows))]
     {
-        // Linux: MemAvailable of /proc/meminfo, in KiB.
+        // Linux: MemTotal of /proc/meminfo, in KiB.
         #[cfg(target_os = "linux")]
         {
             let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
             for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
                     let kib: u64 = rest
                         .trim()
                         .trim_end_matches("kB")
