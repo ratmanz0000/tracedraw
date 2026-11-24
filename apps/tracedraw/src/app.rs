@@ -1904,8 +1904,6 @@ pub struct App {
     /// typed into, so the page beneath stays cached without re-rendering
     /// on each keystroke (#3904).
     pub text_edit_overlay: std::cell::RefCell<crate::text_editing::TextEditOverlay>,
-    /// The layout of the text being edited, kept across frames (#3960).
-    pub text_layout_cache: std::cell::RefCell<Option<crate::text_editing::CachedTextLayout>>,
     /// What the backdrop covers (see [`Self::backdrop_area`]), with the
     /// revision, page and page box it was worked out for.
     backdrop_area: std::cell::Cell<Option<(u64, PageId, Rect, Rect)>>,
@@ -3687,7 +3685,6 @@ impl App {
             page_rasters: Default::default(),
             page_snapshot: Default::default(),
             text_edit_overlay: Default::default(),
-            text_layout_cache: Default::default(),
             backdrop_area: Default::default(),
             view_mode: ViewMode::Enhanced,
             proof_colors: false,
