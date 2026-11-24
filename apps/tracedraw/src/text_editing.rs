@@ -95,6 +95,7 @@ pub struct CachedTextLayout {
     pub shape: ShapeId,
     pub tab_step_bits: u64,
     pub transform_bits: [u64; 6],
+    pub parent_bits: [u64; 6],
     pub font_generation: u64,
     pub layout: std::sync::Arc<TextLayout>,
     pub to_page: Affine,
@@ -111,6 +112,20 @@ impl CachedTextLayout {
             && self.tab_step_bits == tracedraw_core::default_tab_step().to_bits()
             && self.transform_bits == transform.as_coeffs().map(f64::to_bits)
             && self.font_generation == tracedraw_text::fonts().generation()
+    }
+
+    /// Whether this is still the layout and page transform of shape `id`
+    /// (including its parent group/clip frame transform).
+    pub fn matches_parent(
+        &self,
+        instance: u64,
+        revision: u64,
+        id: ShapeId,
+        transform: Affine,
+        parent: Affine,
+    ) -> bool {
+        self.matches(instance, revision, id, transform)
+            && self.parent_bits == parent.as_coeffs().map(f64::to_bits)
     }
 }
 
@@ -263,18 +278,20 @@ impl App {
         let s = self.doc().find_shape(id)?;
         let instance = self.engine.instance();
         let revision = self.engine.revision();
+        let parent = self.doc().parent_transform(id).unwrap_or(Affine::IDENTITY);
         if let Some(c) = self.text_layout_cache.borrow().as_ref() {
-            if c.matches(instance, revision, id, s.transform) {
+            if c.matches_parent(instance, revision, id, s.transform, parent) {
                 return Some((c.layout.clone(), c.to_page));
             }
         }
-        let (layout, to_page) = layout_of_text_shape(s, Affine::IDENTITY)?;
+        let (layout, to_page) = layout_of_text_shape(s, parent)?;
         let cached = CachedTextLayout {
             instance,
             revision,
             shape: id,
             tab_step_bits: tracedraw_core::default_tab_step().to_bits(),
             transform_bits: s.transform.as_coeffs().map(f64::to_bits),
+            parent_bits: parent.as_coeffs().map(f64::to_bits),
             font_generation: tracedraw_text::fonts().generation(),
             layout: std::sync::Arc::new(layout),
             to_page,
@@ -3392,45 +3409,91 @@ fn shape_links_blend_to(s: &tracedraw_core::Shape, id: ShapeId) -> bool {
     }
 }
 
-/// Check that `id` is a top-level shape on a visible layer of `app.page` with
+/// Check that `id` is a shape on a visible layer of `app.page` with
 /// no blend targeting it, returning the visual bounds of every visible shape
-/// drawn above `id` on the page.
+/// drawn above `id` on the page. Searches child shapes inside groups and
+/// clip frames too, so grouped text benefits from the overlay fast-path.
 fn scan_page_for_text_overlay(app: &App, id: ShapeId) -> Option<Vec<Rect>> {
     let layers = app.doc().layers_for_page(app.page).ok()?;
     let mut seen = false;
     let mut above = Vec::new();
+    fn walk(
+        s: &tracedraw_core::Shape,
+        parent: Affine,
+        id: ShapeId,
+        seen: &mut bool,
+        above: &mut Vec<Rect>,
+    ) -> bool {
+        if shape_links_blend_to(s, id) {
+            return false;
+        }
+        if s.id == id {
+            *seen = true;
+            return true;
+        }
+        let t = parent * s.transform;
+        match &s.kind {
+            ShapeKind::Group { children } => {
+                for c in children {
+                    if !walk(c, t, id, seen, above) {
+                        return false;
+                    }
+                }
+            }
+            ShapeKind::ClipFrame { frame, contents } => {
+                if !walk(frame, t, id, seen, above) {
+                    return false;
+                }
+                for c in contents {
+                    if !walk(c, t, id, seen, above) {
+                        return false;
+                    }
+                }
+            }
+            _ => {
+                if *seen && s.visible {
+                    let b = if parent == Affine::IDENTITY {
+                        s.visual_bounds()
+                    } else {
+                        parent.transform_rect_bbox(s.visual_bounds())
+                    };
+                    if b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite() {
+                        above.push(b);
+                    }
+                }
+            }
+        }
+        true
+    }
     for layer in layers {
         if !layer.visible {
             continue;
         }
         for s in &layer.shapes {
-            if shape_links_blend_to(s, id) {
+            if !walk(s, Affine::IDENTITY, id, &mut seen, &mut above) {
                 return None;
-            }
-            if s.id == id {
-                seen = true;
-                continue;
-            }
-            if seen && s.visible {
-                let b = s.visual_bounds();
-                if b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite() {
-                    above.push(b);
-                }
             }
         }
     }
     seen.then_some(above)
 }
 
-fn text_overlay_bounds(s: &tracedraw_core::Shape) -> Option<Rect> {
+fn text_overlay_bounds(doc: &tracedraw_core::Document, id: ShapeId) -> Option<Rect> {
+    let s = doc.find_shape(id)?;
     let ShapeKind::Text { spans, .. } = &s.kind else {
         return None;
     };
-    let b = s.bounds();
+    let parent = doc.parent_transform(id).unwrap_or(Affine::IDENTITY);
+    let own = s.bounds();
+    let b = if parent == Affine::IDENTITY {
+        own
+    } else {
+        parent.transform_rect_bbox(own)
+    };
     if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
         return None;
     }
-    let c = s.transform.as_coeffs();
+    let c = (parent * s.transform).as_coeffs();
     let scale = c[0].hypot(c[1]).max(c[2].hypot(c[3])).max(1.0);
     let max_pt = spans
         .iter()
@@ -3482,7 +3545,7 @@ fn shape_bounds_for_overlay(
     if spans_char_count(spans) == 0 || s.is_empty_path() {
         return Some(None);
     }
-    let padded = text_overlay_bounds(s)?;
+    let padded = text_overlay_bounds(doc, id)?;
     if above_boxes.iter().any(|b| b.overlaps(padded)) {
         return None;
     }

@@ -7419,12 +7419,23 @@ impl App {
     pub fn sync_text_defaults_from(&mut self, id: ShapeId) {
         // Found inside groups too: a text in a group chosen on its own
         // showed the font of the text read before it (#3896).
-        let kind = self.doc().find_shape(id).map(|s| s.kind.clone()).ok_or(());
-        if let Ok(ShapeKind::Text { spans, align, .. }) = &kind {
+        // Query helper values first so self is not borrowed across
+        // inspecting the shape, avoiding cloning ShapeKind::Text on every key.
+        let at = self.shown_char(id);
+        let scale = self.text_scale(id);
+        let range = self.paragraph_range(id);
+
+        let (span_info, align_val) = {
+            let Some(s) = self.doc().find_shape(id) else {
+                return;
+            };
+            let ShapeKind::Text { spans, align, para, .. } = &s.kind else {
+                return;
+            };
+
             // While editing, the style at the caret (of the character
             // before it); with the Shape tool, of the first chosen
             // character (#1662).
-            let at = self.shown_char(id);
             let span_at = at.and_then(|at| {
                 let mut seen = 0usize;
                 spans.iter().find(|sp| {
@@ -7434,36 +7445,42 @@ impl App {
                     hit
                 })
             });
-            if let Some(sp) = span_at.or_else(|| spans.first()) {
-                self.text_font = sp.font_family.clone();
-                // The size as seen on the page, to the hundredth of a point.
-                let seen = sp.size_pt * self.text_scale(id);
-                self.text_size_pt = (seen * 100.0).round() / 100.0;
-                self.text_bold = sp.bold;
-                self.text_italic = sp.italic;
-                self.text_underline = sp.underline.is_on();
-                self.text_strikethrough = sp.strikethrough.is_on();
-                self.text_shown = Some(TextShown {
-                    shape: id,
-                    font: Some(self.text_font.clone()),
-                    size_pt: Some(self.text_size_pt),
-                    bold: Some(sp.bold),
-                    italic: Some(sp.italic),
-                    underline: Some(sp.underline.is_on()),
-                    strikethrough: Some(sp.strikethrough.is_on()),
-                });
-            }
-            // The alignment of the paragraph at the caret.
-            let index = self.paragraph_range(id).map_or(0, |(a, _)| {
+            let span_info = span_at.or_else(|| spans.first()).map(|sp| {
+                (
+                    sp.font_family.clone(),
+                    (sp.size_pt * scale * 100.0).round() / 100.0,
+                    sp.bold,
+                    sp.italic,
+                    sp.underline.is_on(),
+                    sp.strikethrough.is_on(),
+                )
+            });
+            let index = range.map_or(0, |(a, _)| {
                 tracedraw_core::paragraphs::paragraph_of(spans, a)
             });
-            self.text_align = match &kind {
-                Ok(ShapeKind::Text { para, .. }) => {
-                    tracedraw_core::paragraphs::paragraph_format(spans, *align, para, index).align
-                }
-                _ => *align,
-            };
+            let align_val =
+                tracedraw_core::paragraphs::paragraph_format(spans, *align, para, index).align;
+            (span_info, align_val)
+        };
+
+        if let Some((family, size_pt, bold, italic, underline, strikethrough)) = span_info {
+            self.text_font = family.clone();
+            self.text_size_pt = size_pt;
+            self.text_bold = bold;
+            self.text_italic = italic;
+            self.text_underline = underline;
+            self.text_strikethrough = strikethrough;
+            self.text_shown = Some(TextShown {
+                shape: id,
+                font: Some(family),
+                size_pt: Some(size_pt),
+                bold: Some(bold),
+                italic: Some(italic),
+                underline: Some(underline),
+                strikethrough: Some(strikethrough),
+            });
         }
+        self.text_align = align_val;
     }
 
     pub fn finish_text(&mut self) {

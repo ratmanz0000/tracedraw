@@ -101,41 +101,75 @@ pub struct Preview {
 /// the whole page's paths again (#3559).
 type PageBounds = std::collections::HashMap<ShapeId, Rect>;
 
+/// How far an outline may reach past the path it follows, in widths:
+/// mitres, arrowheads and calligraphic nibs all stay within this (the
+/// nodes of a variable width are counted on their own).
+const OUTLINE_REACH: f64 = 12.0;
+
+/// The page-space box of `shape` grown by what its outline may reach:
+/// mitres, arrowheads, variable width nodes, and a 1 mm margin.
+fn shape_reach(shape: &Shape, parent: Affine) -> Option<Rect> {
+    let own = match shape.picture() {
+        Some(p) => shape.bounds().union(p.bounds()),
+        None => shape.bounds(),
+    };
+    let b = if parent == Affine::IDENTITY {
+        own
+    } else {
+        parent.transform_rect_bbox(own)
+    };
+    if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
+        return None;
+    }
+    let scale = {
+        let c = (parent * shape.transform).as_coeffs();
+        (c[0] * c[0] + c[1] * c[1])
+            .sqrt()
+            .max((c[2] * c[2] + c[3] * c[3]).sqrt())
+            .max(1.0)
+    };
+    let width = shape.stroke.as_ref().map_or(0.0, |s| s.width.abs()) * scale;
+    let reach = shape.stroke.as_ref().map_or(0.0, |s| {
+        s.widths
+            .iter()
+            .map(|n| n.left.abs().max(n.right.abs()))
+            .filter(|r| r.is_finite())
+            .fold(0.0, f64::max)
+    }) * scale;
+    let margin = (width * OUTLINE_REACH).max(reach) + 1.0;
+    Some(b.inflate(margin, margin))
+}
+
 /// [`PageBounds`] of the page's drawable layers: each shape's box with
 /// the transforms of the groups and clip frames holding it taken in,
 /// the same value [`Renderer::reach`] would compute for it.
 #[cfg(not(target_arch = "wasm32"))]
 fn page_bounds_cache(doc: &Document, page: PageId) -> PageBounds {
-    fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) {
-        // An object drawn as the picture its bitmap effects make: the
-        // picture's box, which the effects grow past the object (a blur
-        // spreads). The object's own box cut the picture there, a hard
-        // edge round a blurred vector object (#4082).
-        let own = match s.picture() {
-            Some(p) => s.bounds().union(p.bounds()),
-            None => s.bounds(),
-        };
-        let b = if parent == Affine::IDENTITY {
-            own
-        } else {
-            parent.transform_rect_bbox(own)
-        };
-        map.insert(s.id, b);
+    fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) -> Option<Rect> {
         let t = parent * s.transform;
-        match &s.kind {
+        let reach = match &s.kind {
             ShapeKind::Group { children } => {
+                let mut union: Option<Rect> = None;
                 for c in children {
-                    walk(c, t, map);
+                    if let Some(cr) = walk(c, t, map) {
+                        union = Some(union.map_or(cr, |u| u.union(cr)));
+                    }
                 }
+                union
             }
             ShapeKind::ClipFrame { frame, contents } => {
-                walk(frame, t, map);
+                let fr = walk(frame, t, map);
                 for c in contents {
                     walk(c, t, map);
                 }
+                fr
             }
-            _ => {}
+            _ => shape_reach(s, parent),
+        };
+        if let Some(r) = reach {
+            map.insert(s.id, r);
         }
+        reach
     }
     let mut map = PageBounds::new();
     if let Ok(layers) = doc.layers_drawn_for_page(page) {
@@ -937,11 +971,6 @@ fn visible_page_rect(opts: &RenderOptions) -> Rect {
     Rect::from_points(a, b)
 }
 
-/// How far an outline may reach past the path it follows, in widths:
-/// mitres, arrowheads and calligraphic nibs all stay within this (the
-/// nodes of a variable width are counted on their own).
-const OUTLINE_REACH: f64 = 12.0;
-
 /// Paths drawn on this thread, for tests.
 #[cfg(test)]
 thread_local! {
@@ -1036,25 +1065,28 @@ impl Renderer<'_> {
         {
             return false;
         }
-        // A group or a clip frame: its own outline reaches nowhere, its
-        // objects' outlines do. Out of sight when every object is (a clip
-        // frame draws nothing past its frame): the group's bounds count
-        // no outline, so its strips used to cut a wide or variable
-        // outline inside it flat (#626).
+        // Test the visual reach of the shape or entire group first:
+        // if the overall reach box does not intersect the visible area,
+        // it is culled immediately in O(1) without iterating through children.
+        let Some(b) = Self::reach(shape, parent, self.bounds) else {
+            return false;
+        };
+        if b.x1 < visible.x0 || b.x0 > visible.x1 || b.y1 < visible.y0 || b.y0 > visible.y1 {
+            return true;
+        }
+        // If the group or clip frame overlaps the visible area, recurse
+        // to cull individual children.
         match &shape.kind {
             ShapeKind::Group { children } => {
                 let t = parent * shape.transform;
                 return children.iter().all(|c| self.out_of_sight_in(c, t, visible));
             }
             ShapeKind::ClipFrame { frame, .. } => {
-                return self.out_of_sight_in(frame, parent * shape.transform, visible)
+                return self.out_of_sight_in(frame, parent * shape.transform, visible);
             }
             _ => {}
         }
-        let Some(b) = Self::reach(shape, parent, self.bounds) else {
-            return false;
-        };
-        b.x1 < visible.x0 || b.x0 > visible.x1 || b.y1 < visible.y0 || b.y0 > visible.y1
+        false
     }
 
     /// The part of the page (mm) this renderer's pixmap shows, `None`
@@ -1078,41 +1110,28 @@ impl Renderer<'_> {
             .then_some(r)
     }
 
-    /// Where a plain object (no group or clip frame) inside `parent` can
-    /// paint, page mm: its bounds grown by what its outline may reach.
-    /// `None` when its bounds are not finite. Effects, shadows, symbols
-    /// and the drag preview reach further; callers leave those out. The
-    /// box comes from the render's shared [`PageBounds`] when there is
-    /// one (#3559).
+    /// Where a shape (or group of shapes) inside `parent` can paint,
+    /// page mm: its bounds grown by what its outlines, variable widths
+    /// and child objects may reach. `None` when its bounds are not finite.
+    /// The box comes from the render's shared [`PageBounds`] when there
+    /// is one (#3559).
     fn reach(shape: &Shape, parent: Affine, cached: Option<&PageBounds>) -> Option<Rect> {
-        let b = match cached.and_then(|c| c.get(&shape.id)) {
-            Some(b) => *b,
-            None if parent == Affine::IDENTITY => shape.bounds(),
-            None => parent.transform_rect_bbox(shape.bounds()),
-        };
-        if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
-            return None;
+        if let Some(r) = cached.and_then(|c| c.get(&shape.id)).copied() {
+            return Some(r);
         }
-        let scale = {
-            let c = (parent * shape.transform).as_coeffs();
-            (c[0] * c[0] + c[1] * c[1])
-                .sqrt()
-                .max((c[2] * c[2] + c[3] * c[3]).sqrt())
-                .max(1.0)
-        };
-        let width = shape.stroke.as_ref().map_or(0.0, |s| s.width.abs()) * scale;
-        // A Variable Length node may reach any distance from the path,
-        // past what a width covers: counted on its own, or the band was
-        // left out of the strips of the page it reaches into (#626).
-        let reach = shape.stroke.as_ref().map_or(0.0, |s| {
-            s.widths
-                .iter()
-                .map(|n| n.left.abs().max(n.right.abs()))
-                .filter(|r| r.is_finite())
-                .fold(0.0, f64::max)
-        }) * scale;
-        let margin = (width * OUTLINE_REACH).max(reach) + 1.0;
-        Some(b.inflate(margin, margin))
+        match &shape.kind {
+            ShapeKind::Group { children } => {
+                let t = parent * shape.transform;
+                children
+                    .iter()
+                    .filter_map(|c| Self::reach(c, t, None))
+                    .reduce(|a, b| a.union(b))
+            }
+            ShapeKind::ClipFrame { frame, .. } => {
+                Self::reach(frame, parent * shape.transform, None)
+            }
+            _ => shape_reach(shape, parent),
+        }
     }
 
     /// The pixels of this renderer's target that a semi-transparent
