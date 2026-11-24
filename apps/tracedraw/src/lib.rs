@@ -971,8 +971,8 @@ impl Shell {
             return;
         }
         self.renderer_check = RendererCheck::Done;
-        if gpu::next_renderer().is_none() {
-            log::error!("no other renderer is left to try; the window stays");
+        if self.app.is_some() || gpu::next_renderer().is_none() {
+            log::warn!("renderer check finished; the window stays");
             return;
         }
         gpu::note_blind();

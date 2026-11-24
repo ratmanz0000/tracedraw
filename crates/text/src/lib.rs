@@ -7,19 +7,17 @@
 //! Coordinates: baseline of the first line at y = 0 for artistic text; the
 //! top of the frame at y = 0 for paragraph text. Y is up, as everywhere.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use tracedraw_core::{
     document::{
-        text_outline::TextRequest, CurvePreset, DocumentFont, FontVariation, LineStyle,
-        ParagraphStyle, PathTextOrientation, PathTextVertical, TabKind, TabStop, TextAlign,
-        TextOnPath, TextPosition, TextSpan, VerticalAlign, DEFAULT_TAB_STEP,
+        text_outline::TextRequest, DocumentFont, LineStyle, ParagraphStyle, PathTextOrientation,
+        PathTextVertical, TabKind, TabStop, TextAlign, TextOnPath, TextSpan, VerticalAlign,
+        DEFAULT_TAB_STEP,
     },
-    geometry::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Size},
+    geometry::{Affine, BezPath, Point, Rect, Shape as _, Size},
     text_flow::{free_segments, WrapRegion},
 };
 
@@ -1767,328 +1765,6 @@ const SHAPED_KEPT: usize = 64;
 /// outline): a longer text is not kept.
 const SHAPED_GLYPHS: usize = 30_000;
 
-/// How many laid-out texts [`FontSystem::layouts`] keeps.
-const LAYOUT_KEPT: usize = 512;
-
-/// The key of a text in a cache of [`FontSystem`]: everything its layout
-/// depends on, kept exactly. A request is hashed to 64 bits to find its
-/// place in the map and then compared against the kept key field by
-/// field, so two different texts never answer for each other, however
-/// their hashes come out.
-///
-/// The key used to be a `String` put together with `format!` for every
-/// span and a `Vec` of them joined, built on every asking, several times
-/// a frame for a text being edited.
-#[derive(Clone, Debug, PartialEq)]
-struct TextKey {
-    /// Hash of the fields below; compared first.
-    hash: u64,
-    /// The font database generation the glyphs were shaped at; 0 for the
-    /// key of a whole layout (the laid-out texts are dropped when the
-    /// fonts change).
-    generation: u64,
-    /// The font size scale, as bits; 1.0 for the key of a whole layout.
-    size_scale: u64,
-    /// The frame, width then height in mm, as bits; `None` for artistic
-    /// text.
-    frame: Option<(u64, u64)>,
-    align: TextAlign,
-    /// The paragraph style, compared exactly.
-    para: ParagraphStyle,
-    /// The default tab spacing, as bits.
-    tab_step: u64,
-    on_path: Option<OnPathKey>,
-    spans: Vec<SpanKey>,
-    /// The glyphs were collected (`glyph_layout`), not only the outline.
-    collect: bool,
-    /// Lines past the frame were left out (`layout_fitted`).
-    fitted_only: bool,
-}
-
-impl Eq for TextKey {}
-
-impl Hash for TextKey {
-    /// The hash of the fields, computed once when the key was built: the
-    /// map places the key by it, and the exact comparison tells the rest.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
-    }
-}
-
-impl TextKey {
-    /// The key of a whole layout of `req` (see [`FontSystem::layout`]).
-    fn of_layout(req: &TextRequest, tab_step: f64, collect: bool, fitted_only: bool) -> Self {
-        let mut key = TextKey {
-            hash: 0,
-            generation: 0,
-            size_scale: 1.0f64.to_bits(),
-            frame: req.frame.map(|f| (f.width.to_bits(), f.height.to_bits())),
-            align: req.align,
-            para: req.para.clone(),
-            tab_step: tab_step.to_bits(),
-            on_path: req.on_path.map(OnPathKey::of),
-            spans: req.spans.iter().map(SpanKey::of).collect(),
-            collect,
-            fitted_only,
-        };
-        key.hash = key.hash_fields();
-        key
-    }
-
-    /// The key of the shaped glyphs of `req` at `size_scale` (see
-    /// [`FontSystem::shaped`]): what [`TextKey::of_layout`] holds but the
-    /// frame and the path, which only the line breaking uses, and with
-    /// the font database generation and the size scale.
-    fn of_shaped(req: &TextRequest, tab_step: f64, generation: u64, size_scale: f64) -> Self {
-        let mut key = TextKey {
-            hash: 0,
-            generation,
-            size_scale: size_scale.to_bits(),
-            frame: None,
-            align: req.align,
-            para: req.para.clone(),
-            tab_step: tab_step.to_bits(),
-            on_path: None,
-            spans: req.spans.iter().map(SpanKey::of).collect(),
-            collect: false,
-            fitted_only: false,
-        };
-        key.hash = key.hash_fields();
-        key
-    }
-
-    /// The hash of the fields the key keeps. A field left out here is
-    /// still told apart by the exact comparison; it only shares a place
-    /// in the map with the keys it hashes to.
-    fn hash_fields(&self) -> u64 {
-        let mut h = DefaultHasher::new();
-        self.generation.hash(&mut h);
-        self.size_scale.hash(&mut h);
-        self.frame.hash(&mut h);
-        std::mem::discriminant(&self.align).hash(&mut h);
-        hash_paragraph_style(&self.para, &mut h);
-        self.tab_step.hash(&mut h);
-        match &self.on_path {
-            Some(p) => {
-                1u8.hash(&mut h);
-                p.hash_into(&mut h);
-            }
-            None => 0u8.hash(&mut h),
-        }
-        self.spans.len().hash(&mut h);
-        for s in &self.spans {
-            s.hash_into(&mut h);
-        }
-        self.collect.hash(&mut h);
-        self.fitted_only.hash(&mut h);
-        h.finish()
-    }
-}
-
-/// Text on a path, as the key keeps it: the path itself, so two
-/// different curves never share an entry, and the placement settings.
-#[derive(Clone, Debug, PartialEq)]
-struct OnPathKey {
-    path: BezPath,
-    offset: u64,
-    distance: u64,
-    mirror: bool,
-    mirror_h: bool,
-    mirror_v: bool,
-    orientation: PathTextOrientation,
-    vertical: PathTextVertical,
-    preset: Option<CurvePreset>,
-}
-
-impl Eq for OnPathKey {}
-
-impl OnPathKey {
-    fn of(p: &TextOnPath) -> Self {
-        OnPathKey {
-            path: p.path.clone(),
-            offset: p.offset.to_bits(),
-            distance: p.distance.to_bits(),
-            mirror: p.mirror,
-            mirror_h: p.mirror_h,
-            mirror_v: p.mirror_v,
-            orientation: p.orientation,
-            vertical: p.vertical,
-            preset: p.preset,
-        }
-    }
-
-    fn hash_into<H: Hasher>(&self, h: &mut H) {
-        for el in self.path.elements() {
-            std::mem::discriminant(el).hash(h);
-            match el {
-                PathEl::MoveTo(p) | PathEl::LineTo(p) => hash_point(p, h),
-                PathEl::QuadTo(a, b) => {
-                    hash_point(a, h);
-                    hash_point(b, h);
-                }
-                PathEl::CurveTo(a, b, c) => {
-                    hash_point(a, h);
-                    hash_point(b, h);
-                    hash_point(c, h);
-                }
-                PathEl::ClosePath => {}
-            }
-        }
-        self.offset.hash(h);
-        self.distance.hash(h);
-        self.mirror.hash(h);
-        self.mirror_h.hash(h);
-        self.mirror_v.hash(h);
-        std::mem::discriminant(&self.orientation).hash(h);
-        std::mem::discriminant(&self.vertical).hash(h);
-        match &self.preset {
-            Some(p) => {
-                1u8.hash(h);
-                std::mem::discriminant(p).hash(h);
-            }
-            None => 0u8.hash(h),
-        }
-    }
-}
-
-/// The layout-relevant part of a [`TextSpan`]: the fills, the background
-/// and the overprints change how the text is drawn, not where it is, so
-/// they are left out and recolouring a character does not lay it out
-/// again.
-#[derive(Clone, Debug, PartialEq)]
-struct SpanKey {
-    layout_only: bool,
-    font_family: String,
-    size_pt: u64,
-    bold: bool,
-    italic: bool,
-    tracking_pct: u64,
-    baseline_shift_pt: u64,
-    offset_x_pct: u64,
-    width_pct: u64,
-    angle_deg: u64,
-    underline: LineStyle,
-    strikethrough: LineStyle,
-    all_caps: bool,
-    enclosed: bool,
-    features: Vec<String>,
-    position: TextPosition,
-    variations: Vec<FontVariation>,
-    paragraph: Option<Box<tracedraw_core::paragraphs::ParagraphFormat>>,
-    text: String,
-}
-
-impl Eq for SpanKey {}
-
-impl SpanKey {
-    fn of(s: &TextSpan) -> Self {
-        SpanKey {
-            layout_only: s.layout_only,
-            font_family: s.font_family.clone(),
-            size_pt: s.size_pt.to_bits(),
-            bold: s.bold,
-            italic: s.italic,
-            tracking_pct: s.tracking_pct.to_bits(),
-            baseline_shift_pt: s.baseline_shift_pt.to_bits(),
-            offset_x_pct: s.offset_x_pct.to_bits(),
-            width_pct: s.width_pct.to_bits(),
-            angle_deg: s.angle_deg.to_bits(),
-            underline: s.underline,
-            strikethrough: s.strikethrough,
-            all_caps: s.all_caps,
-            enclosed: s.enclosed,
-            features: s.features.clone(),
-            position: s.position,
-            variations: s.variations.clone(),
-            paragraph: s.paragraph.clone(),
-            text: s.text.clone(),
-        }
-    }
-
-    fn hash_into<H: Hasher>(&self, h: &mut H) {
-        self.layout_only.hash(h);
-        self.font_family.hash(h);
-        self.size_pt.hash(h);
-        self.bold.hash(h);
-        self.italic.hash(h);
-        self.tracking_pct.hash(h);
-        self.baseline_shift_pt.hash(h);
-        self.offset_x_pct.hash(h);
-        self.width_pct.hash(h);
-        self.angle_deg.hash(h);
-        std::mem::discriminant(&self.underline).hash(h);
-        std::mem::discriminant(&self.strikethrough).hash(h);
-        self.all_caps.hash(h);
-        self.enclosed.hash(h);
-        self.features.hash(h);
-        std::mem::discriminant(&self.position).hash(h);
-        for v in &self.variations {
-            v.tag.hash(h);
-            v.value.to_bits().hash(h);
-        }
-        // The formatting a paragraph of its own carries has floating point
-        // fields and no Hash of its own: whether there is one is hashed,
-        // the rest is told apart by the exact comparison.
-        self.paragraph.is_some().hash(h);
-        self.text.hash(h);
-    }
-}
-
-/// The paragraph style is compared exactly ([`ParagraphStyle`] implements
-/// `PartialEq`); this hashes the fields that set it apart, so two styles
-/// that differ land in different places in the map in the usual case.
-fn hash_paragraph_style<H: Hasher>(p: &ParagraphStyle, h: &mut H) {
-    p.leading_pct.to_bits().hash(h);
-    std::mem::discriminant(&p.leading_unit).hash(h);
-    p.char_spacing_pct.to_bits().hash(h);
-    p.word_spacing_pct.to_bits().hash(h);
-    p.space_before.to_bits().hash(h);
-    p.space_after.to_bits().hash(h);
-    p.space_before_pct.map(|v| v.to_bits()).hash(h);
-    p.space_after_pct.map(|v| v.to_bits()).hash(h);
-    p.first_line_indent.to_bits().hash(h);
-    p.left_indent.to_bits().hash(h);
-    p.right_indent.to_bits().hash(h);
-    p.columns.hash(h);
-    p.gutter.to_bits().hash(h);
-    for v in &p.column_widths {
-        v.to_bits().hash(h);
-    }
-    for v in &p.column_gutters {
-        v.to_bits().hash(h);
-    }
-    p.columns_right_to_left.hash(h);
-    p.bullets.hash(h);
-    p.bullet_char.hash(h);
-    p.bullet_indent.to_bits().hash(h);
-    // The bullet's own look, the fills and the text wrap are told apart
-    // by the exact comparison.
-    p.drop_cap_lines.hash(h);
-    p.tabs.len().hash(h);
-    for t in &p.tabs {
-        t.pos.to_bits().hash(h);
-        std::mem::discriminant(&t.kind).hash(h);
-        t.leader.is_some().hash(h);
-    }
-    p.hyphenate.hash(h);
-    p.fit_to_frame.hash(h);
-    p.type_block.hash(h);
-    p.baseline_grid_mm.to_bits().hash(h);
-    std::mem::discriminant(&p.vertical_align).hash(h);
-    p.vertical.hash(h);
-    std::mem::discriminant(&p.vertical_columns).hash(h);
-    std::mem::discriminant(&p.direction).hash(h);
-    p.frame_fill.is_some().hash(h);
-    p.flow.is_empty().hash(h);
-    p.flow.grid.map(|g| (g.0.to_bits(), g.1.to_bits())).hash(h);
-    p.bullet_part.is_some().hash(h);
-}
-
-fn hash_point<H: Hasher>(p: &Point, h: &mut H) {
-    p.x.to_bits().hash(h);
-    p.y.to_bits().hash(h);
-}
-
 /// A text shaped: its glyphs in paragraphs (split at newlines), where
 /// each paragraph starts in the concatenated span text, the number of
 /// characters, and each span's metrics. Everything but the line breaking,
@@ -2208,7 +1884,6 @@ struct Line {
     trailing: Vec<Glyph>,
 }
 
-#[derive(Clone)]
 pub struct TextLayout {
     pub path: BezPath,
     /// Logical bounds, mm.
@@ -2781,7 +2456,6 @@ impl FontSystem {
             cached_points: AtomicUsize::new(0),
             laid: Mutex::new(std::collections::VecDeque::new()),
             shaped: Mutex::new(HashMap::new()),
-            layouts: Mutex::new(HashMap::new()),
             offered: RwLock::new(Vec::new()),
             requests: Mutex::new((Vec::new(), Vec::new())),
             fallbacks: Mutex::new(HashMap::new()),
@@ -2885,9 +2559,6 @@ impl FontSystem {
             c.clear();
         }
         if let Ok(mut c) = self.shaped.lock() {
-            c.clear();
-        }
-        if let Ok(mut c) = self.layouts.lock() {
             c.clear();
         }
         if let Ok(mut f) = self.fallbacks.lock() {
@@ -4080,10 +3751,79 @@ impl FontSystem {
         Some((data, idx))
     }
 
+    /// The key of a text object's outline in the cache: everything its
+    /// layout depends on.
+    fn cache_key(req: &TextRequest) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{}|{}|{}",
+            req.frame,
+            req.align,
+            req.para,
+            // The default tab spacing (Options) moves text after tabs.
+            tracedraw_core::default_tab_step().to_bits(),
+            req.on_path
+                .map(|p| {
+                    // The whole path, not just its size: two ellipses have
+                    // the same number of elements.
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for el in p.path.elements() {
+                        for pt in [el.end_point()].into_iter().flatten().chain(match el {
+                            tracedraw_core::geometry::PathEl::QuadTo(a, _) => vec![*a],
+                            tracedraw_core::geometry::PathEl::CurveTo(a, b, _) => vec![*a, *b],
+                            _ => Vec::new(),
+                        }) {
+                            pt.x.to_bits().hash(&mut h);
+                            pt.y.to_bits().hash(&mut h);
+                        }
+                        std::mem::discriminant(el).hash(&mut h);
+                    }
+                    format!(
+                        "{:x}|{}|{}|{}|{}|{}|{:?}|{:?}",
+                        h.finish(),
+                        p.offset,
+                        p.distance,
+                        p.mirror,
+                        p.mirror_h,
+                        p.mirror_v,
+                        p.orientation,
+                        p.vertical
+                    )
+                })
+                .unwrap_or_default(),
+            req.spans
+                .iter()
+                .map(|s| format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}",
+                    s.layout_only,
+                    s.font_family,
+                    s.size_pt,
+                    s.bold,
+                    s.italic,
+                    s.tracking_pct,
+                    s.baseline_shift_pt,
+                    s.offset_x_pct,
+                    s.width_pct,
+                    s.angle_deg,
+                    s.underline,
+                    s.strikethrough,
+                    s.all_caps,
+                    s.enclosed,
+                    s.features,
+                    s.position,
+                    s.variations,
+                    s.paragraph,
+                    s.text
+                ))
+                .collect::<Vec<_>>()
+                .join("\u{1}")
+        )
+    }
+
     /// Cached outline and its box; shaping is expensive and the same text
     /// is asked for every frame.
     fn cached(&self, req: &TextRequest) -> CachedOutline {
-        let key = TextKey::of_layout(req, tracedraw_core::default_tab_step(), false, false);
+        let key = Self::cache_key(req);
         if let Ok(c) = self.cache.lock() {
             if let Some(hit) = c.get(&key) {
                 return hit.clone();
@@ -4861,7 +4601,7 @@ impl FontSystem {
     /// [`FontSystem::layout`] places its outline, and its other marks
     /// (underlines, strike lines, added hyphens) as curves.
     pub fn glyph_layout(&self, req: &TextRequest) -> GlyphLayout {
-        self.layout_kept(req, true, false).glyph_layout.clone()
+        self.layout_with(req, true, false).glyph_layout
     }
 
     /// [`FontSystem::layout`] of the part of a paragraph text its frame
@@ -4878,56 +4618,11 @@ impl FontSystem {
     /// [`FontSystem::shaped`]): laying it out in another frame only
     /// breaks its lines.
     pub fn is_shaped(&self, req: &TextRequest) -> bool {
-        let key = TextKey::of_shaped(
-            req,
-            tracedraw_core::default_tab_step(),
-            self.generation(),
-            1.0,
-        );
+        let key = self.shaping_key(req, 1.0);
         self.shaped.lock().is_ok_and(|c| c.contains_key(&key))
     }
 
-    /// The layout of a text, the one kept for it if it was laid out
-    /// lately (see [`FontSystem::layout_kept`]).
     fn layout_with(&self, req: &TextRequest, collect: bool, fitted_only: bool) -> TextLayout {
-        (*self.layout_kept(req, collect, fitted_only)).clone()
-    }
-
-    /// The layout of a text, kept for the texts asked for lately: the
-    /// same text is laid out for its outline, its glyphs, its carets and
-    /// for whether it overflows, and a frame being resized lays it out
-    /// again every frame of the drag (#1327). A fit-to-frame text is laid
-    /// out fourteen times over for its size and a type block some dozens
-    /// of times for its line breaks, so the kept layout of the last ask
-    /// is what the next ones start from.
-    fn layout_kept(&self, req: &TextRequest, collect: bool, fitted_only: bool) -> Arc<TextLayout> {
-        let step = tracedraw_core::default_tab_step();
-        let key = TextKey::of_layout(req, step, collect, fitted_only);
-        if let Ok(c) = self.layouts.lock() {
-            if let Some(hit) = c.get(&key) {
-                return hit.clone();
-            }
-        }
-        let layout = Arc::new(self.layout_uncached(req, collect, fitted_only));
-        if let Ok(mut c) = self.layouts.lock() {
-            // Few: what is kept is for the texts being worked on now.
-            // Evict one entry at a time until the new one fits, instead
-            // of clearing everything, as the other caches do: a full
-            // clear made every text lay out again on the next frame.
-            while c.len() >= LAYOUT_KEPT {
-                let Some(k) = c.keys().next().cloned() else {
-                    break;
-                };
-                c.remove(&k);
-            }
-            c.insert(key, layout.clone());
-        }
-        layout
-    }
-
-    /// Lay a text out, computing it: what was laid out lately is asked
-    /// for first (see [`FontSystem::layout_kept`]).
-    fn layout_uncached(&self, req: &TextRequest, collect: bool, fitted_only: bool) -> TextLayout {
         if req.para.type_block && req.frame.is_some() && req.on_path.is_none() {
             if let Some((spans, para)) = self.type_block(req) {
                 let block = TextRequest {
@@ -5011,7 +4706,9 @@ impl FontSystem {
             let mut out: Vec<TextSpan> = Vec::new();
             for &(c, i) in &chars[a..b] {
                 match out.last_mut() {
-                    Some(last) if last_span_is(last, &req.spans[i], scale) => last.text.push(c),
+                    Some(last) if last_span_is(last, &req.spans[i], scale) => {
+                        last.text.push(c)
+                    }
                     _ => {
                         let mut s = req.spans[i].clone();
                         s.size_pt *= scale;
@@ -5058,10 +4755,7 @@ impl FontSystem {
                 para: &plain,
                 on_path: None,
             };
-            self.layout_scaled(&r, 1.0, false, false)
-                .bounds
-                .width()
-                .max(0.0)
+            self.layout_scaled(&r, 1.0, false, false).bounds.width().max(0.0)
         };
         let size_of = |a: usize, b: usize| -> f64 {
             chars[a..b]
@@ -5071,11 +4765,7 @@ impl FontSystem {
         };
         let words: Vec<Vec<(f64, f64)>> = paras
             .iter()
-            .map(|p| {
-                p.iter()
-                    .map(|&(a, b)| (measure(a, b), size_of(a, b)))
-                    .collect()
-            })
+            .map(|p| p.iter().map(|&(a, b)| (measure(a, b), size_of(a, b))).collect())
             .collect();
         // Lines of about `target` natural width: (first word, last word)
         // per paragraph.
@@ -5127,7 +4817,11 @@ impl FontSystem {
                 })
                 .sum()
         };
-        let widest = words.iter().flatten().map(|(w, _)| *w).fold(0.0, f64::max);
+        let widest = words
+            .iter()
+            .flatten()
+            .map(|(w, _)| *w)
+            .fold(0.0, f64::max);
         let longest = (0..words.len())
             .map(|p| {
                 if words[p].is_empty() {
@@ -5201,11 +4895,7 @@ impl FontSystem {
             }
             let mut out: Vec<TextSpan> = Vec::new();
             for (k, &(c, i)) in chars.iter().enumerate() {
-                let c = if breaks.binary_search(&k).is_ok() {
-                    '\n'
-                } else {
-                    c
-                };
+                let c = if breaks.binary_search(&k).is_ok() { '\n' } else { c };
                 let s = scale_at[k];
                 match out.last_mut() {
                     Some(last) if last_span_is(last, &req.spans[i], s) => last.text.push(c),
@@ -5252,6 +4942,20 @@ impl FontSystem {
         Some((spans, block_para))
     }
 
+    /// The key of a text's shaped glyphs: what [`FontSystem::cache_key`]
+    /// holds but the frame, which only the line breaking uses, and the
+    /// font scale of Fit Text to Frame.
+    fn shaping_key(&self, req: &TextRequest, size_scale: f64) -> String {
+        let all = Self::cache_key(&TextRequest {
+            spans: req.spans,
+            frame: None,
+            align: req.align,
+            para: req.para,
+            on_path: None,
+        });
+        format!("{}|{}|{all}", self.generation(), size_scale.to_bits())
+    }
+
     /// The glyphs of a text in paragraphs, shaped, kept for the texts laid
     /// out last: a paragraph frame being resized asks for the same text in
     /// a new frame every frame of the drag, and shaping takes most of a
@@ -5262,12 +4966,7 @@ impl FontSystem {
         size_scale: f64,
         style_of: &dyn Fn(usize) -> &'s (TextAlign, ParagraphStyle),
     ) -> Arc<Shaped> {
-        let key = TextKey::of_shaped(
-            req,
-            tracedraw_core::default_tab_step(),
-            self.generation(),
-            size_scale,
-        );
+        let key = self.shaping_key(req, size_scale);
         if let Ok(c) = self.shaped.lock() {
             if let Some(hit) = c.get(&key) {
                 return hit.clone();
@@ -5284,9 +4983,7 @@ impl FontSystem {
                 // on drawings with many texts.
                 let mut kept: usize = c.values().map(|s| s.glyphs()).sum();
                 while c.len() >= SHAPED_KEPT || kept + glyphs > SHAPED_GLYPHS {
-                    let Some(k) = c.keys().next().cloned() else {
-                        break;
-                    };
+                    let Some(k) = c.keys().next().cloned() else { break };
                     if let Some(old) = c.remove(&k) {
                         kept = kept.saturating_sub(old.glyphs());
                     }
@@ -7610,13 +7307,7 @@ mod tests {
     /// for in every installed font; other characters still are.
     #[test]
     fn private_use_characters_are_not_searched_in_every_font() {
-        for c in [
-            '\u{E000}',
-            '\u{F041}',
-            '\u{F8FF}',
-            '\u{F0000}',
-            '\u{10FFFD}',
-        ] {
+        for c in ['\u{E000}', '\u{F041}', '\u{F8FF}', '\u{F0000}', '\u{10FFFD}'] {
             assert!(!searched_in_every_face(c), "{c:?}");
         }
         for c in ['a', '\u{0915}', '\u{D7FF}', '\u{F900}', '\u{1F600}'] {
@@ -9189,12 +8880,7 @@ mod tests {
         assert!(b.height() <= 80.0 + 2.0, "{b:?}");
         // Narrower and taller: more lines.
         let n = lay(30.0, 120.0);
-        assert!(
-            n.lines.len() > l.lines.len(),
-            "{} vs {}",
-            n.lines.len(),
-            l.lines.len()
-        );
+        assert!(n.lines.len() > l.lines.len(), "{} vs {}", n.lines.len(), l.lines.len());
         // The characters keep their places: the lines cover them all.
         let last = l.lines.last().map(|x| x.end_char).unwrap_or(0);
         assert!(last + 1 >= s.text.chars().count(), "{last}");
@@ -10572,14 +10258,8 @@ mod tests {
             .iter()
             .filter_map(|e| e.end_point())
             .collect();
-        let top = pts
-            .iter()
-            .copied()
-            .fold(pts[0], |a, p| if p.y > a.y { p } else { a });
-        let bottom = pts
-            .iter()
-            .copied()
-            .fold(pts[0], |a, p| if p.y < a.y { p } else { a });
+        let top = pts.iter().copied().fold(pts[0], |a, p| if p.y > a.y { p } else { a });
+        let bottom = pts.iter().copied().fold(pts[0], |a, p| if p.y < a.y { p } else { a });
         assert!(top.x > bottom.x, "{top:?} {bottom:?}");
     }
 
@@ -12753,215 +12433,6 @@ mod tests {
         assert!(layout.lines[0].baseline < plain.lines[0].baseline * 2.0);
         assert!((gap(&layout, 1) - gap(&plain, 1)).abs() < 1e-6);
         assert!((gap(&layout, 2) - gap(&plain, 2)).abs() < 1e-6);
-    }
-
-    /// The key of a layout tells the requests apart: the same text twice
-    /// is one key, and a change to the text, the frame, the alignment,
-    /// the paragraph style, the tab spacing or the way it is asked for is
-    /// another. The shaped glyphs are keyed without the frame, which only
-    /// the line breaking uses.
-    #[test]
-    fn layout_keys_tell_requests_apart() {
-        let spans = [span("key")];
-        let para = ParagraphStyle::default();
-        let req = |spans: &[TextSpan],
-                   frame: Option<Size>,
-                   align: TextAlign,
-                   para: &ParagraphStyle| TextRequest {
-            spans,
-            frame,
-            align,
-            para,
-            on_path: None,
-        };
-        let key_of = |req: &TextRequest, collect: bool, fitted_only: bool, tab_step: f64| {
-            TextKey::of_layout(req, tab_step, collect, fitted_only)
-        };
-        let step = tracedraw_core::default_tab_step();
-        let frame = Some(Size::new(40.0, 20.0));
-        let plain = req(&spans, frame, TextAlign::Left, &para);
-        let key = key_of(&plain, false, false, step);
-        assert_eq!(key, key_of(&plain, false, false, step));
-        // Another frame, artistic text instead of a frame, glyphs instead
-        // of an outline, the part of the frame that shows, another tab
-        // spacing, another text, another alignment or another paragraph
-        // style: another key.
-        let wider = req(&spans, Some(Size::new(50.0, 20.0)), TextAlign::Left, &para);
-        assert_ne!(key, key_of(&wider, false, false, step));
-        let artistic = req(&spans, None, TextAlign::Left, &para);
-        assert_ne!(key, key_of(&artistic, false, false, step));
-        assert_ne!(key, key_of(&plain, true, false, step));
-        assert_ne!(key, key_of(&plain, false, true, step));
-        assert_ne!(key, key_of(&plain, false, false, step + 1.0));
-        let other_text = [span("another")];
-        let other = req(&other_text, frame, TextAlign::Left, &para);
-        assert_ne!(key, key_of(&other, false, false, step));
-        let centred = req(&spans, frame, TextAlign::Center, &para);
-        assert_ne!(key, key_of(&centred, false, false, step));
-        let indented = ParagraphStyle {
-            first_line_indent: 2.0,
-            ..para.clone()
-        };
-        let indented_req = req(&spans, frame, TextAlign::Left, &indented);
-        assert_ne!(key, key_of(&indented_req, false, false, step));
-        // The shaped glyphs of a text in two frames are one key: the
-        // frame only breaks the lines. Another size or another generation
-        // of the fonts is another.
-        let shaped_of = |frame: Option<Size>, size_scale: f64, generation: u64| {
-            let r = req(&spans, frame, TextAlign::Left, &para);
-            TextKey::of_shaped(&r, step, generation, size_scale)
-        };
-        assert_eq!(
-            shaped_of(Some(Size::new(40.0, 20.0)), 1.0, 3),
-            shaped_of(Some(Size::new(80.0, 20.0)), 1.0, 3)
-        );
-        assert_ne!(
-            shaped_of(Some(Size::new(40.0, 20.0)), 1.0, 3),
-            shaped_of(None, 2.0, 3)
-        );
-        assert_ne!(
-            shaped_of(Some(Size::new(40.0, 20.0)), 1.0, 3),
-            shaped_of(None, 1.0, 4)
-        );
-    }
-
-    /// A layout is kept for the next asking: the same text asked for
-    /// again, as an outline or as a layout, answers what the first
-    /// asking did. Another text, or the same one at another tab spacing,
-    /// is another layout.
-    #[test]
-    fn a_layout_is_kept_for_the_next_asking() {
-        if !has_fonts() {
-            return;
-        }
-        let f = fonts();
-        let spans = [span("kept for the next asking")];
-        let para = ParagraphStyle::default();
-        let req = TextRequest {
-            spans: &spans,
-            frame: None,
-            align: TextAlign::Left,
-            para: &para,
-            on_path: None,
-        };
-        let step = tracedraw_core::default_tab_step();
-        let first = f.layout(&req);
-        let key = TextKey::of_layout(&req, step, false, false);
-        assert!(
-            f.layouts.lock().unwrap().contains_key(&key),
-            "the layout is kept"
-        );
-        let again = f.layout(&req);
-        assert_eq!(first.path, again.path);
-        assert_eq!(first.lines.len(), again.lines.len());
-        assert_eq!(first.bounds, again.bounds);
-        // The outline is kept with it: the same text asked for as an
-        // outline twice is the same path, not two layings out.
-        let a = f.outline_cached(&req);
-        let b = f.outline_cached(&req);
-        assert!(Arc::ptr_eq(&a, &b));
-        // Another text is another layout, not the first one kept.
-        let other = [span("another text")];
-        let other_req = TextRequest {
-            spans: &other,
-            frame: None,
-            align: TextAlign::Left,
-            para: &para,
-            on_path: None,
-        };
-        let other_key = TextKey::of_layout(&other_req, step, false, false);
-        assert_ne!(key, other_key);
-        assert!(!f.layouts.lock().unwrap().contains_key(&other_key));
-        let other_layout = f.layout(&other_req);
-        assert_ne!(first.path, other_layout.path);
-        // Another tab spacing is another layout too: the one kept is not
-        // answered for it.
-        let moved = TextKey::of_layout(&req, step + 3.0, false, false);
-        assert_ne!(key, moved);
-        assert!(!f.layouts.lock().unwrap().contains_key(&moved));
-    }
-
-    /// A fit-to-frame text is laid out once for its size: the fourteen
-    /// layings out of the search are not repeated for the next asking,
-    /// and the whole layout is kept on its own, apart from the one of
-    /// what the frame shows.
-    #[test]
-    fn a_fit_to_frame_text_keeps_its_layout() {
-        if !has_fonts() {
-            return;
-        }
-        let f = fonts();
-        let text = "one two three four five six seven eight nine ten ".repeat(6);
-        let spans = [span(&text)];
-        let para = ParagraphStyle {
-            fit_to_frame: true,
-            ..ParagraphStyle::default()
-        };
-        let req = TextRequest {
-            spans: &spans,
-            frame: Some(Size::new(40.0, 30.0)),
-            align: TextAlign::Left,
-            para: &para,
-            on_path: None,
-        };
-        let step = tracedraw_core::default_tab_step();
-        let fitted = f.layout_fitted(&req);
-        let fitted_key = TextKey::of_layout(&req, step, false, true);
-        assert!(
-            f.layouts.lock().unwrap().contains_key(&fitted_key),
-            "the fitted layout is kept"
-        );
-        let fitted_again = f.layout_fitted(&req);
-        assert_eq!(fitted.path, fitted_again.path);
-        assert_eq!(fitted.lines.len(), fitted_again.lines.len());
-        // The whole layout is another asking, kept on its own.
-        let whole_key = TextKey::of_layout(&req, step, false, false);
-        assert_ne!(fitted_key, whole_key);
-        let whole = f.layout(&req);
-        assert!(f.layouts.lock().unwrap().contains_key(&whole_key));
-        assert!(whole.lines.len() >= fitted.lines.len());
-        // The glyphs are asked for on their own and kept with their own
-        // key.
-        let glyphs = f.glyph_layout(&req);
-        let glyph_key = TextKey::of_layout(&req, step, true, false);
-        assert!(f.layouts.lock().unwrap().contains_key(&glyph_key));
-        assert_eq!(glyphs.glyphs.len(), f.glyph_layout(&req).glyphs.len());
-    }
-
-    /// The kept layouts stay few: laying out more texts than the cache
-    /// holds drops the earliest ones one at a time and keeps the latest,
-    /// instead of clearing them all out.
-    #[test]
-    fn the_kept_layouts_stay_few() {
-        const QUICKSAND: &[u8] = include_bytes!("../testdata/Quicksand-VF.ttf");
-        let mut db = fontdb::Database::new();
-        db.load_font_data(QUICKSAND.to_vec());
-        let f = FontSystem::from_db(db);
-        let para = ParagraphStyle::default();
-        let mut keys = Vec::new();
-        for n in 0..(LAYOUT_KEPT * 2) {
-            let mut s = span(&n.to_string());
-            s.font_family = "Quicksand".into();
-            let spans = [s];
-            let req = TextRequest {
-                spans: &spans,
-                frame: None,
-                align: TextAlign::Left,
-                para: &para,
-                on_path: None,
-            };
-            f.layout(&req);
-            keys.push(TextKey::of_layout(
-                &req,
-                tracedraw_core::default_tab_step(),
-                false,
-                false,
-            ));
-        }
-        let kept = f.layouts.lock().unwrap();
-        assert!(kept.len() <= LAYOUT_KEPT, "{} kept", kept.len());
-        assert!(kept.contains_key(&keys[keys.len() - 1]), "the latest is in");
-        assert!(!kept.contains_key(&keys[0]), "the earliest is out");
     }
 }
 

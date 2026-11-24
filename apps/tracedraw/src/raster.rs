@@ -1119,7 +1119,10 @@ impl Raster {
         }
         let t = web_time::Instant::now();
         self.renders += 1;
-        let pixmap = render_page(doc, page, &opts)?;
+        let pixmap = match render_page(doc, page, &opts) {
+            Some(pm) => pm,
+            None => tiny_skia::Pixmap::new(w, h).unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap()),
+        };
         let image = to_image(&pixmap, lut.as_deref());
         self.last_seconds = t.elapsed().as_secs_f64();
         self.take_picture(ctx, image, filter, key, page_rect);

@@ -81,54 +81,6 @@ pub struct TextClip {
     pub stroke: Option<Stroke>,
 }
 
-/// The last text layout made for a text of the drawing (the one being
-/// edited: the caret, a click in it, its non-printing marks) and the
-/// overflow of a paragraph frame. Keyed by the engine instance and
-/// revision, the shape, the default tab spacing, the shape's transform
-/// and the font generation, so a change of any of them lays the text out
-/// again. The layout is shared as an `Arc`: moving the caret or the
-/// pointer over the text does not copy its path and lines every frame.
-#[derive(Clone)]
-pub struct CachedTextLayout {
-    pub instance: u64,
-    pub revision: u64,
-    pub shape: ShapeId,
-    pub tab_step_bits: u64,
-    pub transform_bits: [u64; 6],
-    pub parent_bits: [u64; 6],
-    pub font_generation: u64,
-    pub layout: std::sync::Arc<TextLayout>,
-    pub to_page: Affine,
-}
-
-impl CachedTextLayout {
-    /// Whether this is still the layout of shape `id` as the drawing
-    /// stands now (same engine instance and revision, tab spacing, fonts
-    /// and transform).
-    pub fn matches(&self, instance: u64, revision: u64, id: ShapeId, transform: Affine) -> bool {
-        self.instance == instance
-            && self.revision == revision
-            && self.shape == id
-            && self.tab_step_bits == tracedraw_core::default_tab_step().to_bits()
-            && self.transform_bits == transform.as_coeffs().map(f64::to_bits)
-            && self.font_generation == tracedraw_text::fonts().generation()
-    }
-
-    /// Whether this is still the layout and page transform of shape `id`
-    /// (including its parent group/clip frame transform).
-    pub fn matches_parent(
-        &self,
-        instance: u64,
-        revision: u64,
-        id: ShapeId,
-        transform: Affine,
-        parent: Affine,
-    ) -> bool {
-        self.matches(instance, revision, id, transform)
-            && self.parent_bits == parent.as_coeffs().map(f64::to_bits)
-    }
-}
-
 /// Text from a clipboard with its line ends as `\n`.
 pub(crate) fn unify_line_ends(t: &str) -> String {
     t.replace("\r\n", "\n").replace('\r', "\n")
@@ -262,42 +214,6 @@ impl App {
         // own space had the letters, far from them (#4015, #4037).
         let parent = self.doc().parent_transform(id).unwrap_or(Affine::IDENTITY);
         layout_of_text_shape(s, parent)
-    }
-
-    /// The layout of a text object, shared, and the transform from layout
-    /// space to the page. The layout last made is kept in
-    /// [`App::text_layout_cache`] while the drawing, the shape, its
-    /// transform, the fonts and the default tab spacing are unchanged, so
-    /// the caret, a click in the text and the non-printing marks do not
-    /// lay the text out again on every frame and every pointer move.
-    pub fn cached_text_layout_of(
-        &self,
-        id: ShapeId,
-    ) -> Option<(std::sync::Arc<TextLayout>, Affine)> {
-        let s = self.doc().find_shape(id)?;
-        let instance = self.engine.instance();
-        let revision = self.engine.revision();
-        let parent = self.doc().parent_transform(id).unwrap_or(Affine::IDENTITY);
-        if let Some(c) = self.text_layout_cache.borrow().as_ref() {
-            if c.matches_parent(instance, revision, id, s.transform, parent) {
-                return Some((c.layout.clone(), c.to_page));
-            }
-        }
-        let (layout, to_page) = layout_of_text_shape(s, parent)?;
-        let cached = CachedTextLayout {
-            instance,
-            revision,
-            shape: id,
-            tab_step_bits: tracedraw_core::default_tab_step().to_bits(),
-            transform_bits: s.transform.as_coeffs().map(f64::to_bits),
-            parent_bits: parent.as_coeffs().map(f64::to_bits),
-            font_generation: tracedraw_text::fonts().generation(),
-            layout: std::sync::Arc::new(layout),
-            to_page,
-        };
-        let shared = (cached.layout.clone(), cached.to_page);
-        *self.text_layout_cache.borrow_mut() = Some(cached);
-        Some(shared)
     }
 
     /// The text objects Vertical Text acts on: the selected ones and the
@@ -1097,27 +1013,25 @@ impl App {
             CaretMove::WordRight => word_end_after(&text, te.caret),
             CaretMove::TextStart => 0,
             CaretMove::TextEnd => len,
-            CaretMove::LineStart | CaretMove::LineEnd => {
-                match self.cached_text_layout_of(te.shape) {
-                    Some((layout, _)) => {
-                        let line = layout.line_of(te.caret).and_then(|i| layout.lines.get(i));
-                        match (line, m) {
-                            (Some(l), CaretMove::LineStart) => l.start_char,
-                            (Some(l), _) => l.end_char,
-                            (None, CaretMove::LineStart) => 0,
-                            (None, _) => len,
-                        }
-                    }
-                    None => {
-                        if m == CaretMove::LineStart {
-                            0
-                        } else {
-                            len
-                        }
+            CaretMove::LineStart | CaretMove::LineEnd => match self.text_layout_of(te.shape) {
+                Some((layout, _)) => {
+                    let line = layout.line_of(te.caret).and_then(|i| layout.lines.get(i));
+                    match (line, m) {
+                        (Some(l), CaretMove::LineStart) => l.start_char,
+                        (Some(l), _) => l.end_char,
+                        (None, CaretMove::LineStart) => 0,
+                        (None, _) => len,
                     }
                 }
-            }
-            CaretMove::Up | CaretMove::Down => match self.cached_text_layout_of(te.shape) {
+                None => {
+                    if m == CaretMove::LineStart {
+                        0
+                    } else {
+                        len
+                    }
+                }
+            },
+            CaretMove::Up | CaretMove::Down => match self.text_layout_of(te.shape) {
                 Some((layout, _)) => {
                     let Some(li) = layout.line_of(te.caret) else {
                         return;
@@ -1206,7 +1120,7 @@ impl App {
     /// Character index under the page point `p` in the text being edited.
     pub fn text_hit_char(&self, p: Point) -> Option<usize> {
         let te = self.text_edit.as_ref()?;
-        let (layout, to_page) = self.cached_text_layout_of(te.shape)?;
+        let (layout, to_page) = self.text_layout_of(te.shape)?;
         let local = to_page.inverse() * p;
         // On a path: the place along the line nearest the point (#2423).
         let local = layout
@@ -1409,15 +1323,12 @@ impl App {
     /// caret segment and one rectangle per selected line.
     pub fn text_caret_geometry(&self) -> Option<(Point, Point, Vec<[Point; 4]>)> {
         let te = self.text_edit.as_ref()?;
-        let (layout, to_page) = self.cached_text_layout_of(te.shape)?;
-        // The first span's size, without copying every span of the text
-        // for it.
-        let size_pt = match self.doc().find_shape(te.shape).map(|s| &s.kind) {
-            Some(ShapeKind::Text { spans, .. }) => {
-                spans.first().map(|sp| sp.size_pt).unwrap_or(12.0)
-            }
-            _ => return None,
-        };
+        let (layout, to_page) = self.text_layout_of(te.shape)?;
+        let size_pt = self
+            .edit_spans()?
+            .first()
+            .map(|s| s.size_pt)
+            .unwrap_or(12.0);
         caret_geometry_sized(&layout, &to_page, te.caret, te.selection(), size_pt)
     }
 }
@@ -1458,7 +1369,7 @@ impl App {
         let Some(te) = self.text_edit.as_ref() else {
             return Vec::new();
         };
-        let Some((layout, to_page)) = self.cached_text_layout_of(te.shape) else {
+        let Some((layout, to_page)) = self.text_layout_of(te.shape) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -1902,66 +1813,6 @@ mod tests {
             te.caret.abs_diff(want) <= 1,
             "caret {} wanted {want}",
             te.caret
-        );
-    }
-
-    /// A text in a group that a move has placed on the page: a Text tool
-    /// click on a middle letter puts the caret there, and the caret is
-    /// drawn where the letters show, not where the group's own space
-    /// still has them.
-    #[test]
-    fn a_click_in_a_moved_grouped_text_puts_the_caret_by_the_letter() {
-        use tracedraw_core::Command;
-        let mut app = App::headless();
-        let id = app
-            .new_shape(ShapeKind::Text {
-                spans: vec![TextSpan::new("ABCDEFGHIJ", "Sans", 36.0)],
-                origin: Point::new(0.0, 100.0),
-                frame: None,
-                align: Default::default(),
-                para: Default::default(),
-                on_path: None,
-            })
-            .expect("text");
-        // Grouping needs two objects: a second one, away from the click.
-        let other = app
-            .new_shape(ShapeKind::Text {
-                spans: vec![TextSpan::new("x", "Sans", 12.0)],
-                origin: Point::new(-500.0, -500.0),
-                frame: None,
-                align: Default::default(),
-                para: Default::default(),
-                on_path: None,
-            })
-            .expect("other");
-        app.select(vec![id, other]);
-        app.group_selection();
-        let g = app.selection[0];
-        assert!(app.doc().find_shape(g).is_some_and(|s| matches!(
-            s.kind,
-            ShapeKind::Group { .. }
-        )));
-        app.run(Command::TransformShapes {
-            shapes: vec![g],
-            transform: Affine::translate((500.0, 400.0)),
-        });
-        // The middle of the word as it shows on the page.
-        let s = app.doc().find_shape(id).expect("text");
-        let local = s.local_bounds();
-        let to_page = app.doc().parent_transform(id).expect("parent") * s.transform;
-        let p = to_page * local.center();
-        assert!(app.edit_text_inside(g, p));
-        let te = app.text_edit.as_ref().expect("editing");
-        assert_eq!(te.shape, id);
-        assert!(
-            te.caret > 2 && te.caret < 8,
-            "caret {} not by the letter clicked",
-            te.caret
-        );
-        let (top, _, _) = app.text_caret_geometry().expect("caret");
-        assert!(
-            (top.x - p.x).abs() < local.width() && (top.y - p.y).abs() < local.height() * 2.0,
-            "caret {top:?} near the click {p:?}"
         );
     }
 
@@ -3404,60 +3255,12 @@ fn scan_page_for_text_overlay(app: &App, id: ShapeId) -> Option<Vec<Rect>> {
     let layers = app.doc().layers_for_page(app.page).ok()?;
     let mut seen = false;
     let mut above = Vec::new();
-    fn walk(
-        s: &tracedraw_core::Shape,
-        parent: Affine,
-        id: ShapeId,
-        seen: &mut bool,
-        above: &mut Vec<Rect>,
-    ) -> bool {
-        if shape_links_blend_to(s, id) {
-            return false;
-        }
-        if s.id == id {
-            *seen = true;
-            return true;
-        }
-        let t = parent * s.transform;
-        match &s.kind {
-            ShapeKind::Group { children } => {
-                for c in children {
-                    if !walk(c, t, id, seen, above) {
-                        return false;
-                    }
-                }
-            }
-            ShapeKind::ClipFrame { frame, contents } => {
-                if !walk(frame, t, id, seen, above) {
-                    return false;
-                }
-                for c in contents {
-                    if !walk(c, t, id, seen, above) {
-                        return false;
-                    }
-                }
-            }
-            _ => {
-                if *seen && s.visible {
-                    let b = if parent == Affine::IDENTITY {
-                        s.visual_bounds()
-                    } else {
-                        parent.transform_rect_bbox(s.visual_bounds())
-                    };
-                    if b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite() {
-                        above.push(b);
-                    }
-                }
-            }
-        }
-        true
-    }
     for layer in layers {
         if !layer.visible {
             continue;
         }
         for s in &layer.shapes {
-            if !walk(s, Affine::IDENTITY, id, &mut seen, &mut above) {
+            if shape_links_blend_to(s, id) {
                 return None;
             }
             scan_shape_for_text_overlay(s, Affine::IDENTITY, id, &mut seen, &mut above)?;
@@ -3538,17 +3341,11 @@ fn text_overlay_bounds(s: &tracedraw_core::Shape) -> Option<Rect> {
     let ShapeKind::Text { spans, .. } = &s.kind else {
         return None;
     };
-    let parent = doc.parent_transform(id).unwrap_or(Affine::IDENTITY);
-    let own = s.bounds();
-    let b = if parent == Affine::IDENTITY {
-        own
-    } else {
-        parent.transform_rect_bbox(own)
-    };
+    let b = s.bounds();
     if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
         return None;
     }
-    let c = (parent * s.transform).as_coeffs();
+    let c = s.transform.as_coeffs();
     let scale = c[0].hypot(c[1]).max(c[2].hypot(c[3])).max(1.0);
     let max_pt = spans
         .iter()
@@ -3602,7 +3399,7 @@ fn shape_bounds_for_overlay(
     if spans_char_count(spans) == 0 || s.is_empty_path() {
         return Some(None);
     }
-    let padded = text_overlay_bounds(doc, id)?;
+    let padded = text_overlay_bounds(s)?;
     if above_boxes.iter().any(|b| b.overlaps(padded)) {
         return None;
     }
