@@ -11,6 +11,7 @@
 //! Under the sliders a harmony list and a row of swatches offer colours
 //! that go with the one picked; a click on a swatch picks it (#1498).
 
+use crate::ui::btn_icons::IconUi;
 use crate::i18n::tr;
 use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
@@ -267,7 +268,7 @@ pub fn model_list(ui: &mut Ui, id: Id, c: &mut Color) -> bool {
             ui.separator();
             let reg = shown == REGISTRATION;
             if ui
-                .selectable_label(reg, tr("docker.registration"))
+                .iselectable(reg, "docker.registration")
                 .rich_tip(tr("docker.registration_tip"))
                 .clicked()
                 && !reg
@@ -489,12 +490,32 @@ pub fn eyedropper(ui: &mut Ui, id: Id, c: &mut Color) -> bool {
 
 /// A colour swatch that opens the picker. True when the colour changed.
 pub fn color_button(ui: &mut Ui, c: &mut Color) -> bool {
+    color_button_with_opacity(ui, c, 1.0)
+}
+
+/// A swatch that shows paint opacity over a checkerboard.
+pub(crate) fn color_button_with_opacity(ui: &mut Ui, c: &mut Color, opacity: f64) -> bool {
     let (swatch, resp) = ui.allocate_exact_size(Vec2::new(40.0, 18.0), Sense::click());
     let resp = resp.rich_tip(crate::ui::tips::keyed("color_picker.button"));
     let id = resp.id.with("color_picker");
     let [r, g, b] = c.to_rgb8();
+    let inside = swatch.shrink(1.0);
+    if opacity < 1.0 {
+        let painter = ui.painter().with_clip_rect(inside);
+        for y in 0..4 {
+            for x in 0..10 {
+                let rect = Rect::from_min_size(
+                    inside.min + Vec2::new(x as f32 * 4.0, y as f32 * 4.0),
+                    Vec2::splat(4.0),
+                );
+                let gray = if (x + y) % 2 == 0 { 210 } else { 135 };
+                painter.rect_filled(rect, 0.0, Color32::from_gray(gray));
+            }
+        }
+    }
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     ui.painter()
-        .rect_filled(swatch.shrink(1.0), 2.0, Color32::from_rgb(r, g, b));
+        .rect_filled(inside, 2.0, Color32::from_rgba_unmultiplied(r, g, b, alpha));
     ui.painter().rect_stroke(
         swatch,
         2.0,

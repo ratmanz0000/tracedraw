@@ -583,7 +583,8 @@ impl App {
         }
     }
 
-    /// A colour dropped on the end handle: the shadow takes it (one step).
+    /// A palette colour clicked or dropped on the end handle: the shadow
+    /// takes it (one step).
     pub fn set_shadow_color(&mut self, shape: ShapeId, color: Color) {
         let Some(mut sh) = self.doc().find_shape(shape).and_then(|s| s.shadow) else {
             return;
@@ -593,6 +594,66 @@ impl App {
             shapes: vec![shape],
             shadow: Some(sh),
         });
+    }
+
+    /// The preset applied to a detached render snapshot while hovered.
+    pub(crate) fn shadow_preset_preview(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<(std::sync::Arc<tracedraw_core::Document>, u64)> {
+        let id = egui::Id::new("shadow_preset_hover");
+        let (frame, preset, inner) = ctx.data(|data| {
+            data.get_temp::<(u64, &'static str, bool)>(id)
+        })?;
+        // A floating property bar is drawn after the canvas.
+        if ctx.cumulative_frame_nr().saturating_sub(frame) > 1 || self.selection.is_empty() {
+            return None;
+        }
+        let expected_tool = if inner { crate::tools::Tool::InnerShadow } else { crate::tools::Tool::DropShadow };
+        if self.tool != expected_tool {
+            return None;
+        }
+        let key = egui::Id::new(("shadow_preset_snapshot", self.engine.revision(), self.active_doc, self.page, &self.selection, preset, inner));
+        type Snapshot = (egui::Id, std::sync::Arc<tracedraw_core::Document>);
+        let cache = egui::Id::new("shadow_preset_snapshot");
+        if let Some((kept, doc)) = ctx.data(|data| data.get_temp::<Snapshot>(cache)) {
+            if kept == key {
+                return Some((doc, key.value()));
+            }
+        }
+        let (_, preset) = Shadow::presets().into_iter().find(|(name, _)| *name == preset)?;
+        let mut doc = self.doc().clone();
+        if inner {
+            let effect = self.inner_effect_for_preset(preset);
+            for &id in &self.selection {
+                let Some(shape) = doc.find_shape(id) else { continue };
+                let mut effects = shape.effects.clone();
+                effects.retain(|e| !matches!(e, Effect::InnerShadow { .. }));
+                effects.push(effect.clone());
+                Command::SetEffects { shape: id, effects }.apply(&mut doc).ok()?;
+            }
+        } else {
+            let color = self.shadow_bar_shadow().color;
+            Command::SetShadow {
+                shapes: self.selection.clone(),
+                shadow: Some(Shadow { color, ..preset }),
+            }.apply(&mut doc).ok()?;
+        }
+        let doc = std::sync::Arc::new(doc);
+        ctx.data_mut(|data| data.insert_temp(cache, (key, doc.clone())));
+        Some((doc, key.value()))
+    }
+
+    pub(crate) fn inner_effect_for_preset(&self, preset: Shadow) -> Effect {
+        let style = self.selected_inner_shadow_at().map_or(self.inner_shadow, |(_, style)| style);
+        Effect::InnerShadow {
+            offset: preset.offset,
+            color: style.color,
+            opacity: preset.opacity,
+            blur: preset.blur,
+            merge: preset.merge,
+            spread: style.spread,
+        }
     }
 
     /// Apply built-in preset `id` to the selection's shadows (and make it
@@ -662,8 +723,10 @@ impl App {
                 made.push(new_id);
             };
             // The drop shadow, at the back.
-            if s.shadow.is_some_and(|sh| sh.opacity > 0.0) {
-                if let Some(bitmap) = self.shadow_bitmap(&s) {
+            if let Some(shadow) = s.shadow.filter(|sh| sh.opacity > 0.0) {
+                if let Some(mut bitmap) = self.shadow_bitmap(&s) {
+                    bitmap.fill = Fill::Solid(shadow.color);
+                    bitmap.bitmap_alpha_fill = true;
                     place(bitmap, false, &mut cmds);
                     cmds.push(Command::SetShadow {
                         shapes: vec![id],
@@ -728,7 +791,10 @@ impl App {
             _ => None,
         })?;
         let (rect, pm) = tracedraw_render::render_inner_shadow_image(s, BREAK_APART_DPI)?;
-        self.shadow_pixels_bitmap(rect, &pm, color, merge)
+        let mut bitmap = self.shadow_pixels_bitmap(rect, &pm, color, merge)?;
+        bitmap.fill = Fill::Solid(color);
+        bitmap.bitmap_alpha_fill = true;
+        Some(bitmap)
     }
 
     /// The bitmap object that stands for the shadow of `s`.
@@ -826,6 +892,34 @@ mod tests {
 
     fn shadow(app: &App, id: ShapeId) -> Option<Shadow> {
         app.doc().find_shape(id).and_then(|s| s.shadow)
+    }
+
+    #[test]
+    fn shadow_preset_hover_only_changes_the_render_snapshot() {
+        let (mut app, id) = app_with_rect();
+        let ctx = egui::Context::default();
+        let hover = egui::Id::new("shadow_preset_hover");
+        let preset = Shadow::presets().into_iter().find(|(_, sh)| sh.perspective.is_none()).expect("flat preset").0;
+        let revision = app.engine.revision();
+        let undo = app.engine.last_step_id();
+        for (inner, tool) in [(false, crate::tools::Tool::DropShadow), (true, crate::tools::Tool::InnerShadow)] {
+            app.set_tool(tool);
+            let frame = ctx.cumulative_frame_nr();
+            ctx.data_mut(|data| data.insert_temp(hover, (frame, preset, inner)));
+            let (doc, _) = app.shadow_preset_preview(&ctx).expect("preview");
+            let preview = doc.find_shape(id).expect("preview shape");
+            if inner {
+                assert!(preview.effects.iter().any(|e| matches!(e, Effect::InnerShadow { .. })));
+            } else {
+                assert!(preview.shadow.is_some());
+            }
+            let original = app.doc().find_shape(id).expect("original shape");
+            assert!(original.shadow.is_none() && original.effects.is_empty());
+            assert_eq!(app.engine.revision(), revision);
+            assert_eq!(app.engine.last_step_id(), undo);
+        }
+        ctx.data_mut(|data| data.remove::<(u64, &'static str, bool)>(hover));
+        assert!(app.shadow_preset_preview(&ctx).is_none());
     }
 
     /// #2217: the shadow of an object with an envelope is measured on the

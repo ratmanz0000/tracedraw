@@ -190,7 +190,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     // while transforming on (Options > Display, #3569), the objects
     // themselves are drawn there too.
     let live = preview.filter(|_| app.settings.live_transform_preview);
-    draw_page(app, painter, rect, live);
+    let live_ready = draw_page(app, painter, rect, live);
     crate::pixel_edit_app::draw(app, painter);
     let doc: &Document = app.doc();
     draw_text_frames(app, painter, preview);
@@ -202,7 +202,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     }
     // Selection.
     match preview {
-        Some(_) if !shows_transform_outline(app, live.is_some()) => {}
+        Some(_) if !shows_transform_outline(app, live_ready) => {}
         Some(t) => draw_transform_outline(app, painter, t),
         None => draw_selection(app, painter, None),
     }
@@ -752,7 +752,7 @@ fn draw_page_margins(app: &App, painter: &Painter) {
 /// The window's background, the page with its shadow and border, bleed
 /// and printable area, the grids, and the objects rendered (`preview`
 /// moves the selection while it is dragged).
-fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>) {
+fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>) -> bool {
     let view = &app.view;
     let clean_sheet = app.symbol_edit_index().is_some();
     painter.rect_filled(
@@ -779,11 +779,19 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     let without_picture = app.pixel_edit_doc();
     // View > Separations: the page as one ink prints it.
     let one_ink = app.separation_view_doc();
+    let shadow_preview = (without_copies.is_none()
+        && without_picture.is_none()
+        && one_ink.is_none()
+        && preview.is_none()
+        && app.node_drag_revision().is_none())
+    .then(|| app.shadow_preset_preview(painter.ctx()))
+    .flatten();
     // Text being typed in place (#3904): the page beneath it stays at its
     // clean revision while the edited text shape draws as a small overlay.
     let text_bg = if without_picture.is_none()
         && without_copies.is_none()
         && one_ink.is_none()
+        && shadow_preview.is_none()
         && preview.is_none()
         && app.node_drag_revision().is_none()
     {
@@ -798,6 +806,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         .or(without_picture.as_deref())
         .or(without_copies.as_deref())
         .or(one_ink.as_deref())
+        .or_else(|| shadow_preview.as_ref().map(|(doc, _)| doc.as_ref()))
         .unwrap_or(app.doc());
     // Nodes being dragged: the drawing as it was before the drag, its
     // picture already made, until the button is released (#1259).
@@ -820,6 +829,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
             (true, Some(p)) => (1u64 << 60) ^ ((p as u64 + 1) << 48),
             _ => 0,
         };
+    let revision = shadow_preview.as_ref().map_or(revision, |(_, key)| *key);
     // Paragraph text being resized keeps its letters while the frame
     // follows the drag (the drag outline shows the text flowed anew); a
     // text fitted to a path stays on it, its letters scaled on release
@@ -852,7 +862,9 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // The drawing as it stands is shared with the render for nothing:
     // no copy of it on the window's thread at each change (#3440).
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some((Some(hidden), _)) = &text_bg {
+    if let Some((preview, _)) = &shadow_preview {
+        app.raster.borrow_mut().snapshot = Some(preview.clone());
+    } else if let Some((Some(hidden), _)) = &text_bg {
         app.raster.borrow_mut().snapshot = Some(hidden.clone());
     } else if revision == app.engine.revision() && std::ptr::eq(doc, app.engine.document()) {
         app.raster.borrow_mut().snapshot = Some(app.engine.shared_document());
@@ -864,6 +876,13 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     {
         let mut raster = app.raster.borrow_mut();
         raster.light_zoom = app.settings.light_zoom;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            raster.drag_backdrop_enabled = preview.is_some()
+                && matches!(app.drag, Drag::Move { .. })
+                && std::ptr::eq(doc, app.engine.document())
+                && app.zoom_glide.target_view().is_none();
+        }
         // A fill or an outline colour dragged in a colour picker: the
         // part of the page the selection covers, so each move renders
         // only it anew, not the whole page (#3559).
@@ -882,13 +901,37 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         // at the same view the picture was drawn for.
         raster.zoom_target = app.zoom_glide.target_view();
     }
-    let main = app.raster.borrow_mut().texture(
+    // Keep sharp pixels just outside the main canvas for a small pan.
+    // Pixels view keeps its own sampling window.
+    let render_rect = if cfg!(not(target_arch = "wasm32"))
+        && app.view_mode != crate::app::ViewMode::Pixels
+    {
+        let ppp = painter.ctx().pixels_per_point();
+        let limit = painter.ctx().input(|i| i.max_texture_side) as f32;
+        let margin_px = 64.0_f32.min(rect.width().min(rect.height()) * ppp * 0.06).floor();
+        let expanded = rect.expand(margin_px / ppp);
+        if expanded.width().max(expanded.height()) * ppp + 2.0 <= limit {
+            let now = painter.ctx().input(|i| i.time);
+            app.raster.borrow_mut().pan_render_rect(view, rect, margin_px / ppp, now)
+        } else {
+            rect
+        }
+    } else {
+        rect
+    };
+    app.raster.borrow_mut().main_viewport =
+        cfg!(not(target_arch = "wasm32")).then_some(rect);
+    let retained = app.node_drag_revision().and_then(|revision| {
+        app.raster.borrow().node_drag_picture(app.page, revision, view)
+    });
+    let main = retained.or_else(|| {
+        app.raster.borrow_mut().texture(
         painter.ctx(),
         doc,
         app.page,
         view,
-        rect,
-        preview_ids,
+        render_rect,
+        preview_ids.clone(),
         revision,
         app.wireframe,
         app.simulate_overprints,
@@ -896,7 +939,8 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         app.proof_colors,
         app.render_focus(),
         (app.view_mode == crate::app::ViewMode::Pixels).then(|| app.document_dpi()),
-    );
+        )
+    });
     let main_rendered = app.raster.borrow().render_count() != renders_before;
     // SMOOTH_ZOOM_NO_BACKDROP: kept false so the small whole-page backdrop
     // (#2048) covers the paper around the screen texture while zooming out
@@ -1018,6 +1062,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         crate::multipage::draw_other_pages(app, painter, rect, started, main_rendered);
     }
 
+    let mut live_ready = false;
     if let Some((tex, at)) = main {
         // The bands of the new picture done so far, sharp over the last
         // one while it is shown scaled after a zoom (#2389). Under them
@@ -1044,8 +1089,12 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
                 }
             }
         }
+        live_ready = covered.is_empty()
+            && preview_ids.as_ref().is_some_and(|(ids, t)| {
+                app.raster.borrow().shows_transform(tex, app.page, revision, ids, *t)
+            });
         if covered.is_empty() {
-            painter.image(tex, at, full, Color32::WHITE);
+            painter.with_clip_rect(rect).image(tex, at, full, Color32::WHITE);
         } else {
             for part in outside(at.intersect(rect), covered) {
                 painter
@@ -1055,10 +1104,14 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((bands, bands_at, _)) = incoming {
-            painter.image(bands, bands_at, full, Color32::WHITE);
+            painter.with_clip_rect(rect).image(bands, bands_at, full, Color32::WHITE);
         }
         app.paint_edited_text_overlay(painter, rect);
     }
+    // A contour or shadow being dragged: the object alone, small, until
+    // the page's picture shows the drag's latest state (D#4226).
+    let shown_rev = app.raster.borrow().shown_revision();
+    crate::effect_drag_preview::paint(app, painter, revision, shown_rev);
 
     if !clean_sheet {
         draw_page_margins(app, painter);
@@ -1068,8 +1121,10 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     }
     draw_pixel_grid(app, painter, rect);
     draw_empty_clip_frames(app, painter);
+    draw_edited_clip_frame(app, painter);
     crate::cut_tools::paint_grid_preview(app, painter);
     crate::dialog_preview::paint(app, painter);
+    live_ready
 }
 
 /// The part of the page a fill or an outline colour dragged in a colour
@@ -1487,7 +1542,12 @@ fn draw_drop_frame(app: &App, painter: &Painter) {
         return;
     };
     let at = app.view.to_screen(p) + egui::vec2(18.0, 24.0);
-    let lines = drop_frame_hints(app.drop_keys, app.clip_frame_is_empty(frame));
+    let lines = if matches!(s.kind, ShapeKind::ClipFrame { .. }) {
+        drop_frame_hints(app.drop_keys, app.clip_frame_is_empty(frame))
+    } else {
+        // A closed object W was held over: a new clip frame (#4227).
+        vec![("hint.drop_frame_new", true)]
+    };
     let font = egui::FontId::proportional(12.0);
     let galleys: Vec<_> = lines
         .iter()
@@ -1582,13 +1642,11 @@ fn draw_drop_colour(app: &App, painter: &Painter) {
     if action == DropAction::CopyFill && app.drop_frame.is_some() {
         return;
     }
-    draw_drop_style(app, painter, action, target);
+    draw_drop_target(app, painter, action, target);
 }
 
-/// Object `target` outlined in the selection colour and, under the
-/// pointer, what a drop there copies onto it (a left-button move with
-/// Alt, a right-button drag with Shift, Alt or Ctrl; discussion #2066).
-pub(crate) fn draw_drop_style(
+/// Outline the drop target and show the available action by the pointer.
+pub(crate) fn draw_drop_target(
     app: &App,
     painter: &Painter,
     action: crate::drop_menu::DropAction,
@@ -1597,10 +1655,24 @@ pub(crate) fn draw_drop_style(
     let Some(s) = app.doc().find_shape(target) else {
         return;
     };
-    let accent = Tokens::ACCENT;
-    for (pts, _) in flatten(&s.page_path(), &app.view) {
+    let mut path = s.page_path();
+    let fit_text = action == crate::drop_menu::DropAction::FitTextToPath;
+    let width = if fit_text {
+        // An outline being edited inside a container is drawn in page space.
+        if let Some(parent) = app.doc().parent_transform(target) {
+            path.apply_affine(parent);
+        }
+        2.0
+    } else {
+        1.5
+    };
+    let stroke = EStroke::new(width, Tokens::ACCENT);
+    for (mut pts, closed) in flatten(&path, &app.view) {
         if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts, EStroke::new(1.5, accent)));
+            if let Some(first) = pts.first().copied().filter(|_| fit_text && closed) {
+                pts.push(first);
+            }
+            painter.add(egui::Shape::line(pts, stroke));
         }
     }
     let Some(p) = app.pointer_page else {
@@ -1653,7 +1725,7 @@ fn draw_symmetry_lines(app: &App, painter: &Painter, rect: ERect) {
         }
     }
     for (center, angle, lines) in shown {
-        let n = lines.clamp(1, 12) as usize;
+        let n = lines.clamp(1, tracedraw_core::live::SYMMETRY_MAX_LINES) as usize;
         let far = 100_000.0 / view.zoom.max(0.01) as f64;
         for k in 0..n {
             let a = (angle + 180.0 * k as f64 / n as f64).to_radians();
@@ -2469,6 +2541,8 @@ pub fn draw_transform_outline(app: &App, painter: &Painter, t: Affine) {
 /// not the one beneath it (#3569). A symmetry out of edit mode goes
 /// whole: its copies too, also those of one inside a group.
 pub fn transform_outline_paths(app: &App, s: &tracedraw_core::Shape, t: Affine) -> Vec<BezPath> {
+    let expanded = app.with_symbols_drawn(s);
+    let s = expanded.as_ref().unwrap_or(s);
     let mut moved = s.clone();
     moved.transform_by(t);
     let mut paths = Vec::new();
@@ -2771,12 +2845,11 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
             }
         }
     }
-    // The first node of each selected object's subpaths, a small hollow
-    // square, as the reference program marks a selection with the Pick
-    // tool: it shows where each outline starts and that the object is
-    // picked (#1145).
+    // Node marks: for one selected shape show every node, so the points
+    // that define its outline are visible. For multiple shapes retain the
+    // first-node marks used to tell the objects apart (#1145).
     if matches!(app.tool, Tool::Pick | Tool::FreeformPick) {
-        for p in pick_node_marks(&shapes) {
+        for p in pick_node_marks(&shapes, app.settings.nodes.mark_every_node) {
             let p = view.to_screen(match preview {
                 Some(t) => t * p,
                 None => p,
@@ -2811,11 +2884,80 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
 const PICK_NODE_MARKS_MAX: usize = 1000;
 
 /// Where the Pick tool marks the selected `shapes` (#1145), in page
-/// space: the first node of each subpath of a curve, and the first node
+/// space: [`pick_node_marks_every`] when Options > Nodes and Handles >
+/// "Mark every node of one selected object" is on (#3258), else
+/// [`pick_node_marks_first`], as before.
+pub(crate) fn pick_node_marks(shapes: &[tracedraw_core::Shape], every: bool) -> Vec<Point> {
+    if every {
+        pick_node_marks_every(shapes)
+    } else {
+        pick_node_marks_first(shapes)
+    }
+}
+
+/// The marks with the option on (#3258). A single object shows all its nodes; a multiple selection shows
+/// one first-node mark per object. Bitmaps use their corners and clip
+/// frames use their frame's nodes, without marking their contents. Groups,
+/// texts and other objects without nodes show none; selections with more
+/// than [`PICK_NODE_MARKS_MAX`] marks show none.
+pub(crate) fn pick_node_marks_every(shapes: &[tracedraw_core::Shape]) -> Vec<Point> {
+    let mut out = Vec::new();
+    let limit = if shapes.len() == 1 {
+        PICK_NODE_MARKS_MAX + 1
+    } else {
+        1
+    };
+    for s in shapes {
+        let mut s = s;
+        let mut parent = Affine::IDENTITY;
+        while let ShapeKind::ClipFrame { frame, .. } = &s.kind {
+            parent = parent * s.transform;
+            s = frame;
+        }
+        let transform = parent * s.transform;
+        match &s.kind {
+            ShapeKind::Path { path, .. } if s.spline.is_none() => {
+                out.extend(
+                    tracedraw_core::nodes::nodes(path)
+                        .into_iter()
+                        .take(limit)
+                        .map(|n| transform * n.pos),
+                );
+            }
+            ShapeKind::Bitmap { rect, .. } => {
+                out.extend(
+                    [
+                        Point::new(rect.x0, rect.y1),
+                        Point::new(rect.x1, rect.y1),
+                        Point::new(rect.x0, rect.y0),
+                        Point::new(rect.x1, rect.y0),
+                    ]
+                    .into_iter()
+                    .take(limit)
+                    .map(|p| transform * p),
+                );
+            }
+            _ => {
+                out.extend(
+                    crate::kind_nodes::nodes(s)
+                        .into_iter()
+                        .take(limit)
+                        .map(|(_, p)| parent * p),
+                );
+            }
+        }
+        if out.len() > PICK_NODE_MARKS_MAX {
+            return Vec::new();
+        }
+    }
+    out
+}
+
+/// The default marks (#1145), in page space: the first node of each subpath of a curve, and the first node
 /// of a rectangle (its first corner), an ellipse (its start), a polygon
 /// or a B-spline. Groups, texts, pictures and other objects show none;
 /// nor does a selection of more than [`PICK_NODE_MARKS_MAX`] subpaths.
-pub(crate) fn pick_node_marks(shapes: &[tracedraw_core::Shape]) -> Vec<Point> {
+pub(crate) fn pick_node_marks_first(shapes: &[tracedraw_core::Shape]) -> Vec<Point> {
     let mut out = Vec::new();
     for s in shapes {
         match &s.kind {
@@ -3088,6 +3230,35 @@ fn draw_text_frames(app: &App, painter: &Painter, preview: Option<Affine>) {
                 tab_links(painter, tab, color);
             }
         }
+    }
+}
+
+/// While a clip frame's contents are edited, its frame's outline shows
+/// all the time in its own colour (orange dashes over white), so the
+/// contents, mostly larger than it, can be placed where it shows them
+/// (#4227).
+fn draw_edited_clip_frame(app: &App, painter: &Painter) {
+    if !app.editing_clip_contents() {
+        return;
+    }
+    let Some(frame) = app
+        .clip_frame_edit
+        .as_ref()
+        .and_then(|(f, _)| app.doc().shape_on_page(*f))
+    else {
+        return;
+    };
+    let orange = Color32::from_rgb(0xFF, 0x7A, 0x00);
+    for (pts, closed) in flatten(&frame.page_path(), &app.view) {
+        if pts.len() < 2 {
+            continue;
+        }
+        let mut pts = pts;
+        if closed {
+            pts.push(pts[0]);
+        }
+        painter.add(egui::Shape::line(pts.clone(), EStroke::new(3.0, Color32::WHITE)));
+        painter.extend(egui::Shape::dashed_line(&pts, EStroke::new(1.5, orange), 6.0, 4.0));
     }
 }
 
@@ -3892,6 +4063,11 @@ fn draw_nodes(app: &App, painter: &Painter) {
                     ));
                 }
             }
+            // The nodes, then a rectangle's edge handles: the list of
+            // nodes alone left the edge handles out, so their diamonds
+            // and arcs never showed (#3813).
+            let mut own = own;
+            own.extend(crate::kind_nodes::edge_handles(&s));
             for (node, p) in own {
                 let chosen = matches!(
                     node,
@@ -3953,6 +4129,9 @@ fn draw_nodes(app: &App, painter: &Painter) {
             painter.add(egui::Shape::line(pts, EStroke::new(1.0, outline)));
         }
         let all = nodes::nodes(path);
+        // The nodes whose handles show (#4337): one chosen node and its
+        // neighbours, none while several are chosen.
+        let shown = app.handle_nodes();
         // The direction (#3038, #2578): the first node of every subpath is
         // a triangle pointing the way the curve leaves it, and the last
         // node of an open subpath one pointing the way it arrives, so
@@ -3981,7 +4160,7 @@ fn draw_nodes(app: &App, painter: &Painter) {
             let selected = app.node_selection.contains(&(s.id, n.index))
                 && chosen_segment != Some((s.id, n.index));
             let p = view.to_screen(s.transform * n.pos);
-            if selected {
+            if shown.contains(&(s.id, n.index)) && chosen_segment != Some((s.id, n.index)) {
                 for c in [n.ctrl_in, n.ctrl_out].into_iter().flatten() {
                     let cp = view.to_screen(s.transform * c);
                     draw_control_handle(painter, p, cp, main, prefs.control_head());
@@ -4841,9 +5020,9 @@ fn mesh_edge_points(edge: kurbo::CubicBez, view: &View) -> Vec<Pos2> {
     points
 }
 
-/// Effect nodes (perspective, mesh) of the selection with the Shape tool
-/// (and the mesh with the Mesh Fill tool): small blue squares joined by
-/// a frame.
+/// Effect nodes (perspective, blur pins, mesh) of the selection with the
+/// Shape tool (and the mesh with the Mesh Fill tool): small blue squares
+/// joined by a frame, the blur pins round.
 pub fn draw_effect_nodes(app: &App, painter: &Painter) {
     if !matches!(
         app.tool,
@@ -4876,7 +5055,7 @@ pub fn draw_effect_nodes(app: &App, painter: &Painter) {
         // The perspective frame (envelopes: `ui::envelope_ui`).
         let persp: Vec<egui::Pos2> = nodes
             .iter()
-            .filter(|(i, _)| (100..200).contains(i))
+            .filter(|(i, _)| (100..104).contains(i))
             .map(|(_, p)| app.view.to_screen(*p))
             .collect();
         if persp.len() == 4 && !envelope_tool {
@@ -4966,8 +5145,39 @@ pub fn draw_effect_nodes(app: &App, painter: &Painter) {
             .filter(|(id, _)| *id == s.id)
             .map(|(_, v)| v)
             .unwrap_or_default();
+        // Blur pins: a round handle each, with a thin ring as wide as
+        // its blur radius.
+        let pin_radii: Vec<f64> = s
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                tracedraw_core::live::Effect::GaussianBlur { pins, .. } => {
+                    Some(pins.iter().map(|p| p.radius).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         for (i, p) in nodes {
             let sp = app.view.to_screen(p);
+            if let Some(k) = crate::interaction2::blur_pin_of(i) {
+                let held = app.effect_node_drag == Some((s.id, i))
+                    || app.selected_effect_node == Some((s.id, i));
+                let ring = pin_radii.get(k).copied().unwrap_or(0.0) * app.view.zoom as f64;
+                if ring.is_finite() && ring > 5.0 {
+                    painter.circle_stroke(
+                        sp,
+                        ring.min(4000.0) as f32,
+                        egui::Stroke::new(1.0, blue.gamma_multiply(0.6)),
+                    );
+                }
+                painter.circle(
+                    sp,
+                    4.5,
+                    if held { blue } else { egui::Color32::WHITE },
+                    egui::Stroke::new(1.0, blue),
+                );
+                continue;
+            }
             let r = egui::Rect::from_center_size(sp, egui::vec2(7.0, 7.0));
             let selected = app
                 .effect_node_drag
@@ -5862,10 +6072,61 @@ mod tests {
         assert_eq!(drop_frame_hints((false, false), false).len(), 3);
     }
 
-    /// #1145: with the Pick tool a selected object marks the first node
+    /// #1145 (default, the option of #3258 off): with the Pick tool a selected object marks the first node
     /// of each of its subpaths (the outer and inner ring of a letter O
     /// each), as the reference program does; an ellipse its start, a
     /// rectangle its first corner; a group nothing.
+    #[test]
+    fn by_default_the_pick_tool_marks_only_where_outlines_start() {
+        use tracedraw_core::ShapeKind;
+        let mut app = App::headless();
+        let mut path = BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        path.line_to(Point::new(50.0, 0.0));
+        path.line_to(Point::new(50.0, 30.0));
+        path.close_path();
+        path.move_to(Point::new(10.0, 5.0));
+        path.line_to(Point::new(40.0, 5.0));
+        path.line_to(Point::new(40.0, 20.0));
+        path.close_path();
+        let curve = app
+            .new_shape(ShapeKind::Path { path, closed: true })
+            .expect("curve");
+        let ring = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: Rect::new(100.0, 0.0, 140.0, 40.0),
+                arc: None,
+            })
+            .expect("ellipse");
+        let rect = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(200.0, 0.0, 240.0, 40.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        let marks = |app: &App, id| {
+            let s = app.doc().find_shape(id).expect("shape").clone();
+            pick_node_marks_first(&[s])
+        };
+        assert_eq!(
+            marks(&app, curve),
+            vec![Point::new(0.0, 0.0), Point::new(10.0, 5.0)]
+        );
+        assert_eq!(marks(&app, ring).len(), 1);
+        assert_eq!(marks(&app, rect).len(), 1);
+        app.select(vec![curve, ring]);
+        app.group_selection();
+        let group = app.selection[0];
+        assert!(marks(&app, group).is_empty());
+    }
+
+    /// #1906: View > Page > Page Border and Page Shadow are two options:
+    /// each draws its part of the page's edge alone, and both are kept
+    /// with the view's preferences.
+    /// #1145, #3258: a single selected object marks all its nodes; a
+    /// multiple selection marks only each object's first node, even for
+    /// compound paths. A group has no marks.
     #[test]
     fn the_pick_tool_marks_where_the_selected_outlines_start() {
         use tracedraw_core::ShapeKind;
@@ -5897,18 +6158,267 @@ mod tests {
             .expect("rect");
         let marks = |app: &App, id| {
             let s = app.doc().find_shape(id).expect("shape").clone();
-            pick_node_marks(&[s])
+            pick_node_marks_every(&[s])
         };
         assert_eq!(
             marks(&app, curve),
-            vec![Point::new(0.0, 0.0), Point::new(10.0, 5.0)]
+            vec![
+                Point::new(0.0, 0.0),
+                Point::new(50.0, 0.0),
+                Point::new(50.0, 30.0),
+                Point::new(10.0, 5.0),
+                Point::new(40.0, 5.0),
+                Point::new(40.0, 20.0),
+            ]
         );
         assert_eq!(marks(&app, ring).len(), 1);
-        assert_eq!(marks(&app, rect).len(), 1);
+        let rect_marks = marks(&app, rect);
+        assert_eq!(rect_marks.len(), 4);
+        for corner in [
+            Point::new(200.0, 0.0),
+            Point::new(240.0, 0.0),
+            Point::new(240.0, 40.0),
+            Point::new(200.0, 40.0),
+        ] {
+            assert!(rect_marks.contains(&corner), "missing {corner:?}");
+        }
+
         app.select(vec![curve, ring]);
+        let selected = app.selected_rc();
+        assert_eq!(
+            pick_node_marks_every(selected.as_slice()),
+            vec![Point::new(0.0, 0.0), Point::new(120.0, 40.0),]
+        );
         app.group_selection();
         let group = app.selection[0];
         assert!(marks(&app, group).is_empty());
+    }
+
+    /// #3813: with the Shape tool a rectangle shows the arc of each
+    /// edge handle just outside its side.
+    #[test]
+    fn a_rectangle_shows_its_edge_handles_with_the_shape_tool() {
+        use tracedraw_core::document::ShapeKind;
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(20.0, 20.0, 80.0, 60.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        app.tool = crate::tools::Tool::Shape;
+        let input = egui::RawInput {
+            screen_rect: Some(ERect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let painter = ui.painter().clone();
+            draw_nodes(&app, &painter);
+        });
+        out.textures_delta.clear();
+        // Each edge's arc is a line of nine points, drawn twice (a white
+        // edge under the node colour) (#3813).
+        fn arcs(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(arcs).sum(),
+                egui::Shape::Path(p) => usize::from(!p.closed && p.points.len() == 9),
+                _ => 0,
+            }
+        }
+        let n: usize = out.shapes.iter().map(|c| arcs(&c.shape)).sum();
+        assert_eq!(n, 8, "four edge arcs, each drawn twice");
+    }
+
+    #[test]
+    fn the_pick_tool_marks_a_transformed_bitmaps_four_corners() {
+        use tracedraw_core::{Shape, ShapeId};
+        let mut bitmap = Shape::new(
+            ShapeId(1),
+            ShapeKind::Bitmap {
+                rect: Rect::new(10.0, 20.0, 40.0, 60.0),
+                width_px: 1,
+                height_px: 1,
+                png: Vec::new().into(),
+                fx: None,
+            },
+        );
+        // Rotate a quarter turn, scale each axis and translate.
+        bitmap.transform = Affine::new([0.0, 2.0, -3.0, 0.0, 100.0, 200.0]);
+        assert_eq!(
+            pick_node_marks_every(std::slice::from_ref(&bitmap)),
+            vec![
+                Point::new(-80.0, 220.0),
+                Point::new(-80.0, 280.0),
+                Point::new(40.0, 220.0),
+                Point::new(40.0, 280.0),
+            ]
+        );
+        let mut other = bitmap.clone();
+        other.id = ShapeId(2);
+        other.transform = Affine::translate((8.0, -4.0));
+        assert_eq!(
+            pick_node_marks_every(&[bitmap, other]),
+            vec![Point::new(-80.0, 220.0), Point::new(18.0, 56.0)]
+        );
+    }
+
+    #[test]
+    fn the_pick_tool_marks_a_clip_frames_outline_without_its_contents() {
+        use tracedraw_core::{Shape, ShapeId};
+        let mut path = BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((30.0, 0.0));
+        path.line_to((10.0, 20.0));
+        path.close_path();
+        let mut outline = Shape::new(ShapeId(1), ShapeKind::Path { path, closed: true });
+        outline.transform = Affine::translate((5.0, 7.0));
+        let content = Shape::new(
+            ShapeId(2),
+            ShapeKind::Rect {
+                rect: Rect::new(-100.0, -100.0, 100.0, 100.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let mut clip = Shape::new(
+            ShapeId(3),
+            ShapeKind::ClipFrame {
+                frame: Box::new(outline),
+                contents: vec![content],
+            },
+        );
+        clip.transform = Affine::new([0.0, 2.0, -3.0, 0.0, 100.0, 200.0]);
+        let expected = vec![
+            Point::new(79.0, 210.0),
+            Point::new(79.0, 270.0),
+            Point::new(19.0, 230.0),
+        ];
+        assert_eq!(pick_node_marks_every(std::slice::from_ref(&clip)), expected);
+        let mut nested = Shape::new(
+            ShapeId(4),
+            ShapeKind::ClipFrame {
+                frame: Box::new(clip),
+                contents: Vec::new(),
+            },
+        );
+        nested.transform = Affine::translate((8.0, -4.0));
+        let other = Shape::new(
+            ShapeId(5),
+            ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 40.0, 40.0),
+                arc: None,
+            },
+        );
+        assert_eq!(
+            pick_node_marks_every(&[nested.clone(), other]),
+            vec![Point::new(87.0, 206.0), Point::new(20.0, 40.0)]
+        );
+        assert_eq!(
+            pick_node_marks_every(&[nested]),
+            expected
+                .into_iter()
+                .map(|p| p + tracedraw_core::geometry::Vec2::new(8.0, -4.0))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_pick_tool_marks_each_selected_bitmap_and_clip_frame_once() {
+        use tracedraw_core::{Shape, ShapeId};
+        let rect = Shape::new(
+            ShapeId(1),
+            ShapeKind::Rect {
+                rect: Rect::new(10.0, 20.0, 40.0, 60.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let frame = Shape::new(
+            ShapeId(2),
+            ShapeKind::ClipFrame {
+                frame: Box::new(rect.clone()),
+                contents: Vec::new(),
+            },
+        );
+        let bitmap = Shape::new(
+            ShapeId(3),
+            ShapeKind::Bitmap {
+                rect: Rect::new(50.0, 20.0, 80.0, 60.0),
+                width_px: 1,
+                height_px: 1,
+                png: Vec::new().into(),
+                fx: None,
+            },
+        );
+        assert_eq!(
+            pick_node_marks_every(std::slice::from_ref(&frame)),
+            vec![
+                Point::new(10.0, 60.0),
+                Point::new(40.0, 60.0),
+                Point::new(10.0, 20.0),
+                Point::new(40.0, 20.0),
+            ]
+        );
+        assert_eq!(
+            pick_node_marks_every(&[frame.clone(), bitmap.clone()]),
+            vec![Point::new(10.0, 60.0), Point::new(50.0, 60.0)]
+        );
+        let mut filled = frame.clone();
+        filled.id = ShapeId(4);
+        filled.transform = Affine::translate((100.0, 0.0));
+        if let ShapeKind::ClipFrame { contents, .. } = &mut filled.kind {
+            contents.push(bitmap.clone());
+        }
+        assert_eq!(
+            pick_node_marks_every(&[rect, frame, bitmap, filled]),
+            vec![
+                Point::new(10.0, 60.0),
+                Point::new(10.0, 60.0),
+                Point::new(50.0, 60.0),
+                Point::new(110.0, 60.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pick_tool_limits_marks_for_single_and_multiple_selections() {
+        use tracedraw_core::{Shape, ShapeId};
+        let mut path = BezPath::new();
+        path.move_to((0.0, 0.0));
+        for i in 1..PICK_NODE_MARKS_MAX {
+            path.line_to((i as f64, 0.0));
+        }
+        let mut curve = Shape::new(
+            ShapeId(1),
+            ShapeKind::Path {
+                path,
+                closed: false,
+            },
+        );
+        assert_eq!(
+            pick_node_marks_every(std::slice::from_ref(&curve)).len(),
+            PICK_NODE_MARKS_MAX
+        );
+        if let ShapeKind::Path { path, .. } = &mut curve.kind {
+            path.line_to((PICK_NODE_MARKS_MAX as f64, 0.0));
+        }
+        assert!(pick_node_marks_every(std::slice::from_ref(&curve)).is_empty());
+        let mut selected: Vec<_> = (0..PICK_NODE_MARKS_MAX)
+            .map(|i| {
+                let mut shape = curve.clone();
+                shape.id = ShapeId(i as u64 + 1);
+                shape.transform = Affine::translate((i as f64, 0.0));
+                shape
+            })
+            .collect();
+        let marks = pick_node_marks_every(&selected);
+        assert_eq!(marks.len(), PICK_NODE_MARKS_MAX);
+        assert_eq!(marks.last(), Some(&Point::new(999.0, 0.0)));
+        selected.push(curve);
+        assert!(pick_node_marks_every(&selected).is_empty());
     }
 
     /// #1906: View > Page > Page Border and Page Shadow are two options:

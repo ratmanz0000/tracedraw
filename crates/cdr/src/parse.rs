@@ -372,8 +372,53 @@ const OBJ_MESH: u32 = 0x20;
 /// The mesh of an [`OBJ_MESH`] object: its grid lines and node colours
 /// (see [`Ctx::read_mesh`]).
 const ARG_MESH: u32 = 19150;
+/// The merge mode a version 16+ style string's transparency `mode` names.
+/// The codes are those of the merge modes of the scripting interface
+/// (`cdrMergeMode` in `vg_model.js`), which the transparency record of
+/// versions 13 to 15 shares (9 multiplies there, #3222). In the car
+/// drawing of #1238 (version 27) the highlights hold 7 and 29, and the
+/// shades 8 and 9, and drawn so they match its reference picture, where
+/// drawn as Normal they lay over the paint as flat grey patches.
+fn style_merge_mode(code: i64) -> Option<tracedraw_core::live::MergeMode> {
+    use tracedraw_core::live::MergeMode as M;
+    Some(match code {
+        0 => M::Normal,
+        1 => M::And,
+        2 => M::Or,
+        3 => M::Xor,
+        6 => M::Invert,
+        7 => M::Add,
+        8 => M::Subtract,
+        9 => M::Multiply,
+        10 => M::Divide,
+        11 => M::IfLighter,
+        12 => M::IfDarker,
+        13 => M::Texturize,
+        14 => M::Color,
+        15 => M::Hue,
+        16 => M::Saturation,
+        17 => M::Lightness,
+        18 => M::Red,
+        19 => M::Green,
+        20 => M::Blue,
+        24 => M::Difference,
+        27 => M::Behind,
+        28 => M::Screen,
+        29 => M::Overlay,
+        30 => M::SoftLight,
+        31 => M::HardLight,
+        33 => M::ColorDodge,
+        34 => M::ColorBurn,
+        36 => M::Exclusion,
+        _ => return None,
+    })
+}
+
 /// The largest mesh read, in nodes.
 const MESH_MAX_NODES: usize = 250_000;
+/// The mark of mesh records whose node colours are sized records (150 in
+/// version 27 files; 100 in the older layout).
+const MESH_SIZED_COLOURS: u32 = 150;
 /// The tag of records added by version 24 and later at the start of fill
 /// records (a 16-byte id), which files saved for older versions carry too.
 const NEWER_RECORD_TAG: u32 = 2400;
@@ -1004,17 +1049,20 @@ pub(crate) fn parse_document_kept_data(
                 layer.locked = f[0] & 0x10 != 0;
                 layer.printable = f[0] & 0x08 == 0;
             }
-            // Guides and grid layers hold no drawable content.
+            let mut ids = std::mem::take(doc.ids_mut());
+            layer.shapes = ctx.read_objects(lc, &mut ids, size, 0);
+            doc.set_ids(ids);
+            // Guides and grid layers do not print. Empty, they are hidden;
+            // a guides layer holding artwork (a part of the drawing put
+            // there, one face of a cube in a version 16 file, #4331)
+            // shows as the file has it, as its preview draws it.
             match ctx.layer_type(lc) {
                 Some(t) if t & 0x0f == 0x0a => {
-                    layer.visible = false;
+                    layer.visible = !layer.shapes.is_empty() && !ctx.layer_hidden(lc);
                     layer.printable = false;
                 }
                 _ => layer.visible = !ctx.layer_hidden(lc),
             }
-            let mut ids = std::mem::take(doc.ids_mut());
-            layer.shapes = ctx.read_objects(lc, &mut ids, size, 0);
-            doc.set_ids(ids);
             // Guides, grid and desktop layers, and the master page's layers
             // each page lists again, are no drawing of their own when
             // empty.
@@ -2567,8 +2615,10 @@ impl<'a> Ctx<'a> {
         let Some(tc) = txsm else {
             // A frame the text of another frame continues in keeps no text
             // record: it opens empty, and the text flows into it once the
-            // frames are linked (#4104, #2018).
-            if kind_code == OBJ_PARAGRAPH_TEXT && frame_number.is_some() {
+            // frames are linked (#4104, #2018). So does a paragraph frame
+            // left empty (#4330): an empty text box, not an object that
+            // could not be read.
+            if kind_code == OBJ_PARAGRAPH_TEXT {
                 if frame.is_none() {
                     if let Some((o, size)) = self.frame_from_hints(&hints) {
                         origin = o;
@@ -2593,8 +2643,10 @@ impl<'a> Ctx<'a> {
                     });
                 }
             }
-            self.report
-                .warn("text object without a txsm chunk; skipped");
+            // Text with no text record holds no letters: it draws
+            // nothing, and nothing of the drawing is lost (#4330).
+            log::debug!("text object without a txsm chunk: no text, draws nothing");
+            self.last_drew_nothing = true;
             return None;
         };
         let td = self.data(tc);
@@ -2783,7 +2835,21 @@ impl<'a> Ctx<'a> {
             }
         }
         if spans.is_empty() {
-            self.report.warn("text object with no content; skipped");
+            // An empty text box (#4330): a paragraph frame opens as an
+            // empty frame to type in; artistic text with no letters draws
+            // nothing. Neither is an object that could not be read.
+            if kind_code == OBJ_PARAGRAPH_TEXT && frame.is_some() {
+                return Some(ShapeKind::Text {
+                    spans: Vec::new(),
+                    origin,
+                    frame,
+                    align: TextAlign::Left,
+                    para: ParagraphStyle::default(),
+                    on_path: None,
+                });
+            }
+            log::debug!("text object with no content: draws nothing");
+            self.last_drew_nothing = true;
             return None;
         }
         // 0 none, 1 left, 2 centre, 3 right, 4 full and 5 forced justify
@@ -3527,6 +3593,9 @@ impl<'a> Ctx<'a> {
                     }
                     Some(_) => {}
                     None => {
+                        // An empty cell's text draws nothing: no mark left
+                        // for the next object read (#4330).
+                        self.last_drew_nothing = false;
                         let empty = "text object with no content; skipped";
                         if self.report.warnings.len() > warned
                             && self.report.warnings.last().map(String::as_str) == Some(empty)
@@ -4243,7 +4312,8 @@ impl<'a> Ctx<'a> {
     /// through them and their handles from the control points next to
     /// them on those lines, so the cells keep the lines' curves. Also the
     /// mesh's edge (the first and last row and column lines), the
-    /// object's outline.
+    /// object's outline. A record marked 150 instead of 100 (version 27,
+    /// #1238) holds the colours as sized records.
     fn read_mesh(
         &mut self,
         d: &'a [u8],
@@ -4254,7 +4324,7 @@ impl<'a> Ctx<'a> {
         // The record's own length: the argument may run a little past it.
         let len = r.u32()? as usize;
         let end = arg.off.checked_add(len)?.min(arg.end);
-        let _tag = r.u32()?;
+        let tag = r.u32()?;
         let cols = r.u32()? as usize;
         let rows = r.u32()? as usize;
         if cols < 2 || rows < 2 || cols.saturating_mul(rows) > MESH_MAX_NODES {
@@ -4324,19 +4394,40 @@ impl<'a> Ctx<'a> {
             }
             lines.push((build_path(&pts, &types).0, first > last));
         }
-        // The colour grid closes the record.
-        let grid = end.checked_sub(12 + rows * cols * 12)?;
-        if grid < r.pos {
-            return None;
-        }
-        let mut g = self.reader_at(data, grid);
-        let _tag = g.u32()?;
-        if g.u32()? as usize != rows || g.u32()? as usize != cols {
-            return None;
-        }
         let mut colours = Vec::with_capacity(rows * cols);
-        for _ in 0..rows * cols {
-            colours.push(self.read_color(&mut g)?);
+        if tag >= MESH_SIZED_COLOURS {
+            // Records marked 150: the transform (six f64), the mark and the
+            // counts follow the lines, then each node's colour as a sized
+            // record (see `read_mesh_sized_colour`); 12 bytes close it.
+            r.skip(48);
+            let _tag = r.u32()?;
+            if r.u32()? as usize != rows || r.u32()? as usize != cols {
+                return None;
+            }
+            for _ in 0..rows * cols {
+                let size = r.u32()? as usize;
+                let at = r.pos;
+                if at.checked_add(size)? > end {
+                    return None;
+                }
+                let mut c = self.reader_at(data, at);
+                colours.push(self.read_mesh_sized_colour(&mut c, size)?);
+                r.skip(size);
+            }
+        } else {
+            // The colour grid closes the record.
+            let grid = end.checked_sub(12 + rows * cols * 12)?;
+            if grid < r.pos {
+                return None;
+            }
+            let mut g = self.reader_at(data, grid);
+            let _tag = g.u32()?;
+            if g.u32()? as usize != rows || g.u32()? as usize != cols {
+                return None;
+            }
+            for _ in 0..rows * cols {
+                colours.push(self.read_color(&mut g)?);
+            }
         }
         let mut nodes = Vec::with_capacity(rows * cols);
         for (i, handles) in handles.into_iter().enumerate() {
@@ -4385,6 +4476,20 @@ impl<'a> Ctx<'a> {
             },
             edge,
         ))
+    }
+
+    /// A mesh node's colour in a record marked 150: byte 1, the colour's
+    /// length (12) and the colour as everywhere else; what follows (byte 7,
+    /// a length of 16 and 16 bytes, zeros in the samples) is not read.
+    fn read_mesh_sized_colour(&mut self, r: &mut Reader, size: usize) -> Option<Color> {
+        if size < 17 {
+            return None;
+        }
+        let _kind = r.u8()?;
+        if r.u32()? != 12 {
+            return None;
+        }
+        self.read_color(r)
     }
 
     fn read_polygon_info(&mut self, d: &'a [u8], arg: Arg) -> Option<PolygonInfo> {
@@ -4472,6 +4577,46 @@ impl<'a> Ctx<'a> {
         Some((steps, settings))
     }
 
+    /// The inner shadow layout observed in CDR 24.3. The link table
+    /// names its target independently of the order of the layer records.
+    fn inner_shadow_record(&mut self, group: &Chunk) -> Option<(u32, tracedraw_core::live::Effect)> {
+        let loda = group.children.iter().find(|c| c.is(b"lgob"))?
+            .children.iter().find(|c| c.is(b"loda"))?;
+        let data = self.data(loda);
+        let l = self.read_loda(data)?;
+        if l.kind != OBJ_DROP_SHADOW {
+            return None;
+        }
+        let a = l.args.iter().find(|a| a.ty == ARG_BLEND_STEPS)?;
+        let record = data.get(a.off..a.end)?;
+        if record.get(..8)? != [0x98, 0x08, 0, 0, 0x6f, 0, 0, 0]
+            || self.reader_at(record, 24).u32()? != 4
+        {
+            return None;
+        }
+        let group_number = group.children.iter().find(|c| c.is(b"spnd"))?;
+        let group_number = self.reader(self.data(group_number)).u32()?;
+        let owner = *self.links.get(&group_number)?;
+        let mut r = self.reader_at(record, 8);
+        let offset = tracedraw_core::geometry::Vec2::new(
+            f64::from(r.i32()?) * UNIT_MM,
+            f64::from(r.i32()?) * UNIT_MM,
+        );
+        let opacity = f64::from(r.u32()?.min(250)) / 250.0;
+        let blur = f64::from(r.u32()?.min(500)) * DROP_SHADOW_FEATHER_MM;
+        // Depth is a percentage. Map it to the native spread control.
+        let spread = f64::from(self.reader_at(record, 32).u32()?.min(100)) / 100.0;
+        let color = self.read_color(&mut self.reader_at(record, 61))?;
+        let merge = match self.reader_at(record, 107).u32()? {
+            0 => tracedraw_core::live::MergeMode::Normal,
+            9 => tracedraw_core::live::MergeMode::Multiply,
+            _ => return None,
+        };
+        Some((owner, tracedraw_core::live::Effect::InnerShadow {
+            offset, color, opacity, blur, merge, spread,
+        }))
+    }
+
     /// The drop shadow of a linked group whose own `lgob` holds a `loda`
     /// of object type 23 ([`OBJ_DROP_SHADOW`]): an empty group that
     /// follows the object it shadows (version 15, #3222; later versions
@@ -4494,6 +4639,10 @@ impl<'a> Ctx<'a> {
         let arg = l.args.iter().find(|a| a.ty == ARG_BLEND_STEPS)?;
         let rec = d.get(arg.off..arg.end)?;
         if rec.len() < DROP_SHADOW_RECORD_LEN || rec[..8] != [0x14, 0x05, 0, 0, 0x6f, 0, 0, 0] {
+            self.report.warn(format!(
+                "shadow record in CDR version {} has an unsupported layout; shadow skipped",
+                self.v
+            ));
             return None;
         }
         let mut r = self.reader_at(rec, 8);
@@ -4965,29 +5114,38 @@ impl<'a> Ctx<'a> {
             s.miter_limit = a;
         }
 
-        // A merge mode the reader does not know yet (#1666) is named, so
-        // a report can say which code the file uses.
-        if let Some(code) = style_string
-            .as_deref()
-            .and_then(text::object_transparency_merge_code)
-        {
-            self.report.warn(format!(
-                "transparency merge mode {code} not read; object merged as Normal"
-            ));
-        }
         // Version 16+: a graded transparency in the object's style string
         // becomes a mask; otherwise its uniform transparency an opacity.
-        let mut mask = v11_mask.or_else(|| {
-            style_string
-                .as_deref()
-                .and_then(text::object_transparency_mask)
-        });
-        // A pattern transparency in the style string (a fill type other
-        // than uniform or fountain) is the pattern its record names, not
-        // the mean of its two amounts (#2960).
         let style_fill_type = style_string
             .as_deref()
             .and_then(text::object_transparency_fill_type);
+        // A transparency section whose fill is of type 0 (none, as in fill
+        // sections) on an object without a transparency record is a
+        // transparency that was taken off: its amounts are leftovers
+        // (#1238: a version 27 mesh object left with "uniformTransparency 1"
+        // is drawn whole in its reference picture).
+        let transparency_off = self.v >= 16
+            && style_fill_type == Some(0)
+            && !l.args.iter().any(|a| a.ty == ARG_OPACITY);
+        let style_transparency = style_string.as_deref().filter(|_| !transparency_off);
+        // Version 16+: how the transparency mixes with what lies beneath
+        // is the style string's `mode` (see `style_merge_mode`); a code
+        // without a mode here is named, so a report can say which one
+        // the file uses (#1666).
+        if let Some(code) = style_transparency.and_then(text::object_transparency_merge_code) {
+            match style_merge_mode(code) {
+                Some(m) => record_merge = m,
+                None => self.report.warn(format!(
+                    "transparency merge mode {code} not read; object merged as Normal"
+                )),
+            }
+        }
+        let style_merges = self.v >= 16 && record_merge != tracedraw_core::live::MergeMode::Normal;
+        let mut mask =
+            v11_mask.or_else(|| style_transparency.and_then(text::object_transparency_mask));
+        // A pattern transparency in the style string (a fill type other
+        // than uniform or fountain) is the pattern its record names, not
+        // the mean of its two amounts (#2960).
         if mask.is_none() && style_fill_type.is_some_and(|t| !matches!(t, 0..=2)) {
             if let Some(RecordTransparency::Mask(m @ (Fill::Pattern(_), _))) = &record_transparency
             {
@@ -5004,7 +5162,7 @@ impl<'a> Ctx<'a> {
             }
         }
         if opacity >= 1.0 && mask.is_none() {
-            if let Some(o) = style_string.as_deref().and_then(text::object_opacity) {
+            if let Some(o) = style_transparency.and_then(text::object_opacity) {
                 opacity = o;
             } else if let Some(o) = record_opacity.filter(|_| {
                 style_string
@@ -5064,11 +5222,11 @@ impl<'a> Ctx<'a> {
                     (Some(u), Some(t)) => (u.bounding_box(), recenter * t),
                     _ => (local.bounding_box(), shape.transform),
                 };
-                // The bands run square to the fill's axis in the object's
-                // own space (its box not stretched to a square).
+                // The bands run along the fill frame's second axis, in
+                // units of the object's box like the first.
                 let start = Fountain::rel_to_page(lb, h.start);
                 let end = Fountain::rel_to_page(lb, h.end);
-                let skew = start + (end - start).turn_90();
+                let skew = Fountain::rel_to_page(lb, h.skew);
                 let place = |p: Point| Fountain::page_to_rel(pb, m * p);
                 let placed = tracedraw_core::style::FountainHandles {
                     start: place(start),
@@ -5211,7 +5369,9 @@ impl<'a> Ctx<'a> {
                     merge: record_merge,
                     target,
                 });
-        } else if record_merge != tracedraw_core::live::MergeMode::Normal && shape.opacity < 1.0 {
+        } else if record_merge != tracedraw_core::live::MergeMode::Normal
+            && (shape.opacity < 1.0 || style_merges)
+        {
             // A uniform transparency that does not merge as Normal: a
             // mask of one grey, whose lightness is the opacity.
             let grey = Color::Gray {
@@ -5367,15 +5527,15 @@ impl<'a> Ctx<'a> {
     /// numbered `clip` drawn inside it (the container's fill under them,
     /// its outline over them). A number naming no group leaves the shape.
     ///
-    /// A transparency read on the container is the whole container's
-    /// (#2515): the clip frame takes its amount and its mask, so the
-    /// contents fade with the frame and the property bar shows it. Left
-    /// on the frame inside, the amount was not drawn at all (a clip frame
-    /// is drawn at its own opacity) and a mask faded the frame's fill
-    /// alone: a picture in a see-through container opened opaque.
+    /// A transparency read on the container is the frame's alone
+    /// (#4360): the clip frame takes its amount, so the property bar
+    /// shows it, and is marked so that the objects inside keep their own
+    /// opacity, as the program that saves the files draws them; a graded
+    /// transparency stays on the frame inside and fades its fill. (Taken
+    /// at first, without a file, as the whole container's, #2515.)
     fn with_clip_contents(
         &mut self,
-        mut shape: Shape,
+        shape: Shape,
         clip: u32,
         ids: &mut tracedraw_core::id::IdSource,
         page_size: Size,
@@ -5416,11 +5576,15 @@ impl<'a> Ctx<'a> {
         // The frame keeps the amount as well, as a frame made in the
         // application does, so Extract Contents gives it back.
         outer.opacity = shape.opacity;
-        let (faded, kept) = std::mem::take(&mut shape.effects)
-            .into_iter()
-            .partition(|e| matches!(e, tracedraw_core::live::Effect::Transparency { .. }));
-        outer.effects = faded;
-        shape.effects = kept;
+        // The amount fades the frame's own fill and outline, not the
+        // objects inside, which keep their own (#4360); a graded
+        // transparency stays on the frame for the same reason.
+        if outer.opacity < 1.0 {
+            outer.data.push((
+                tracedraw_core::document::CLIP_CONTENTS_OPAQUE.into(),
+                "1".into(),
+            ));
+        }
         outer.kind = ShapeKind::ClipFrame {
             frame: Box::new(shape),
             contents,
@@ -5471,6 +5635,7 @@ impl<'a> Ctx<'a> {
         let mut contours: Vec<(usize, usize, f64)> = Vec::new();
         // Brush strokes: where their objects start and end, and
         // their linked group's number (see `crate::artistic`).
+        let mut inner_shadows = Vec::new();
         let mut strokes: Vec<(usize, usize, u32)> = Vec::new();
         for c in &list.children {
             if c.is(b"obj ") {
@@ -5687,7 +5852,9 @@ impl<'a> Ctx<'a> {
                 if out.len() == before {
                     // A version 15 drop shadow: an empty linked group
                     // after its object, its record holding the settings.
-                    if let Some(shadow) = self.drop_shadow_record(c) {
+                    if let Some(inner) = self.inner_shadow_record(c) {
+                        inner_shadows.push(inner);
+                    } else if let Some(shadow) = self.drop_shadow_record(c) {
                         if let Some(owner) = out.last_mut() {
                             owner.shadow = Some(shadow);
                         }
@@ -5754,6 +5921,15 @@ impl<'a> Ctx<'a> {
                     ..Default::default()
                 },
             });
+        }
+        for (number, effect) in inner_shadows {
+            let owner = self.spnd_shapes.get(&number)
+                .and_then(|id| out.iter_mut().skip(first).find(|shape| shape.id == *id));
+            if let Some(owner) = owner {
+                owner.effects.push(effect);
+            } else {
+                self.report.warn(format!("inner shadow target {number} not found in its layer"));
+            }
         }
         self.mark_brush_strokes(out, first, &strokes);
         self.make_contours_live(out, &contours);
@@ -7882,12 +8058,11 @@ fn radial_frame(d: &[u8]) -> Option<tracedraw_core::style::FountainHandles> {
 /// b, d, f; the offsets zero) in units of the object box's width and
 /// height from its centre, y upwards. The fill runs along the matrix's x
 /// axis `(a, b)`, from the centre less half of it (the first colour) to
-/// the centre plus half of it (the last); the bands run square to that
-/// axis in the object's own space, which `Ctx::read_object` works
-/// out when it places the fill on the object. As
+/// the centre plus half of it (the last); the bands run along its y axis
+/// `(c, d)`, which a skewed fill turns away from square (#1238). As
 /// [`FountainHandles`](tracedraw_core::style::FountainHandles) in the
-/// object's box (half sizes), the skew handle a placeholder; None when the
-/// tail is shorter or the axis has no length.
+/// object's box (half sizes), the skew handle one y axis from the start;
+/// None when the tail is shorter or the x axis has no length.
 fn linear_frame(d: &[u8]) -> Option<tracedraw_core::style::FountainHandles> {
     let f = |k: usize| {
         let b = d.get(8 * k..8 * k + 8)?;
@@ -7895,10 +8070,11 @@ fn linear_frame(d: &[u8]) -> Option<tracedraw_core::style::FountainHandles> {
         v.is_finite().then_some(v)
     };
     let (ox, oy, a, b) = (f(0)?, f(1)?, f(2)?, f(5)?);
-    // The matrix's other entries are read only to know the tail is whole.
-    f(3)?;
+    // The matrix's y axis: the way the bands run. One that is not a
+    // number counts as one of no length.
+    let (c, d2) = (f(3).unwrap_or(0.0), f(6).unwrap_or(0.0));
+    // The offsets are read only to know the tail is whole.
     f(4)?;
-    f(6)?;
     f(7)?;
     let len = a.hypot(b);
     if !(1e-6..=1e3).contains(&len) || ox.abs() > 1e3 || oy.abs() > 1e3 {
@@ -7907,10 +8083,16 @@ fn linear_frame(d: &[u8]) -> Option<tracedraw_core::style::FountainHandles> {
     // Half sizes: twice the box units.
     let start = Point::new(2.0 * ox - a, 2.0 * oy - b);
     let end = Point::new(2.0 * ox + a, 2.0 * oy + b);
+    // A y axis without length (not seen) leaves the bands square.
+    let along = if (1e-6..=1e3).contains(&c.hypot(d2)) {
+        (c, d2)
+    } else {
+        (-b, a)
+    };
     Some(tracedraw_core::style::FountainHandles {
         start,
         end,
-        skew: Point::new(start.x - b, start.y + a),
+        skew: Point::new(start.x + along.0, start.y + along.1),
     })
 }
 
@@ -9498,6 +9680,33 @@ pub(crate) mod tests {
         for (r, g, b) in [(255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 255, 255)] {
             body.extend(color_bgr(r, g, b));
         }
+        // #1238: a record marked 150 (a version 27 file) holds each
+        // colour in a sized record and 12 bytes after the last.
+        let sized = |colours: usize, size: u32| {
+            let lines = body.len() - 4 * 12 - 12;
+            let mut b = u32s(&[150]);
+            b.extend_from_slice(&body[4..lines]);
+            b.extend(u32s(&[150, 2, 2]));
+            for (r, g, bl) in [(255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 255, 255)]
+                .into_iter()
+                .take(colours)
+            {
+                let mut rec = vec![1u8];
+                rec.extend(u32s(&[12]));
+                rec.extend(color_bgr(r, g, bl));
+                rec.push(7);
+                rec.extend(u32s(&[16]));
+                rec.resize(43, 0);
+                b.extend(u32s(&[size]));
+                b.extend(rec);
+            }
+            b.extend(u32s(&[1, 9, 5]));
+            let mut mesh = u32s(&[b.len() as u32 + 4]);
+            mesh.extend(b);
+            mesh
+        };
+        let (mesh_150, mesh_150_short, mesh_150_wide) =
+            (sized(4, 43), sized(3, 43), sized(4, u32::MAX));
         let mut mesh = u32s(&[body.len() as u32 + 4]);
         mesh.extend(body);
         // The coordinates' curve: a triangle far from the mesh.
@@ -9591,6 +9800,24 @@ pub(crate) mod tests {
         // Every shorter cut opens without a panic.
         for cut in 0..mesh.len() {
             let _ = doc_of(obj(mesh[..cut].to_vec()));
+        }
+        // The record marked 150 gives the same colours.
+        let (doc, rep) = doc_of(obj(mesh_150.clone()));
+        let Fill::Mesh(m150) = &first_shape(&doc).fill else {
+            panic!("{:?}", rep.warnings)
+        };
+        for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert_eq!(m150.node(r, c).map(|n| n.color), at(r, c).map(|n| n.1));
+        }
+        // One colour short, or a colour sized past the record: the curve
+        // with a warning, and no cut panics.
+        for bad in [mesh_150_short, mesh_150_wide] {
+            let (doc, rep) = doc_of(obj(bad));
+            assert!(rep.warnings.iter().any(|w| w.contains("mesh")));
+            assert!(!matches!(first_shape(&doc).fill, Fill::Mesh(_)));
+        }
+        for cut in 0..mesh_150.len() {
+            let _ = doc_of(obj(mesh_150[..cut].to_vec()));
         }
     }
 
@@ -11192,6 +11419,48 @@ pub(crate) mod tests {
         assert_eq!(doc.pages[0].layers[0].shapes.len(), 1);
     }
 
+    /// Artwork on a page's guides layer (#4331): the layer opens visible,
+    /// as the file shows it, and does not print; an empty guides layer
+    /// is left out as before.
+    #[test]
+    fn artwork_on_the_guides_layer_shows() {
+        let rect_obj = list(
+            b"obj ",
+            &chunk(
+                b"loda",
+                &loda(OBJ_RECT, &[(ARG_COORDS, i32s(&[254000, 254000, 0]))]),
+            ),
+        );
+        let layer = |flags: [u8; 4], objs: &[u8]| {
+            list(b"layr", &[chunk(b"flgs", &flags), objs.to_vec()].concat())
+        };
+        let page = list(
+            b"page",
+            &[
+                chunk(b"flgs", &[0, 0, 0, 0x90]),
+                list(
+                    b"gobj",
+                    &[
+                        layer([0x0a, 0, 0, 0x98], &rect_obj),
+                        layer([0, 0, 0, 0x98], &rect_obj),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        );
+        let body = [chunk(b"mcfg", &mcfg(12, 2_100_000, 2_970_000)), page].concat();
+        let (doc, rep) = parse(&riff(b"CDRC", &body), 12);
+        let layers = &doc.pages[0].layers;
+        assert_eq!(layers.len(), 2, "{:?}", rep.warnings);
+        let guides = layers
+            .iter()
+            .find(|l| !l.printable)
+            .expect("the guides layer is kept");
+        assert_eq!(guides.shapes.len(), 1);
+        assert!(guides.visible, "artwork on the guides layer shows");
+    }
+
     /// Objects on the master page's desktop layer and guidelines on its
     /// guides layer, as the version 7 to 21 files of #1775 hold them
     /// (master layer flags [2, 1, 1, 0x98] guides, [0, 1, 1, 0x98]
@@ -12060,6 +12329,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// An empty text object in a version 10 file (#4330): a text with no
+    /// text record and one whose record holds no letters are not counted
+    /// as objects that could not be read.
+    #[test]
+    fn an_empty_text_is_not_an_unread_object() {
+        let obj = list(
+            b"obj ",
+            &chunk(
+                b"loda",
+                &loda(OBJ_ARTISTIC_TEXT, &[(ARG_COORDS, i32s(&[0, 0]))]),
+            ),
+        );
+        let body = [
+            chunk(b"mcfg", &mcfg(10, 2_540_000, 2_540_000)),
+            list(b"page", &list(b"layr", &obj)),
+        ]
+        .concat();
+        let (_, rep) = parse(&riff(b"CDRA", &body), 10);
+        assert_eq!(rep.skipped_objects, 0, "{:?}", rep.warnings);
+        let (_, rep) = text_doc(
+            12,
+            b"CDRC",
+            Vec::new(),
+            OBJ_ARTISTIC_TEXT,
+            &[(ARG_COORDS, i32s(&[0, 0]))],
+            txsm7(12, false, &[], ""),
+        );
+        assert_eq!(rep.skipped_objects, 0, "{:?}", rep.warnings);
+    }
+
     fn text_doc(
         v: u16,
         form: &[u8; 4],
@@ -12490,6 +12789,55 @@ pub(crate) mod tests {
             assert_eq!(s.merge, mode);
             assert!(s.perspective.is_none());
         }
+    }
+
+    #[test]
+    fn version_24_inner_shadow_uses_the_linked_target() {
+        let v = 24;
+        let mut data = u32s(&[0x898, 111, 32_500, 0, 125, 15, 4, 0, 36]);
+        data.resize(61, 0);
+        data.extend_from_slice(&[2, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 100]);
+        data.resize(107, 0);
+        data.extend_from_slice(&9_u32.to_le_bytes());
+        let loda_chunk = chunk(b"loda", &loda(OBJ_DROP_SHADOW, &[(3000, data)]));
+        let group = list(b"lnkg", &[
+            chunk(b"spnd", &u32s(&[1])),
+            list(b"lgob", &loda_chunk),
+        ].concat());
+        let ellipse = list(b"obj ", &[
+            chunk(b"spnd", &u32s(&[2])),
+            chunk(b"loda", &loda(OBJ_ELLIPSE, &[(ARG_COORDS, i32s(&[0, -100_000, 200_000, 100_000, 0]))])),
+        ].concat());
+        let links = chunk(b"lnkt", &u32s(&[32, 1, 12, 20, 32, 224, 1, 2]));
+        let body = [
+            chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+            links,
+            list(b"page", &list(b"layr", &[group, ellipse].concat())),
+        ].concat();
+        let (doc, report) = parse(&riff(b"CDRM", &body), v);
+        let owner = &doc.pages[0].layers[0].shapes[0];
+        let [tracedraw_core::live::Effect::InnerShadow { offset, opacity, blur, spread, merge, .. }] =
+            owner.effects.as_slice()
+        else {
+            panic!("linked inner shadow not read: {:?}", report.warnings);
+        };
+        assert!((offset.x - 3.25).abs() < 1e-9 && offset.y == 0.0);
+        assert_eq!((*opacity, *blur, *spread), (0.5, 1.5, 0.36));
+        assert_eq!(*merge, tracedraw_core::live::MergeMode::Multiply);
+    }
+
+    #[test]
+    fn reports_an_unsupported_shadow_record() {
+        let v = 24;
+        let record = loda(OBJ_DROP_SHADOW, &[(3000, u32s(&[0x898, 111]))]);
+        let group = list(b"lnkg", &list(b"lgob", &chunk(b"loda", &record)));
+        let body = [
+            chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+            list(b"page", &list(b"layr", &group)),
+        ]
+        .concat();
+        let (_, report) = parse(&riff(b"CDRM", &body), v);
+        assert!(report.warnings.iter().any(|w| w.contains("shadow skipped")));
     }
 
     /// A step count field holding no count a blend can have (0, or a
@@ -14588,8 +14936,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// A text object with no text record holds no letters: nothing is
+    /// drawn and nothing counts as unread (#4330).
     #[test]
-    fn text_object_without_txsm_is_skipped_with_a_warning() {
+    fn text_object_without_txsm_draws_nothing() {
         let obj = list(
             b"obj ",
             &chunk(
@@ -14604,8 +14954,7 @@ pub(crate) mod tests {
         .concat();
         let (_, rep) = parse(&riff(b"CDRD", &body), 13);
         assert_eq!(rep.shapes, 0);
-        assert_eq!(rep.skipped_objects, 1);
-        assert!(rep.warnings.iter().any(|w| w.contains("txsm")));
+        assert_eq!(rep.skipped_objects, 0, "{:?}", rep.warnings);
     }
 
     // Fills: bitmaps, textures, pattern tiles, version 16 fountain transform.
@@ -16555,10 +16904,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// #2515: a transparency set on a clip container is the whole
-    /// container's. The clip frame read from it takes the amount and the
-    /// mask; they stayed on the frame inside, where the amount is not
-    /// drawn, so a picture in a see-through container opened opaque.
+    /// #2515, #4360: a transparency set on a clip container is shown on
+    /// the clip frame, and fades the frame's fill and outline while the
+    /// objects inside keep their own opacity; a graded one stays on the
+    /// frame inside.
     #[test]
     fn a_clip_containers_transparency_is_the_clip_frames() {
         use tracedraw_core::live::Effect;
@@ -16612,6 +16961,8 @@ pub(crate) mod tests {
         assert!((frame.opacity - 0.1).abs() < 1e-9, "{}", frame.opacity);
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].opacity, 1.0);
+        // The objects inside are not faded with it (#4360).
+        assert!(clip.clip_contents_opaque());
 
         // The amount held in the record of argument 8000 (#1706).
         let bare = style_of(r#"{"transparency":{"fill":{"type":"1"}}}"#);
@@ -16630,8 +16981,8 @@ pub(crate) mod tests {
         let ShapeKind::ClipFrame { frame, .. } = &clip.kind else {
             panic!("not a clip frame: {:?}", clip.kind);
         };
-        assert_eq!(masks(&clip), 1, "{:?}", clip.effects);
-        assert_eq!(masks(frame), 0, "{:?}", frame.effects);
+        assert_eq!(masks(&clip), 0, "{:?}", clip.effects);
+        assert_eq!(masks(frame), 1, "{:?}", frame.effects);
 
         // A container with no transparency stays opaque.
         let plain = style_of(r#"{"fill":{"type":"0"}}"#);
@@ -18120,13 +18471,28 @@ pub(crate) mod tests {
         assert!((t(3.0, 2.5) - 0.5).abs() < 1e-9, "{}", t(3.0, 2.5));
         assert!((f.angle - 90.0).abs() < 1e-9, "{}", f.angle);
         // Along the box's diagonal, (0.5, 0.5) in box units: on the
-        // object the axis runs (10, 5) mm and the bands square to it.
+        // object the axis runs (10, 5) mm. The bands run along the
+        // frame's other axis, (-0.5, 0.5) in box units, (-10, 5) mm on
+        // the object, which is not square to the first on a box that is
+        // not square (#1238).
         let (f, b) = read(fill(&[0.0, 0.0, 0.5, -0.5, 0.0, 0.5, 0.5, 0.0]));
         let t = |x: f64, y: f64| f.param_at(b, Point::new(c + x, c + y)).expect("a frame");
         assert!((t(10.0, 5.0) - 0.5).abs() < 1e-9);
         assert!((t(15.0, 7.5) - 1.0).abs() < 1e-9, "{}", t(15.0, 7.5));
-        // (1, -2) is square to (10, 5).
-        assert!((t(11.0, 3.0) - 0.5).abs() < 1e-9, "{}", t(11.0, 3.0));
+        assert!((t(8.0, 6.0) - 0.5).abs() < 1e-9, "{}", t(8.0, 6.0));
+        // #1238: a skewed fill. The same axis with the other one lying
+        // along the box's width: the bands are level.
+        let (f, b) = read(fill(&[0.0, 0.0, 0.5, -0.5, 0.0, 0.5, 0.0, 0.0]));
+        let t = |x: f64, y: f64| f.param_at(b, Point::new(c + x, c + y)).expect("a frame");
+        assert!((t(10.0, 5.0) - 0.5).abs() < 1e-9);
+        assert!((t(2.0, 5.0) - 0.5).abs() < 1e-9, "{}", t(2.0, 5.0));
+        assert!((t(15.0, 7.5) - 1.0).abs() < 1e-9, "{}", t(15.0, 7.5));
+        // A second axis of no length, or not a number, falls back to
+        // bands square to the first in box units.
+        for bad in [0.0, f64::NAN, f64::INFINITY] {
+            let (f, _) = read(fill(&[0.0, 0.0, 0.5, bad, 0.0, 0.5, bad, 0.0]));
+            assert!(f.handles.is_some(), "{f:?}");
+        }
         // A tail of four values, or an axis of no length, keeps the angle
         // and the edge pad.
         for tail in [
@@ -18311,6 +18677,109 @@ pub(crate) mod tests {
         let own = r#"{"transparency":{"fill":{"type":"1"},"uniformTransparency":"0.2"}}"#;
         let s = rect(own, transparency_record_v16(0, 40.0, 1));
         assert!((s.opacity - 0.8).abs() < 1e-9, "{}", s.opacity);
+    }
+
+    /// #1238 (a version 27 drawing of a car): a transparency taken off
+    /// leaves its section in the style string with fill type 0 and the
+    /// old amounts, and no transparency argument; the lamps and the
+    /// grille opened see-through or gone. And the section's `mode` is
+    /// the merge mode, which opened as Normal with a warning, so the
+    /// highlights and shades lay over the paint as flat patches.
+    #[test]
+    fn style_string_transparency_taken_off_and_merge_modes() {
+        use tracedraw_core::live::{Effect, MergeMode};
+        let rect = |style: &str, op: Option<Vec<u8>>| {
+            let style = [u32s(&[1, style.len() as u32]), style.as_bytes().to_vec()].concat();
+            let mut args = vec![
+                (ARG_STYLE_STRING, style),
+                (ARG_COORDS, f64s(&[254_000.0, 254_000.0, 1.0, 1.0])),
+            ];
+            if let Some(op) = op {
+                args.insert(0, (ARG_OPACITY, op));
+            }
+            let body = [
+                chunk(b"mcfg", &mcfg(27, 2_540_000, 2_540_000)),
+                list(
+                    b"page",
+                    &list(
+                        b"layr",
+                        &list(b"obj ", &chunk(b"loda", &loda(OBJ_RECT, &args))),
+                    ),
+                ),
+            ]
+            .concat();
+            let (doc, rep) = parse(&riff(b"CDRR", &body), 27);
+            assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+            (first_shape(&doc).clone(), rep)
+        };
+        let style = |ty: u8, amount: &str, mode: u8| {
+            format!(
+                r#"{{"transparency":{{"fill":{{"type":"{ty}"}},"uniformTransparency":"{amount}","mode":"{mode}"}}}}"#
+            )
+        };
+        // Taken off: solid, whatever amount and mode were left behind.
+        let (s, rep) = rect(&style(0, "1", 9), None);
+        assert_eq!(s.opacity, 1.0);
+        assert!(s.effects.is_empty(), "{:?}", s.effects);
+        assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+        // The same section with the argument is a transparency.
+        let (s, _) = rect(
+            &style(0, "0.3", 0),
+            Some(transparency_record_v16(0, 30.0, 1)),
+        );
+        assert!((s.opacity - 0.7).abs() < 1e-9, "{}", s.opacity);
+        // And type 1 without the argument is one too.
+        let (s, _) = rect(&style(1, "0.3", 0), None);
+        assert!((s.opacity - 0.7).abs() < 1e-9, "{}", s.opacity);
+        // The merge modes seen, each a mask of the opacity so merged.
+        for (code, mode) in [
+            (7, MergeMode::Add),
+            (8, MergeMode::Subtract),
+            (9, MergeMode::Multiply),
+            (29, MergeMode::Overlay),
+        ] {
+            let (s, rep) = rect(
+                &style(1, "0.5", code),
+                Some(transparency_record_v16(0, 50.0, 1)),
+            );
+            assert!(rep.warnings.is_empty(), "{code}: {:?}", rep.warnings);
+            assert_eq!(s.opacity, 1.0, "{code}");
+            match s.effects.as_slice() {
+                [Effect::Transparency {
+                    mask: Fill::Solid(Color::Gray { v }),
+                    merge,
+                    ..
+                }] => {
+                    assert_eq!(*merge, mode, "{code}");
+                    assert!((v - 0.5).abs() < 1e-6, "{code}: {v}");
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+        // A merge mode on an object that hides nothing still merges.
+        let (s, _) = rect(&style(1, "0", 9), Some(transparency_record_v16(0, 0.0, 1)));
+        assert!(
+            matches!(
+                s.effects.as_slice(),
+                [Effect::Transparency {
+                    merge: MergeMode::Multiply,
+                    ..
+                }]
+            ),
+            "{:?}",
+            s.effects
+        );
+        // A code outside the table: Normal, named in a warning.
+        let (s, rep) = rect(
+            &style(1, "0.5", 99),
+            Some(transparency_record_v16(0, 50.0, 1)),
+        );
+        assert!((s.opacity - 0.5).abs() < 1e-9, "{}", s.opacity);
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("merge mode 99")),
+            "{:?}",
+            rep.warnings
+        );
     }
 
     /// #3095: a fountain transparency in a version 18 file, each kind

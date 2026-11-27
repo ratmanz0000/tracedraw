@@ -7,6 +7,7 @@
 //! preview; Voronoi, stippling and halftone can pick the selection as
 //! their outline or picture.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::{tr, trf};
 use crate::shape_gen::{
@@ -74,7 +75,7 @@ fn growth_controls(app: &mut App, ui: &mut Ui) -> Arc<PreviewData> {
             (tr("shapegen.growth_run"), "shapegen.growth_run")
         };
         if ui
-            .add_enabled(running || !settled, egui::Button::new(label))
+            .add_enabled(running || !settled, crate::ui::btn_icons::Ib::with_text(key, label))
             .rich_tip(crate::ui::tips::keyed(key))
             .clicked()
         {
@@ -83,7 +84,7 @@ fn growth_controls(app: &mut App, ui: &mut Ui) -> Arc<PreviewData> {
         if ui
             .add_enabled(
                 has_doc && points > 0,
-                egui::Button::new(tr("shapegen.growth_stop")),
+                crate::ui::btn_icons::Ib::new("shapegen.growth_stop"),
             )
             .rich_tip(crate::ui::tips::keyed("shapegen.growth_stop"))
             .clicked()
@@ -296,7 +297,9 @@ impl PreviewMap {
 }
 
 fn draw_preview(ui: &mut Ui, data: &PreviewData, sense: Sense) -> (egui::Response, PreviewMap) {
-    let w = ui.available_width().clamp(120.0, 320.0);
+    // Never wider than the panel: a box wider than a narrow panel ran
+    // past its edge (#4323).
+    let w = crate::ui::docker_form::fit_w(ui, 320.0);
     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, w), sense);
     let painter = ui.painter_at(r);
     painter.rect_filled(r, 0.0, Color32::WHITE);
@@ -453,7 +456,7 @@ fn edit_pins(app: &mut App, data: &PreviewData, resp: &egui::Response, pm: Previ
     }
     // The end first: a pin with no pull yet is moved by its end.
     let hit = |p: Pos2| -> Option<(bool, usize)> {
-        let near = |q: Pos2| q.distance(p) <= 8.0;
+        let near = |q: Pos2| q.distance(p) <= GRAB_PX;
         screen
             .iter()
             .position(|(_, b)| near(*b))
@@ -467,7 +470,7 @@ fn edit_pins(app: &mut App, data: &PreviewData, resp: &egui::Response, pm: Previ
     };
     let id = resp.id.with("dragged_pin");
     if resp.drag_started() {
-        let target = resp.interact_pointer_pos().and_then(|p| {
+        let target = press_pos(resp).and_then(|p| {
             hit(p).or_else(|| {
                 (s.warp_pins.len() < MAX_PINS).then(|| {
                     let (x, y) = pm.to_drawing(data, p);
@@ -521,6 +524,7 @@ fn deform_split(app: &mut App, ui: &mut Ui, units: crate::app::Units, precision:
 }
 
 fn deform_split_body(app: &mut App, ui: &mut Ui, units: crate::app::Units, precision: usize) {
+    let split_before = app.shape_gen.split_mode;
     {
         let s = &mut app.shape_gen;
         ui.add(
@@ -542,7 +546,7 @@ fn deform_split_body(app: &mut App, ui: &mut Ui, units: crate::app::Units, preci
         if !s.warp_pins.is_empty() {
             indented(ui, |ui| {
                 if ui
-                    .button(tr("shapegen.warp_clear"))
+                    .ibutton("shapegen.warp_clear")
                     .rich_tip(crate::ui::tips::keyed("shapegen.warp_clear"))
                     .clicked()
                 {
@@ -581,17 +585,24 @@ fn deform_split_body(app: &mut App, ui: &mut Ui, units: crate::app::Units, preci
     if app.shape_gen.split_mode == SplitMode::Off {
         return;
     }
-    let picked = app.shape_gen.split_shape.is_some();
-    let text = if picked {
-        tr("shapegen.split_picked")
-    } else {
-        tr("shapegen.split_none")
-    };
-    ui.add(egui::Label::new(egui::RichText::new(text).color(Tokens::text_dim())).wrap());
     let can = !app.selection.is_empty() && app.shape_gen_selected().is_none();
+    // A way of splitting chosen with no shape picked yet takes the
+    // selection, when there is one: the inside and outside choices
+    // seemed to do nothing, as they wait for a shape (#4324).
+    if split_before == SplitMode::Off && app.shape_gen.split_shape.is_none() && can {
+        app.shape_gen_pick_split();
+    }
+    let picked = app.shape_gen.split_shape.is_some();
+    let (text, color) = if picked {
+        (tr("shapegen.split_picked"), Tokens::text_dim())
+    } else {
+        // Said plainly: nothing changes until a shape is picked.
+        (tr("shapegen.split_none"), ui.visuals().warn_fg_color)
+    };
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(can, egui::Button::new(tr("shapegen.split_pick")))
+            .add_enabled(can, crate::ui::btn_icons::Ib::new("shapegen.split_pick"))
             .rich_tip(crate::ui::tips::keyed("shapegen.split_pick"))
             .clicked()
         {
@@ -599,13 +610,27 @@ fn deform_split_body(app: &mut App, ui: &mut Ui, units: crate::app::Units, preci
         }
         if picked
             && ui
-                .button(tr("shapegen.clear_source"))
+                .ibutton("shapegen.clear_source")
                 .rich_tip(crate::ui::tips::keyed("shapegen.split_clear"))
                 .clicked()
         {
             app.shape_gen_clear_split();
         }
     });
+}
+
+/// How far, in screen points, a press in the preview still grabs a
+/// control point (a Voronoi site, a pin): a press a little beside one
+/// added a new point instead (#4323).
+const GRAB_PX: f32 = 12.0;
+
+/// Where the press that started a drag went down: egui starts a drag only
+/// once the pointer has moved a few points, and judging the point to grab
+/// from there missed points pressed right on (#4323).
+fn press_pos(resp: &egui::Response) -> Option<Pos2> {
+    resp.ctx
+        .input(|i| i.pointer.press_origin())
+        .or_else(|| resp.interact_pointer_pos())
 }
 
 /// Voronoi sites edited in the preview: drag one to move it, double
@@ -623,7 +648,7 @@ fn edit_sites(app: &mut App, data: &PreviewData, resp: &egui::Response, pm: Prev
             .iter()
             .enumerate()
             .map(|(k, (x, y))| (k, pm.to_screen(data, *x, *y).distance(p)))
-            .filter(|(_, d)| *d <= 8.0)
+            .filter(|(_, d)| *d <= GRAB_PX)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(k, _)| k)
     };
@@ -652,7 +677,7 @@ fn edit_sites(app: &mut App, data: &PreviewData, resp: &egui::Response, pm: Prev
         }
     }
     if resp.drag_started() {
-        let k = resp.interact_pointer_pos().and_then(hit);
+        let k = press_pos(resp).and_then(hit);
         resp.ctx.data_mut(|d| d.insert_temp(id, k));
         if k.is_some() {
             take(s);
@@ -671,7 +696,8 @@ fn edit_sites(app: &mut App, data: &PreviewData, resp: &egui::Response, pm: Prev
             .data_mut(|d| d.insert_temp::<Option<usize>>(id, None));
     }
     if resp.double_clicked() {
-        if let Some(p) = resp.interact_pointer_pos() {
+        // A double click on a point is not a new point beside it.
+        if let Some(p) = resp.interact_pointer_pos().filter(|p| hit(*p).is_none()) {
             take(s);
             if s.vor_points.len() < crate::shape_gen_cells::MAX_SITES {
                 s.vor_points.push(norm(p));
@@ -748,7 +774,8 @@ fn combo<T: Copy + PartialEq>(
 ) {
     crate::ui::keynav::ComboBox::from_id_salt(id)
         .selected_text(tr(key_of(*v)))
-        .width(ui.available_width().clamp(120.0, 190.0))
+        .width(crate::ui::docker_form::fit_w(ui, 190.0))
+        .truncate()
         .show_ui(ui, |ui| {
             for k in all {
                 ui.selectable_value(v, *k, tr(key_of(*k)));
@@ -798,7 +825,7 @@ fn seed_row(ui: &mut Ui, s: &mut ShapeGenSettings) {
         )
         .rich_tip(crate::ui::tips::keyed("shapegen.seed"));
         if ui
-            .button(tr("shapegen.new_seed"))
+            .ibutton("shapegen.new_seed")
             .rich_tip(crate::ui::tips::keyed("shapegen.new_seed"))
             .clicked()
         {
@@ -827,7 +854,7 @@ fn source_row(app: &mut App, ui: &mut Ui) {
     let can = !app.selection.is_empty() && app.shape_gen_selected().is_none();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(can, egui::Button::new(tr("shapegen.use_selection")))
+            .add_enabled(can, crate::ui::btn_icons::Ib::new("shapegen.use_selection"))
             .rich_tip(crate::ui::tips::keyed("shapegen.use_selection"))
             .clicked()
         {
@@ -835,7 +862,7 @@ fn source_row(app: &mut App, ui: &mut Ui) {
         }
         if picked
             && ui
-                .button(tr("shapegen.clear_source"))
+                .ibutton("shapegen.clear_source")
                 .rich_tip(crate::ui::tips::keyed("shapegen.clear_source"))
                 .clicked()
         {
@@ -845,7 +872,10 @@ fn source_row(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn shape_generator(app: &mut App, ui: &mut Ui) {
-    ui.spacing_mut().slider_width = 110.0;
+    // The fields fit the panel at any width: fixed widths ran past the
+    // edge of a narrow panel, hiding the end of the rows and the names of
+    // the buttons below (#4323).
+    crate::ui::docker_form::fit_sliders(ui);
     let units = app.units;
     let precision = app.settings.precision.min(10) as usize;
     {
@@ -1241,7 +1271,20 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                 }
             }
             GenKind::ConeTemplate => {
-                row(ui, &tr("shapegen.cone_top"), |ui| {
+                // How the object was measured (#4232): round with a tape,
+                // and up its side.
+                indented(ui, |ui| {
+                    ui.checkbox(&mut s.cone_round, tr("shapegen.cone_round"))
+                        .rich_tip(crate::ui::tips::keyed("shapegen.cone_round"));
+                    ui.checkbox(&mut s.cone_along_side, tr("shapegen.cone_along_side"))
+                        .rich_tip(crate::ui::tips::keyed("shapegen.cone_along_side"));
+                });
+                let (top_key, bottom_key) = if s.cone_round {
+                    ("shapegen.cone_top_round", "shapegen.cone_bottom_round")
+                } else {
+                    ("shapegen.cone_top", "shapegen.cone_bottom")
+                };
+                row(ui, &tr(top_key), |ui| {
                     length(
                         ui,
                         units,
@@ -1249,10 +1292,10 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                         &mut s.cone_top,
                         0.0,
                         5000.0,
-                        "shapegen.cone_top",
+                        top_key,
                     )
                 });
-                row(ui, &tr("shapegen.cone_bottom"), |ui| {
+                row(ui, &tr(bottom_key), |ui| {
                     length(
                         ui,
                         units,
@@ -1260,7 +1303,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                         &mut s.cone_bottom,
                         0.0,
                         5000.0,
-                        "shapegen.cone_bottom",
+                        bottom_key,
                     )
                 });
                 row(ui, &tr("shapegen.cone_height"), |ui| {
@@ -1283,6 +1326,17 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                         0.0,
                         500.0,
                         "shapegen.cone_tab",
+                    )
+                });
+                row(ui, &tr("shapegen.cone_overlap"), |ui| {
+                    length(
+                        ui,
+                        units,
+                        precision,
+                        &mut s.cone_overlap,
+                        0.0,
+                        500.0,
+                        "shapegen.cone_overlap",
                     )
                 });
                 row(ui, &tr("shapegen.cone_bleed"), |ui| {
@@ -1439,7 +1493,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                 }
                 ui.horizontal(|ui| {
                     if ui
-                        .button(tr("shapegen.relax_once"))
+                        .ibutton("shapegen.relax_once")
                         .rich_tip(crate::ui::tips::keyed("shapegen.relax_once"))
                         .clicked()
                     {
@@ -1447,7 +1501,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                     }
                     if !s.vor_points.is_empty()
                         && ui
-                            .button(tr("shapegen.reset_points"))
+                            .ibutton("shapegen.reset_points")
                             .rich_tip(crate::ui::tips::keyed("shapegen.reset_points"))
                             .clicked()
                     {
@@ -1759,7 +1813,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
                     }
                     t => {
                         if ui
-                            .button(tr("shapegen.frac_edit"))
+                            .ibutton("shapegen.frac_edit")
                             .rich_tip(crate::ui::tips::keyed("shapegen.frac_edit"))
                             .clicked()
                         {
@@ -2300,35 +2354,40 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
     let has_doc = app.active_layer().is_some();
     if wide_button(
         ui,
-        &tr("shapegen.create"),
+        "shapegen.create",
         has_doc && data.count > 0,
         &crate::ui::tips::keyed("shapegen.create"),
     ) {
         app.shape_gen_create();
     }
-    if let Some((_, saved)) = &selected {
-        ui.horizontal(|ui| {
+    // The buttons go onto a second line when a narrow panel has no room
+    // (#4323).
+    ui.horizontal_wrapped(|ui| {
+        if let Some((_, saved)) = &selected {
             if ui
-                .button(tr("shapegen.update"))
+                .ibutton("shapegen.update")
                 .rich_tip(crate::ui::tips::keyed("shapegen.update"))
                 .clicked()
             {
                 app.shape_gen_update();
             }
             if ui
-                .button(tr("shapegen.load"))
+                .ibutton("shapegen.load")
                 .rich_tip(crate::ui::tips::keyed("shapegen.load"))
                 .clicked()
             {
                 app.shape_gen = saved.clone();
             }
-        });
-    }
+        }
+        if crate::ui::docker_form::reset_button(ui) {
+            app.shape_gen.reset();
+        }
+    });
     if app.shape_gen.kind == GenKind::SliceGrid {
         let can = has_doc && !app.selection.is_empty() && selected.is_none();
         if wide_button(
             ui,
-            &tr("shapegen.slice_apply"),
+            "shapegen.slice_apply",
             can,
             &crate::ui::tips::keyed("shapegen.slice_apply"),
         ) {
@@ -2338,7 +2397,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
         let can = has_doc && !app.selection.is_empty() && selected.is_none();
         if wide_button(
             ui,
-            &tr("shapegen.wrap"),
+            "shapegen.wrap",
             can,
             &crate::ui::tips::keyed("shapegen.wrap"),
         ) {
@@ -2346,7 +2405,7 @@ pub fn shape_generator(app: &mut App, ui: &mut Ui) {
         }
     } else if wide_button(
         ui,
-        &tr("shapegen.make_pattern"),
+        "shapegen.make_pattern",
         has_doc && data.count > 0,
         &crate::ui::tips::keyed("shapegen.make_pattern"),
     ) && app.shape_gen_create().is_some()

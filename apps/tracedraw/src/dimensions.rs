@@ -398,6 +398,18 @@ impl DimensionStyle {
         }
     }
 
+    /// How much larger than their usual size the arrowheads are drawn:
+    /// 1 up to a line [`ARROW_LINE`] wide, then in step with the line, so
+    /// a thick line does not cover them (#4319).
+    fn arrow_scale(&self) -> f64 {
+        let w = self.line_width.min(50.0);
+        if w.is_finite() && w > ARROW_LINE {
+            w / ARROW_LINE
+        } else {
+            1.0
+        }
+    }
+
     /// The extension gap and overshoot, kept finite and in range.
     fn lengths(&self) -> (f64, f64) {
         let ok = |v: f64, d: f64| {
@@ -527,9 +539,14 @@ fn find_value(text: &str, value: &str) -> Option<usize> {
     })
 }
 
-/// Arrowheads: length and half width, mm.
+/// Arrowheads: length and half width, mm, for lines up to
+/// [`ARROW_LINE`] wide.
 const ARROW_LEN: f64 = 3.0;
 const ARROW_HALF: f64 = 1.0;
+/// The widest line, mm, the arrowheads keep their size for; a wider line
+/// makes them larger in step, each half width twice the line's width
+/// (#4319).
+const ARROW_LINE: f64 = ARROW_HALF / 2.0;
 /// Gap between the label and its line, and how far extension lines run
 /// past the dimension line, mm.
 const GAP: f64 = 1.0;
@@ -876,27 +893,31 @@ impl Dimension {
         // The open and tick marks are strokes, drawn with the lines.
         let mut marks = BezPath::new();
         let style = self.style.arrows;
+        // Arrowheads grow with a thick line, or the line covers them
+        // (#4319).
+        let k = self.style.arrow_scale();
+        let (arrow_len, arrow_half) = (ARROW_LEN * k, ARROW_HALF * k);
         let mut arrow = |tip: Point, back_dir: Vec2| {
             let n = Vec2::new(-back_dir.y, back_dir.x);
-            let back = tip + back_dir * ARROW_LEN;
+            let back = tip + back_dir * arrow_len;
             match style {
                 ArrowStyle::Filled => {
                     arrows.move_to(tip);
-                    arrows.line_to(back + n * ARROW_HALF);
-                    arrows.line_to(back - n * ARROW_HALF);
+                    arrows.line_to(back + n * arrow_half);
+                    arrows.line_to(back - n * arrow_half);
                     arrows.close_path();
                 }
                 ArrowStyle::Open => {
-                    marks.move_to(back + n * ARROW_HALF);
+                    marks.move_to(back + n * arrow_half);
                     marks.line_to(tip);
-                    marks.line_to(back - n * ARROW_HALF);
+                    marks.line_to(back - n * arrow_half);
                 }
                 ArrowStyle::Dot => {
-                    arrows.extend(kurbo::Circle::new(tip, ARROW_HALF).path_elements(0.01));
+                    arrows.extend(kurbo::Circle::new(tip, arrow_half).path_elements(0.01));
                 }
                 ArrowStyle::Tick => {
                     // At 45 degrees across the line.
-                    let d = (n + back_dir) * (ARROW_LEN * 0.5 / 2f64.sqrt());
+                    let d = (n + back_dir) * (arrow_len * 0.5 / 2f64.sqrt());
                     marks.move_to(tip - d);
                     marks.line_to(tip + d);
                 }
@@ -947,7 +968,7 @@ impl Dimension {
                 let arrow_len = if self.style.arrows == ArrowStyle::None {
                     0.0
                 } else {
-                    ARROW_LEN
+                    arrow_len
                 };
                 let mid = a2.midpoint(b2) + dir * along.offset(len, half, arrow_len);
                 // The dimension line, with a gap for a centred label.
@@ -1464,7 +1485,15 @@ impl App {
         // transform, baked in when it is drawn again, leaves them there),
         // while the line or arc keeps the move.
         let by_itself = g.transform != Affine::IDENTITY;
-        if !moved.is_empty() && !by_itself {
+        // The line or arc moves only when what it measures moved as one
+        // (every held point by the same step); an object resized or
+        // reshaped under one end leaves it in place, so a distance that
+        // did not change keeps its dimension where it was (#4224).
+        let rigid = moved.len() == d.anchors.len()
+            && moved
+                .first()
+                .is_some_and(|m0| moved.iter().all(|m| (*m - *m0).hypot() <= 1e-6));
+        if !moved.is_empty() && !by_itself && rigid {
             let shift = moved.iter().fold(Vec2::ZERO, |s, v| s + *v) / moved.len() as f64;
             match &mut next.measure {
                 Measure::Linear { at, .. } | Measure::Angular { at, .. } => *at += shift,
@@ -1837,6 +1866,39 @@ impl App {
             cmds.push(Command::DeleteShapes { shapes });
         }
         Some(cmds)
+    }
+
+    /// The dimensions (not among `ids`) that measure one of the objects
+    /// `ids` or an object inside them: those with a point held to it
+    /// (#4211). Delete takes them along when the dimension bar's
+    /// "Delete dimensions with the object" is on.
+    pub(crate) fn dimensions_measuring(&self, ids: &[ShapeId]) -> Vec<ShapeId> {
+        fn inside(s: &Shape, out: &mut Vec<ShapeId>) {
+            out.push(s.id);
+            match &s.kind {
+                ShapeKind::Group { children } => children.iter().for_each(|c| inside(c, out)),
+                ShapeKind::ClipFrame { frame, contents } => {
+                    inside(frame, out);
+                    contents.iter().for_each(|c| inside(c, out));
+                }
+                _ => {}
+            }
+        }
+        let doc = self.doc();
+        let mut gone = Vec::new();
+        for id in ids {
+            if let Some(s) = doc.find_shape(*id) {
+                inside(s, &mut gone);
+            }
+        }
+        doc.all_layers()
+            .flat_map(|l| &l.shapes)
+            .filter(|s| !ids.contains(&s.id))
+            .filter(|s| {
+                Dimension::of(s).is_some_and(|d| d.anchors.iter().any(|a| gone.contains(&a.shape)))
+            })
+            .map(|s| s.id)
+            .collect()
     }
 
     /// Dynamic dimensioning: dimensions moved, scaled, turned or skewed
@@ -2464,6 +2526,43 @@ mod tests {
     }
 
     /// A dimension drawn between two nodes of an object holds to them:
+    /// With "Delete dimensions with the object" on, deleting a measured
+    /// object deletes its dimension in the same step (one Undo brings
+    /// both back) and leaves a dimension of another object; off (the
+    /// default), the dimension stays (#4211).
+    #[test]
+    fn deleting_a_measured_object_can_take_its_dimensions() {
+        let mut app = App::headless();
+        app.view.zoom = 1.0;
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 40.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let a = rect(&mut app, 10.0);
+        let b = rect(&mut app, 100.0);
+        app.create_dimension(Point::new(10.0, 10.0), Point::new(50.0, 10.0), Point::new(30.0, 0.0));
+        let dim_a = app.selection[0];
+        app.create_dimension(Point::new(100.0, 10.0), Point::new(140.0, 10.0), Point::new(120.0, 0.0));
+        let dim_b = app.selection[0];
+        assert!(!app.settings.delete_dimensions_with_object, "off by default");
+        app.select(vec![a]);
+        app.delete_selection();
+        assert!(app.doc().find_shape(dim_a).is_some(), "off: the dimension stays");
+        app.undo();
+        app.settings.delete_dimensions_with_object = true;
+        app.select(vec![a]);
+        app.delete_selection();
+        assert!(app.doc().find_shape(a).is_none());
+        assert!(app.doc().find_shape(dim_a).is_none(), "on: it goes too");
+        assert!(app.doc().find_shape(dim_b).is_some() && app.doc().find_shape(b).is_some());
+        app.undo();
+        assert!(app.doc().find_shape(a).is_some() && app.doc().find_shape(dim_a).is_some());
+    }
+
     /// resizing or moving the object takes the dimension along and its
     /// value follows; a dimension moved by itself stays held (#1492); one whose
     /// object is deleted lets go (#838).
@@ -3347,6 +3446,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(odd.lengths(), (0.0, OVERSHOOT));
+    }
+
+    /// #4319: a thick line makes the arrowheads larger, so it does not
+    /// cover them; a thin one keeps their usual size.
+    #[test]
+    fn arrowheads_grow_with_a_thick_line() {
+        let measure = Measure::Linear {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(100.0, 0.0),
+            at: Point::new(0.0, 20.0),
+        };
+        let ids = [ShapeId(1), ShapeId(2), ShapeId(3)];
+        let heads = |line_width: f64| {
+            let d = Dimension::new(
+                measure,
+                DimensionStyle {
+                    line_width,
+                    ..Default::default()
+                },
+            );
+            let [_, h, _] = d.shapes(ids, "Arial", Units::Millimeters);
+            match &h.kind {
+                ShapeKind::Path { path, .. } => path.bounding_box().height(),
+                _ => panic!("path"),
+            }
+        };
+        assert!((heads(0.0) - 2.0 * ARROW_HALF).abs() < 1e-6);
+        assert!((heads(0.3) - 2.0 * ARROW_HALF).abs() < 1e-6);
+        // 0.1 inch: the heads are four times as wide as the line.
+        let w = 2.54;
+        assert!((heads(w) - 4.0 * w).abs() < 1e-6, "{}", heads(w));
+        assert!(heads(5.0) > 4.0 * 2.54);
     }
 
     /// Convert to Curves makes a dimension a group of plain curves: its

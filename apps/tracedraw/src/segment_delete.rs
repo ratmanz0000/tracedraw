@@ -604,91 +604,73 @@ fn cuttable(s: &Shape) -> bool {
 /// An object's outline on the page and its box, worked out once for a
 /// click or a drag.
 struct Outline {
-    id: ShapeId,
-    path: BezPath,
+    shape: Shape,
     bounds: Rect,
+    path: std::cell::OnceCell<BezPath>,
 }
 
-fn outlines_of(all: &[Shape]) -> Vec<Outline> {
-    all.iter()
-        .map(|s| {
-            let path = s.page_path();
-            let bounds = path.bounding_box();
-            Outline {
-                id: s.id,
-                path,
-                bounds,
-            }
-        })
-        .collect()
+impl Outline {
+    fn path(&self) -> &BezPath {
+        self.path.get_or_init(|| self.shape.page_path())
+    }
+}
+
+// Horizontal and vertical segments can have boxes with no area.
+fn boxes_meet(a: Rect, b: Rect) -> bool {
+    !(a.x0 > b.x1 || a.x1 < b.x0 || a.y0 > b.y1 || a.y1 < b.y0)
 }
 
 impl App {
-    /// The visible objects of the page's unlocked layers.
-    fn segment_targets(&self) -> Vec<Shape> {
-        // The Shape Builder's Alt: the selected objects alone (#4079).
-        let scope = self.builder.segment_scope.as_ref();
-        self.doc()
-            .page(self.page)
-            .map(|pg| {
-                pg.layers
-                    .iter()
-                    .filter(|l| l.visible && !l.locked)
-                    .flat_map(|l| {
-                        l.shapes
-                            .iter()
-                            .filter(|s| s.visible && !s.locked)
-                            .filter(|s| scope.is_none_or(|ids| ids.contains(&s.id)))
-                            .cloned()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
+    /// Visit visible, unlocked leaves with the enclosing group transforms.
+    /// Selecting a group includes its leaves; selecting a child does not
+    /// include its siblings.
+    fn segment_outlines(&self, scope: Option<&Vec<ShapeId>>) -> Vec<Outline> {
+        use tracedraw_core::geometry::Affine;
 
-    /// The targets with every group opened (not linked groups such as
-    /// text or clip frames): the objects inside take their place, their
-    /// transforms composed with the group's, so a curve in a group is cut
-    /// as one on its own (#427).
-    fn segment_leaves(&self) -> Vec<Shape> {
-        fn open(s: Shape, out: &mut Vec<Shape>) {
+        fn visit(s: &Shape, parent: Affine, scope: Option<&Vec<ShapeId>>, out: &mut Vec<Outline>) {
+            if !s.visible || s.locked {
+                return;
+            }
+            let scope = scope.filter(|ids| !ids.contains(&s.id));
+            let transform = parent * s.transform;
             match &s.kind {
                 ShapeKind::Group { children } => {
-                    for c in children.iter().filter(|c| c.visible && !c.locked) {
-                        let mut c = c.clone();
-                        c.transform = s.transform * c.transform;
-                        open(c, out);
+                    for child in children {
+                        visit(child, transform, scope, out);
                     }
                 }
-                _ => out.push(s),
+                _ if scope.is_none() => {
+                    let mut shape = s.clone();
+                    shape.transform = transform;
+                    out.push(Outline {
+                        bounds: shape.bounds(),
+                        shape,
+                        path: std::cell::OnceCell::new(),
+                    });
+                }
+                _ => {}
             }
         }
+
         let mut out = Vec::new();
-        for s in self.segment_targets() {
-            open(s, &mut out);
+        if let Ok(page) = self.doc().page(self.page) {
+            for layer in page.layers.iter().filter(|l| l.visible && !l.locked) {
+                for shape in &layer.shapes {
+                    visit(shape, Affine::IDENTITY, scope, &mut out);
+                }
+            }
         }
         out
     }
 
-    /// The outlines of the objects other than `id` that can cross
-    /// `reach` (page space): only those whose box meets it, so a click or
-    /// a drag on a crowded page flattens the neighbours, not every object.
+    /// Materialise only the outlines that can cross this object's path.
     fn cutters_near(outlines: &[Outline], id: ShapeId, reach: Rect) -> Vec<Cutter> {
         let reach = reach.inflate(0.1, 0.1);
-        let mut out = Vec::new();
-        for o in outlines {
-            let b = o.bounds;
-            if o.id == id
-                || b.x0 > reach.x1
-                || b.x1 < reach.x0
-                || b.y0 > reach.y1
-                || b.y1 < reach.y0
-            {
-                continue;
-            }
-            out.extend(cutters_of(&o.path));
-        }
-        out
+        outlines
+            .iter()
+            .filter(|o| o.shape.id != id && boxes_meet(o.bounds, reach))
+            .flat_map(|o| cutters_of(o.path()))
+            .collect()
     }
 
     /// The command that leaves `s` (page path `subs`) with the stretches
@@ -749,15 +731,52 @@ impl App {
     /// Remove the virtual segment under `p` (page space). False when no
     /// outline is near.
     pub fn delete_virtual_segment_at(&mut self, p: Point) -> bool {
+        let Some((s, subs, k, stretch_ka)) = self.virtual_segment_under(p, self.builder.segment_scope.as_ref()) else {
+            return false;
+        };
+        let mut cut = vec![Vec::new(); subs.len()];
+        cut[k].push(stretch_ka);
+        if let Some(cmd) = self.segment_delete_command(&s, &subs, &cut) {
+            if let Err(e) = self.engine.run_batch("Delete Segment", &[cmd]) {
+                self.status = e.to_string();
+            }
+            self.engine.document().retain_existing(&mut self.selection);
+        }
+        true
+    }
+
+    /// The virtual segment a click at `p` would remove, as a page path,
+    /// among the objects of `scope` (all when `None`) (#4223).
+    pub fn virtual_segment_at(&self, p: Point, scope: Option<&Vec<ShapeId>>) -> Option<BezPath> {
+        let (_, subs, k, (a, b)) = self.virtual_segment_under(p, scope)?;
+        let sub = &subs[k];
+        let n = sub.segs.len() as f64;
+        let runs = if a <= b { vec![(a, b)] } else { vec![(a, n), (0.0, b)] };
+        let mut out = BezPath::new();
+        for (a, b) in runs {
+            let mut piece = BezPath::new();
+            stretch(&sub.segs, a, b, &mut piece);
+            out.extend(piece.elements().iter().copied());
+        }
+        (out.elements().len() > 1).then_some(out)
+    }
+
+    /// The object nearest `p` within a few pixels, its subpaths, the
+    /// subpath under `p` and the virtual segment of it there.
+    fn virtual_segment_under(
+        &self,
+        p: Point,
+        scope: Option<&Vec<ShapeId>>,
+    ) -> Option<(Shape, Vec<Sub>, usize, (f64, f64))> {
         let tol = 5.0 / self.view.zoom.max(1e-6) as f64;
-        let all = self.segment_leaves();
+        let outlines = self.segment_outlines(scope);
         // The nearest outline within reach (the topmost of equals).
-        let mut found: Option<(Shape, Vec<Sub>, usize, f64, f64)> = None;
-        for s in all.iter().rev().filter(|s| cuttable(s)) {
-            if !s.bounds().inflate(tol, tol).contains(p) {
+        let mut found: Option<(&Outline, Vec<Sub>, usize, f64, f64)> = None;
+        for o in outlines.iter().rev().filter(|o| cuttable(&o.shape)) {
+            if !o.bounds.inflate(tol, tol).contains(p) {
                 continue;
             }
-            let subs = subs_of(&s.page_path());
+            let subs = subs_of(o.path());
             let mut best: Option<(usize, f64, f64)> = None;
             for (k, sub) in subs.iter().enumerate() {
                 for (i, seg) in sub.segs.iter().enumerate() {
@@ -770,82 +789,25 @@ impl App {
             }
             if let Some((k, u, d)) = best {
                 if found.as_ref().is_none_or(|f| d < f.4 - 1e-9) {
-                    found = Some((s.clone(), subs, k, u, d));
+                    found = Some((o, subs, k, u, d));
                 }
             }
         }
-        let Some((s, subs, k, u, _)) = found else {
-            return false;
-        };
-        let reach = s.page_path().bounding_box();
-        let cutters = Self::cutters_near(&outlines_of(&all), s.id, reach);
+        let (o, subs, k, u, _) = found?;
+        let reach = o.path().bounding_box();
+        let cutters = Self::cutters_near(&outlines, o.shape.id, reach);
         let bounds = crossings(&subs, k, &cutters);
-        let mut cut = vec![Vec::new(); subs.len()];
-        cut[k].push(around(&subs[k], &bounds, u));
-        if let Some(cmd) = self.segment_delete_command(&s, &subs, &cut) {
-            if let Err(e) = self.engine.run_batch("Delete Segment", &[cmd]) {
-                self.status = e.to_string();
-            }
-            self.engine.document().retain_existing(&mut self.selection);
-        }
-        true
+        let st = around(&subs[k], &bounds, u);
+        Some((o.shape.clone(), subs, k, st))
     }
 
     /// Remove every virtual segment the freehand stroke through `points`
     /// (page space) crosses, whole, as far as the crossings at its ends,
     /// on all objects at once (#1150). True when something was removed.
     pub fn delete_virtual_segments_along(&mut self, points: &[Point]) -> bool {
-        let points: Vec<Point> = points
-            .iter()
-            .copied()
-            .filter(|p| p.x.is_finite() && p.y.is_finite())
-            .collect();
-        let lines = stroke_lines(&points);
-        let Some(stroke_box) = points
-            .iter()
-            .map(|p| Rect::from_points(*p, *p))
-            .reduce(|a, b| a.union(b))
-        else {
-            return false;
-        };
-        let all = self.segment_leaves();
-        let outlines = outlines_of(&all);
         let mut cmds = Vec::new();
-        for (s, o) in all.iter().zip(&outlines).filter(|(s, _)| cuttable(s)) {
-            let b = o.bounds;
-            if b.x0 > stroke_box.x1
-                || b.x1 < stroke_box.x0
-                || b.y0 > stroke_box.y1
-                || b.y1 < stroke_box.y0
-            {
-                continue;
-            }
-            let subs = subs_of(&o.path);
-            let reached: Vec<bool> = subs
-                .iter()
-                .map(|sub| {
-                    sub.segs
-                        .iter()
-                        .any(|seg| seg_crosses(seg, &lines, stroke_box))
-                })
-                .collect();
-            if !reached.contains(&true) {
-                continue;
-            }
-            let cutters = Self::cutters_near(&outlines, s.id, b);
-            let mut cut = vec![Vec::new(); subs.len()];
-            for (k, sub) in subs.iter().enumerate() {
-                if !reached[k] {
-                    continue;
-                }
-                let bounds = crossings(&subs, k, &cutters);
-                for (a, b) in pieces(sub, &bounds) {
-                    if stretch_crossed(sub, a, b, &lines, stroke_box) {
-                        cut[k].push((a, b));
-                    }
-                }
-            }
-            if let Some(cmd) = self.segment_delete_command(s, &subs, &cut) {
+        for (s, subs, cut) in self.segments_along(points, self.builder.segment_scope.as_ref()) {
+            if let Some(cmd) = self.segment_delete_command(&s, &subs, &cut) {
                 cmds.push(cmd);
             }
         }
@@ -860,6 +822,89 @@ impl App {
         true
     }
 
+    /// The virtual segments a stroke through `points` would remove, as
+    /// page paths, among the objects of `scope` (all when `None`): what a
+    /// drag shows before it ends (#4223).
+    pub fn virtual_segments_along(&self, points: &[Point], scope: Option<&Vec<ShapeId>>) -> Vec<BezPath> {
+        let mut out = Vec::new();
+        for (_, subs, cut) in self.segments_along(points, scope) {
+            for (sub, c) in subs.iter().zip(&cut) {
+                let n = sub.segs.len() as f64;
+                for &(a, b) in c {
+                    let runs = if a <= b { vec![(a, b)] } else { vec![(a, n), (0.0, b)] };
+                    for (a, b) in runs {
+                        let mut p = BezPath::new();
+                        stretch(&sub.segs, a, b, &mut p);
+                        if p.elements().len() > 1 {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The objects a stroke through `points` crosses, each with its
+    /// subpaths and the stretches of them it removes.
+    #[allow(clippy::type_complexity)]
+    fn segments_along(
+        &self,
+        points: &[Point],
+        scope: Option<&Vec<ShapeId>>,
+    ) -> Vec<(Shape, Vec<Sub>, Vec<Vec<(f64, f64)>>)> {
+        let points: Vec<Point> = points
+            .iter()
+            .copied()
+            .filter(|p| p.x.is_finite() && p.y.is_finite())
+            .collect();
+        let lines = stroke_lines(&points);
+        let Some(stroke_box) = points
+            .iter()
+            .map(|p| Rect::from_points(*p, *p))
+            .reduce(|a, b| a.union(b))
+        else {
+            return Vec::new();
+        };
+        let outlines = self.segment_outlines(scope);
+        let mut found = Vec::new();
+        for o in outlines.iter().filter(|o| cuttable(&o.shape)) {
+            let s = &o.shape;
+            if !boxes_meet(o.bounds, stroke_box) {
+                continue;
+            }
+            let subs = subs_of(o.path());
+            let reached: Vec<bool> = subs
+                .iter()
+                .map(|sub| {
+                    sub.segs
+                        .iter()
+                        .any(|seg| seg_crosses(seg, &lines, stroke_box))
+                })
+                .collect();
+            if !reached.contains(&true) {
+                continue;
+            }
+            let cutters = Self::cutters_near(&outlines, s.id, o.path().bounding_box());
+            let mut cut = vec![Vec::new(); subs.len()];
+            for (k, sub) in subs.iter().enumerate() {
+                if !reached[k] {
+                    continue;
+                }
+                let bounds = crossings(&subs, k, &cutters);
+                for (a, b) in pieces(sub, &bounds) {
+                    if stretch_crossed(sub, a, b, &lines, stroke_box) {
+                        cut[k].push((a, b));
+                    }
+                }
+            }
+            if cut.iter().any(|c| !c.is_empty()) {
+                found.push((s.clone(), subs, cut));
+            }
+        }
+        found
+    }
+
     /// Remove every virtual segment `rect` touches (page space), whole:
     /// a stretch with any part inside the rectangle goes, as far as the
     /// crossings at its ends, and a closed outline nothing crosses goes
@@ -868,17 +913,16 @@ impl App {
         if !(rect.width().is_finite() && rect.height().is_finite()) {
             return false;
         }
-        let all = self.segment_leaves();
-        let outlines = outlines_of(&all);
+        let outlines = self.segment_outlines(self.builder.segment_scope.as_ref());
         let mut cmds = Vec::new();
-        for (s, o) in all.iter().zip(&outlines).filter(|(s, _)| cuttable(s)) {
+        for o in outlines.iter().filter(|o| cuttable(&o.shape)) {
+            let s = &o.shape;
             // Overlap, not area: a level or upright line has a box of no
             // height or width.
-            let b = o.bounds;
-            if b.x0 > rect.x1 || b.x1 < rect.x0 || b.y0 > rect.y1 || b.y1 < rect.y0 {
+            if !boxes_meet(o.bounds, rect) {
                 continue;
             }
-            let subs = subs_of(&o.path);
+            let subs = subs_of(o.path());
             // Only subpaths the rectangle reaches need their crossings.
             let reached: Vec<bool> = subs
                 .iter()
@@ -887,7 +931,7 @@ impl App {
             if !reached.contains(&true) {
                 continue;
             }
-            let cutters = Self::cutters_near(&outlines, s.id, b);
+            let cutters = Self::cutters_near(&outlines, s.id, o.path().bounding_box());
             let mut cut = vec![Vec::new(); subs.len()];
             for (k, sub) in subs.iter().enumerate() {
                 if !reached[k] {
@@ -1135,6 +1179,40 @@ mod tests {
     /// Curves inside a group (an imported ornament is one) are cut as
     /// curves on their own, by a click and by a drag, the group moved
     /// first so its transform counts (#427: nothing happened).
+    #[test]
+    fn segment_scope_includes_selected_child_but_not_its_sibling() {
+        let mut app = App::headless();
+        let child = line(&mut app, (0.0, 0.0), (30.0, 0.0));
+        let sibling = line(&mut app, (0.0, 10.0), (30.0, 10.0));
+        app.select(vec![child, sibling]);
+        app.group_selection();
+        let group = app.selection[0];
+        app.run(Command::TransformShapes {
+            shapes: vec![group],
+            transform: tracedraw_core::geometry::Affine::translate((100.0, 50.0)),
+        });
+        app.builder.segment_scope = Some(vec![child]);
+
+        assert!(!app.delete_virtual_segment_at(Point::new(115.0, 60.0)));
+        assert!(app.delete_virtual_segment_at(Point::new(115.0, 50.0)));
+        assert!(app.doc().find_shape(sibling).is_some());
+    }
+
+    #[test]
+    fn distant_cutters_do_not_build_paths() {
+        let mut app = App::headless();
+        let target = line(&mut app, (0.0, 0.0), (30.0, 0.0));
+        let near = line(&mut app, (10.0, -5.0), (10.0, 5.0));
+        let far = line(&mut app, (90.0, -5.0), (90.0, 5.0));
+        let outlines = app.segment_outlines(None);
+        let reach = Rect::new(0.0, 0.0, 30.0, 0.0);
+        assert!(!App::cutters_near(&outlines, target, reach).is_empty());
+        for o in &outlines {
+            assert_eq!(o.path.get().is_some(), o.shape.id == near);
+        }
+        assert!(outlines.iter().any(|o| o.shape.id == far));
+    }
+
     #[test]
     fn curves_inside_a_group_are_cut() {
         let mut app = App::headless();

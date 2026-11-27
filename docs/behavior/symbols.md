@@ -28,24 +28,27 @@ missed it; both the panel and the top-left bar carry Cancel beside
 Finish while editing, and the panel carries Duplicate (#3437,
 `ops2::tests::symbol_instances_outline_their_objects_cancel_and_duplicate`).
 
+Revert to objects replaces the instance with its definition at the
+instance's placement. When the instance has its own appearance or
+metadata, the replacement keeps it on an enclosing group. The Symbols
+panel updates counts for all definitions together on document revision.
+
 ## Layout
 
-The row at the top holds three buttons: New symbol from selection
-(enabled when something is selected), By similarity (enabled when the
-selection holds a group) and Revert to objects. Under them a search
-field filters the list by name, case apart.
+The search above the list filters names without regard to case. New
+symbol from selection and By similarity are above the list too.
+Each visible row shows a thumbnail, the symbol name and the number of
+instances. Click a row to select it. Double-click to rename it, Enter
+or clicking away keeps the name, and Esc cancels the edit.
 
-Each symbol takes one row, as before: the small picture of what the
-symbol draws, its name (a double click renames it in place; Enter or a
-click elsewhere keeps the new name, Esc leaves it), Insert, Edit,
-Duplicate, Replace and its instance count, counted on every page and
-master layer, inside groups and clip frames too. While the symbol is
-being edited, its Edit button becomes Finish and Cancel. Replace is
-enabled only when the drawing holds more than one symbol and no symbol
-or clip frame edit is going on; Edit and Duplicate wait for the edit to
-end too. The last By similarity or Replace result stays under the list
-(`App::symbolize_report`). There are no keyboard shortcuts of their own
-for By similarity and Replace; the panel opens with Ctrl+F3.
+Insert, Edit and Replace apply to the selected row and stay below the
+scrolling list. While editing, the footer shows Finish and Cancel.
+Replace names the source and asks for a target. Select the target row
+and use the footer button to apply the replacement, or press Esc to
+cancel. The More menu contains Duplicate, Revert selected instances,
+Revert all instances and Delete. Revert selected acts on canvas
+selection. Revert all keeps copies within other symbol definitions
+before removing the source definition.
 
 ## By similarity (#2343)
 
@@ -53,23 +56,13 @@ By similarity turns every group that copies the selection into an
 instance of one symbol, where each group stands. The sample is the
 selected group, or, when the selection is a symbol instance, that
 symbol's definition, or, for loose selected objects, those objects
-themselves (text apart). The measure is a
-fingerprint of the group's objects that are not text, in order
-(`tracedraw_core::symbols::fingerprint`):
-
-- the kind tag, the same the Objects docker shows (Rectangle, Ellipse,
-  Curve, ...), so a curve never matches a rectangle;
-- the object's box relative to the corner (least x, least y) of the
-  common box of all those objects, each value rounded to a tenth of a
-  millimetre (`(v * 10.0).round()`);
-- the fill, serialised as JSON.
-
-Two groups match when their fingerprints are equal. A copy only moved,
-by its own transform or by its objects' places, matches, because the
-boxes are read from the common corner; a recoloured or reshaped copy
-does not. Text is left out of the measure: a group's labels stay
-editable text beside the instance, in a group that keeps the original
-group's transform and name.
+themselves (text apart). It compares the ordered graphics' normalized
+shape data, including geometry, stroke and appearance. Matching ignores
+object IDs and normalizes the common position. Some equivalent shapes with
+different internal representations can remain separate. Bitmap candidates
+are skipped, as are groups that would lose their own appearance or
+change the stacking order of labels. Labels above the graphics stay
+editable text beside the instance.
 
 The search walks every layer of every page and the master layers, into
 groups and clip frames at any depth. The outermost matching group wins;

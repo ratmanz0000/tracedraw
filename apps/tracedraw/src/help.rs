@@ -48,6 +48,7 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
     match d {
         Dialog::None => HOME,
         Dialog::NewFromTemplate(_) => "templates-styles/templates#new-from-template",
+        Dialog::OptimizeRaster(_) => "bitmaps/color-modes",
         Dialog::BitmapBw(_) => "bitmaps/color-modes#black-and-white",
         Dialog::BitmapDuotone(_) => "bitmaps/color-modes#duotone",
         Dialog::BitmapPaletted(_) => "bitmaps/color-modes#paletted",
@@ -75,6 +76,9 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::EditFill(_) => "color/fills#edit-fill",
         Dialog::TableCount(_) => "objects/tables",
         Dialog::OldCdrVersion { .. } => "get-started/open-and-save#save-as",
+        Dialog::DamagedFile { .. } => "get-started/open-and-save",
+        Dialog::NewRangeLayer(_) => "objects/objects-and-layers#range-pages",
+        Dialog::LayerProperties(st) if st.use_page_range => "objects/objects-and-layers#range-pages",
         Dialog::RenameLayer { .. }
         | Dialog::LayerProperties(_)
         | Dialog::RenameObject { .. }
@@ -108,8 +112,12 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::Formula(_) => "objects/formulas",
         Dialog::TransformEach(_) => "objects/transforming#transform-each",
         Dialog::Flare(_) => "objects/light-flare",
+        Dialog::Chart(_) => "objects/charts",
+        Dialog::Pins(_) => "effects/bend-with-pins",
         Dialog::ConvertToBitmap(_) => "bitmaps/convert-to-bitmap",
         Dialog::PictureCaptions(_) => "bitmaps/picture-captions",
+        Dialog::ScaleKnown(_) => "bitmaps/resample-and-straighten#other",
+        Dialog::TableShapes(_) => "lines-shapes/rectangles-and-ellipses#drawing",
         Dialog::AiTurn(_) | Dialog::AiSketch(_) | Dialog::AiRemove(_) => "bitmaps/ai-photo",
         Dialog::StraightenImage(_) => "bitmaps/resample-and-straighten#straighten",
         Dialog::Resample(_) => "bitmaps/resample-and-straighten#resample",
@@ -175,6 +183,7 @@ pub fn options_topic(p: OptionsPage) -> &'static str {
         Appearance => "customize/customization#appearance",
         Commands => "customize/customization#commands",
         CommandBars => "customize/customization#command-bars",
+        ContextMenus => "customize/customization#context-menus",
         ColorPalette => "customize/customization#color-palette",
         Pick => "customize/tool-options#pick",
         ZoomPan => "customize/tool-options#zoom-pan",
@@ -228,6 +237,7 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::ColorStyles => "color/color-styles",
         DockerTab::ObjectStyles => "templates-styles/object-styles",
         DockerTab::FindReplace => "objects/find-replace",
+        DockerTab::SelectSame => "objects/selecting#select-same",
         DockerTab::Scripts => "customize/scripts",
         DockerTab::Macros => "customize/scripts#macros",
         DockerTab::PrintMerge => "printing/print-merge#docker",
@@ -264,6 +274,7 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::ShapeGenerator => "objects/shape-generator",
         DockerTab::SymbolScatter => "effects/symbol-scatter",
         DockerTab::FrameGenerator => "effects/frame-generator",
+        DockerTab::Mockup => "effects/mockup",
         DockerTab::Shape3d => "effects/revolve-inflate",
         DockerTab::Shelf => "objects/shelf",
         DockerTab::Export => "web-graphics/export-docker",
@@ -482,6 +493,10 @@ mod tests {
             Dialog::Options,
             Dialog::PageNumberSettings,
             Dialog::ConfirmClose,
+            Dialog::DamagedFile {
+                path: "/nowhere/art.cdr".into(),
+                reason: "content/riffData.cdr: Invalid checksum".into(),
+            },
             Dialog::ConfirmResetSettings,
             Dialog::Updates,
             Dialog::Benchmark,
@@ -502,11 +517,10 @@ mod tests {
     /// The topics written in `dialog_topic`, read from this file, so
     /// variants with heavy state are checked too.
     fn dialog_topics_in_source() -> Vec<String> {
-        let mut src =
+        let src =
             std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/help.rs"))
-                .unwrap();
-        // A Windows checkout keeps CRLF; match the bare brace either way.
-        src = src.replace("\r\n", "\n");
+                .unwrap()
+                .replace("\r\n", "\n");
         let start = src.find("pub fn dialog_topic").unwrap();
         let end = src[start..].find("\n}\n").unwrap() + start;
         let body = &src[start..end];

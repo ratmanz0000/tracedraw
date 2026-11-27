@@ -7,6 +7,7 @@
 //! applies what was changed, in one undo step; with nothing selected it
 //! sets the outline new objects get. See docs/behavior/outline-pen.md.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::tr;
 use crate::theme::Tokens;
@@ -59,7 +60,7 @@ pub(crate) fn width_choices(u: crate::app::Units) -> Vec<(f64, String)> {
 }
 
 /// The dash styles the style list offers before the custom ones.
-fn preset_dashes() -> [Vec<f64>; 5] {
+pub(crate) fn preset_dashes() -> [Vec<f64>; 5] {
     [
         vec![],
         vec![4.0, 2.0],
@@ -388,12 +389,12 @@ fn general(ui: &mut Ui, st: &mut OutlinePenState, lib: &crate::ui::line_style::O
             .width(110.0)
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(!st.has, tr("outline_pen.none"))
+                    .iselectable(!st.has, "outline_pen.none")
                     .clicked()
                 {
                     st.has = false;
                 }
-                if ui.selectable_label(false, tr("docker.hairline")).clicked() {
+                if ui.iselectable(false, "docker.hairline").clicked() {
                     st.stroke.width = Stroke::HAIRLINE;
                     touch(st, StrokeField::Width);
                 }
@@ -687,7 +688,7 @@ fn calligraphy(ui: &mut Ui, st: &mut OutlinePenState) {
                     touch(st, StrokeField::NibAngle);
                 }
             });
-            if ui.button(tr("outline_pen.default")).clicked() {
+            if ui.ibutton("outline_pen.default").clicked() {
                 st.stroke.stretch = 1.0;
                 st.stroke.nib_angle = 0.0;
                 touch(st, StrokeField::Stretch);
@@ -724,7 +725,16 @@ fn calligraphy(ui: &mut Ui, st: &mut OutlinePenState) {
 /// drag on it turns and stretches it, and the new stretch and angle come
 /// back (the Outline Pen dialog and the Properties docker, #1200).
 pub fn nib_picture(ui: &mut Ui, stretch: f64, angle: f64) -> Option<(f64, f64)> {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::drag());
+    nib_picture_sized(ui, stretch, angle, 64.0)
+}
+
+pub(super) fn nib_picture_sized(
+    ui: &mut Ui,
+    stretch: f64,
+    angle: f64,
+    size: f32,
+) -> Option<(f64, f64)> {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::drag());
     let p = ui.painter();
     p.rect_filled(rect, 2.0, Color32::WHITE);
     p.rect_stroke(
@@ -739,11 +749,14 @@ pub fn nib_picture(ui: &mut Ui, stretch: f64, angle: f64) -> Option<(f64, f64)> 
         if d.length() > 2.0 {
             let a = (-d.y).atan2(d.x).to_degrees() as f64;
             let a = ((a + 90.0).rem_euclid(180.0)) - 90.0;
-            dragged = Some((f64::from(d.length() / 28.0).clamp(0.1, 1.0), a.round()));
+            dragged = Some((
+                f64::from(d.length() / (size * 28.0 / 64.0)).clamp(0.1, 1.0),
+                a.round(),
+            ));
         }
     }
     let (stretch, angle) = dragged.unwrap_or((stretch, angle));
-    let corners = nib_corners(rect.center(), 24.0, stretch, angle);
+    let corners = nib_corners(rect.center(), size * 24.0 / 64.0, stretch, angle);
     p.add(egui::Shape::convex_polygon(
         corners.to_vec(),
         Color32::BLACK,
@@ -971,7 +984,7 @@ fn variable(ui: &mut Ui, st: &mut OutlinePenState, lib: &crate::ui::line_style::
             }
         }
         if ui
-            .add_enabled(node.is_some(), egui::Button::new(tr("vo.delete_node")))
+            .add_enabled(node.is_some(), crate::ui::btn_icons::Ib::new("vo.delete_node"))
             .clicked()
         {
             if let Some(i) = node {

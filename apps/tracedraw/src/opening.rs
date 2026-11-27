@@ -19,6 +19,7 @@ pub const WINDOW_AFTER: std::time::Duration = std::time::Duration::from_millis(5
 
 /// What a finished read gives.
 pub enum OpenedFile {
+    DamagedCdr(String),
     /// A `.tdraw` drawing and its format version.
     Tdraw(tracedraw_core::Document, u32),
     /// A `.cdr` or `.cmx` drawing and what the reader reported.
@@ -241,13 +242,15 @@ fn read_cdr(
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled")
         .to_string();
-    tracedraw_cdr::open_bytes(&bytes, &title)
-        .map(|(mut doc, report)| {
+    match tracedraw_cdr::open_bytes(&bytes, &title) {
+        Ok((mut doc, report)) => {
             // Clones saved by TraceDraw follow their masters again (#2879).
             crate::object_clone::rebase_clone_links(&mut doc);
-            OpenedFile::Cdr(doc, Box::new(report))
-        })
-        .map_err(|e| e.to_string())
+            Ok(OpenedFile::Cdr(doc, Box::new(report)))
+        }
+        Err(tracedraw_cdr::Error::Damaged(why)) => Ok(OpenedFile::DamagedCdr(why)),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Free physical RAM in bytes; 0 when the OS will not say.

@@ -305,6 +305,175 @@ fn made_once(
     img
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const HANDOFF_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ImageHandoff {
+    key: u64,
+    image: Arc<Pixmap>,
+    expires: std::time::Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static HANDOFF: Mutex<Option<ImageHandoff>> = Mutex::new(None);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn can_handoff(bytes: usize, free: usize, commit: usize, total: usize) -> bool {
+    bytes <= (2usize << 30).min(max_budget(total)) && free.min(commit) >= (768 << 20).max(bytes / 2)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn take_recent_image(key: u64, available: Option<(usize, usize, usize)>) -> Option<Arc<Pixmap>> {
+    let now = std::time::Instant::now();
+    let mut handoff = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let allowed = handoff.as_ref().is_some_and(|entry| {
+        entry.key == key
+            && entry.expires > now
+            && available.is_some_and(|(f, c, t)| can_handoff(entry.image.data().len(), f, c, t))
+    });
+    if allowed {
+        if let Some(entry) = handoff.as_mut() {
+            entry.expires = now + HANDOFF_IDLE;
+            return Some(Arc::clone(&entry.image));
+        }
+    }
+    *handoff = None;
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn offer_recent_image(key: u64, image: &Arc<Pixmap>) {
+    let Some((free, commit, total)) = system_budget() else {
+        return;
+    };
+    if !can_handoff(image.data().len(), free, commit, total) {
+        return;
+    }
+    let mut slot = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return;
+    }
+    let expires = std::time::Instant::now() + HANDOFF_IDLE;
+    *slot = Some(ImageHandoff {
+        key,
+        image: Arc::clone(image),
+        expires,
+    });
+    // Only the current slot's worker may release it. A weak reference
+    // identifies the image without keeping another large allocation alive.
+    let watched = Arc::downgrade(image);
+    if std::thread::Builder::new()
+        .name("bitmap-handoff".into())
+        .spawn(move || loop {
+            let wait = {
+                let mut slot = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = slot
+                    .as_ref()
+                    .filter(|e| std::sync::Weak::ptr_eq(&watched, &Arc::downgrade(&e.image)))
+                else {
+                    return;
+                };
+                let wait = entry
+                    .expires
+                    .saturating_duration_since(std::time::Instant::now());
+                if wait.is_zero() {
+                    *slot = None;
+                    return;
+                }
+                wait
+            };
+            std::thread::sleep(wait);
+        })
+        .is_err()
+    {
+        *slot = None;
+    }
+}
+
+/// One oversized original retained until all bands of a frame finish.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub(crate) struct FrameImageLease {
+    entry: Mutex<Option<(u64, Slot)>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FrameImageLease {
+    fn decode(&self, png: &[u8], budget: usize, oversized: bool) -> Option<Arc<Pixmap>> {
+        let key = fingerprint(png);
+        let slot = {
+            let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+            match entry.as_ref() {
+                Some((current, slot)) if *current == key => Some(slot.clone()),
+                None if oversized => {
+                    let slot = Slot::default();
+                    *entry = Some((key, slot.clone()));
+                    Some(slot)
+                }
+                _ => None,
+            }
+        };
+        match slot {
+            Some(slot) => slot
+                .get_or_init(|| {
+                    if let Some(retained) = take_recent_image(key, system_budget_recent()) {
+                        return Some(retained);
+                    }
+                    let img = decode_in(png, budget)?;
+                    if img.data().len() > budget && img.data().len() > MIN_BUDGET {
+                        offer_recent_image(key, &img);
+                    }
+                    Some(img)
+                })
+                .clone(),
+            None => decode_in(png, budget),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static FRAME_IMAGE: std::cell::RefCell<Option<Arc<FrameImageLease>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn with_frame_image<R>(lease: &Arc<FrameImageLease>, render: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<FrameImageLease>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FRAME_IMAGE.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(FRAME_IMAGE.with(|slot| slot.replace(Some(Arc::clone(lease)))));
+    render()
+}
+
+pub(crate) fn decode_page_bitmap(
+    png: &[u8],
+    level: u32,
+    width: u32,
+    height: u32,
+) -> Option<Arc<Pixmap>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if level == 0 && u64::from(width) * u64::from(height) > MIN_BUDGET as u64 / 4 {
+        let budget = budget();
+        let oversized = u64::from(width) * u64::from(height) > budget as u64 / 4;
+        return FRAME_IMAGE.with(|slot| {
+            let lease = slot.borrow().clone();
+            match lease {
+                Some(lease) => lease.decode(png, budget, oversized),
+                None => decode_in(png, budget),
+            }
+        });
+    }
+    let _ = (width, height);
+    decode_level(png, level)
+}
+
 /// Deepest reduced level kept: 1/4096 of the picture's sides.
 pub(crate) const MAX_LEVEL: u32 = 12;
 
@@ -403,6 +572,51 @@ mod tests {
         let mut p = Pixmap::new(w, h).expect("pixmap");
         p.fill(tiny_skia::Color::from_rgba8(shade, 0, 0, 255));
         p.encode_png().expect("png")
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_pointer_width = "64"))]
+    #[test]
+    fn frame_handoff_requires_safe_memory_headroom() {
+        let mib = 1usize << 20;
+        assert!(can_handoff(1526 * mib, 1800 * mib, 1800 * mib, 8192 * mib));
+        assert!(!can_handoff(1526 * mib, 1800 * mib, 500 * mib, 8192 * mib));
+        assert!(!can_handoff(1526 * mib, 5000 * mib, 5000 * mib, 4096 * mib));
+        assert!(!can_handoff(
+            2200 * mib,
+            5000 * mib,
+            5000 * mib,
+            16384 * mib
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_frame_keeps_one_oversized_picture_between_bands() {
+        let source = png(17, 19, 77);
+        let before = decodes_of(&source);
+        let lease = FrameImageLease::default();
+        let first = lease.decode(&source, 64, true).expect("first band");
+        let pixels = first.data().to_vec();
+        let retained = Arc::downgrade(&first);
+        drop(first);
+        let second = lease.decode(&source, 64, true).expect("later band");
+        assert!(Arc::ptr_eq(
+            &second,
+            &retained.upgrade().expect("kept by frame")
+        ));
+        assert_eq!(second.data(), pixels);
+        assert_eq!(decodes_of(&source), before + 1);
+        let other = png(13, 11, 93);
+        let decoded = lease.decode(&other, 64, true).expect("second picture");
+        let not_retained = Arc::downgrade(&decoded);
+        drop(decoded);
+        assert!(not_retained.upgrade().is_none());
+        drop(second);
+        drop(lease);
+        assert!(retained.upgrade().is_none());
+        let next_frame = FrameImageLease::default();
+        assert!(next_frame.decode(&source, 64, true).is_some());
+        assert_eq!(decodes_of(&source), before + 2);
     }
 
     #[test]

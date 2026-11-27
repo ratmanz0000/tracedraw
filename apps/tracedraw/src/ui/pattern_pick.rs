@@ -158,6 +158,37 @@ impl App {
     /// pattern on the selection (one undo step), its tile as wide as the
     /// picture at the resolution the file records (else 96 dpi).
     pub fn import_pattern_bitmap(&mut self, path: &std::path::Path) {
+        if let Some(fill) = self.read_pattern_bitmap(path) {
+            self.apply_fill(fill);
+        }
+    }
+
+    pub(super) fn import_outline_pattern_bitmap(&mut self, path: &std::path::Path) {
+        let Some(fill) = self.read_pattern_bitmap(path) else {
+            return;
+        };
+        let old = self.first_paint_target().and_then(|shape| shape.stroke);
+        let mut next = old.clone().unwrap_or_default();
+        next.fill = Some(Box::new(fill));
+        next.fill_along = false;
+        self.patch_selection_stroke(
+            &old,
+            &Some(next),
+            &[tracedraw_core::patch::StrokeField::Paint],
+        );
+    }
+
+    pub(super) fn run_outline_pattern_action(&mut self, action: PatternAction) {
+        if matches!(action, PatternAction::ImportBitmap) {
+            crate::files::Dialog::new()
+                .add_filter(tr("file.images"), &PICTURE_EXTENSIONS)
+                .pick_file(self, |app, path| app.import_outline_pattern_bitmap(&path));
+        } else {
+            self.run_pattern_action(action);
+        }
+    }
+
+    fn read_pattern_bitmap(&mut self, path: &std::path::Path) -> Option<Fill> {
         let bytes = match crate::files::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -165,7 +196,7 @@ impl App {
                     "status.could_not_read",
                     &[("p", &path.display().to_string()), ("e", &e.to_string())],
                 );
-                return;
+                return None;
             }
         };
         let img = match image::load_from_memory(&bytes) {
@@ -175,25 +206,24 @@ impl App {
                     "status.could_not_read",
                     &[("p", &path.display().to_string()), ("e", &e.to_string())],
                 );
-                return;
+                return None;
             }
         };
         let (w, h) = (img.width(), img.height());
         let Some(png) = crate::bitmap_fx::encode(&img) else {
-            return;
+            return None;
         };
         let dpi = crate::image_dpi::resolution(&bytes)
             .map(|(x, _)| x)
             .filter(|d| d.is_finite() && *d > 1.0)
             .unwrap_or(96.0);
-        let fill = Fill::Pattern(Pattern::Bitmap {
+        Some(Fill::Pattern(Pattern::Bitmap {
             png: png.into(),
             width_px: w,
             height_px: h,
             size_mm: (f64::from(w) * 25.4 / dpi).max(0.1),
             placement: Default::default(),
-        });
-        self.apply_fill(fill);
+        }))
     }
 
     /// Run what a pattern picker asked for.

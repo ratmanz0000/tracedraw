@@ -27,6 +27,7 @@
 //! no text selected the font, style, size, underline and alignment become
 //! those of new text.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::tr;
 use crate::theme::Tokens;
@@ -446,7 +447,7 @@ pub(crate) fn edit_spans(app: &mut App, f: impl Fn(&mut TextSpan) + Clone) {
         return;
     }
     let cmds: Vec<tracedraw_core::Command> = app
-        .selected_shapes()
+        .selected_text_objects()
         .iter()
         .filter_map(|s| match &s.kind {
             ShapeKind::Text {
@@ -489,14 +490,19 @@ pub(crate) fn edit_spans(app: &mut App, f: impl Fn(&mut TextSpan) + Clone) {
 /// paragraphs of the selection while a text is edited, else every
 /// paragraph (only the settings `f` changes).
 pub(crate) fn edit_paragraphs(app: &mut App, f: impl Fn(&mut ParagraphStyle)) {
-    let ids: Vec<_> = app
-        .selected_shapes()
-        .iter()
-        .filter(|s| matches!(s.kind, ShapeKind::Text { .. }))
-        .map(|s| s.id)
-        .collect();
-    for id in ids {
-        app.edit_paragraph_style(id, &f);
+    let mut cmds = Vec::new();
+    app.for_each_selected_text(|shape, _| {
+        if let Some((_, mut para)) = app.paragraph_style_of(shape) {
+            f(&mut para);
+            cmds.extend(app.paragraph_style_command(shape, para));
+        }
+        false
+    });
+    if !cmds.is_empty() {
+        match app.engine.run_batch("Paragraph Style", &cmds) {
+            Ok(_) => app.note_recorded(&cmds),
+            Err(e) => app.status = e.to_string(),
+        }
     }
 }
 
@@ -594,15 +600,11 @@ pub(crate) fn apply_to_default(app: &mut App) {
 /// Draw the docker.
 pub fn text_docker(app: &mut App, ui: &mut Ui) {
     // The active table cell shows as the text it holds.
-    let first = app.active_cell_text_shape().or_else(|| {
-        app.selected_shapes()
-            .into_iter()
-            .find(|s| matches!(s.kind, ShapeKind::Text { .. }))
-    });
+    let first = app.active_cell_text_shape().or_else(|| app.first_selected_text());
     // With the Shape tool the property bar does not read the text fields:
     // the docker reads them itself, from the first chosen character
     // (#1662).
-    if let Some(t) = first.as_ref().filter(|_| app.chosen_chars_active()) {
+    if let Some(t) = first.as_ref().filter(|_| app.chosen_chars_active() || has_nontext_selection(app)) {
         app.sync_text_defaults_from(t.id);
     }
     let from = (app.settings.text_docker_from as usize).min(SECTIONS.len() - 1);
@@ -656,7 +658,7 @@ fn fill_row(
     icon: &str,
     tip: &str,
     fill: Option<&Fill>,
-    more: &mut bool,
+    more: Option<&mut bool>,
 ) -> Option<Option<Fill>> {
     let mut out = None;
     let color = fill.and_then(|f| f.preview_color());
@@ -682,12 +684,11 @@ fn fill_row(
             out = Some(Some(Fill::Solid(c)));
         }
     });
-    if ui
-        .small_button("\u{2022}\u{2022}\u{2022}")
-        .rich_tip(tr("docker.more_settings"))
-        .clicked()
-    {
-        *more = true;
+    if let Some(more) = more {
+        *more = ui
+            .small_button("\u{2022}\u{2022}\u{2022}")
+            .rich_tip(tr("docker.more_settings"))
+            .clicked();
     }
     out
 }
@@ -907,6 +908,7 @@ pub(crate) fn character_panel(
         }
     });
     // Text fill, background and outline.
+    let text_only = !has_nontext_selection(app);
     let mut more_fill = false;
     let text_fill = first.map(|t| {
         span.as_ref()
@@ -920,7 +922,7 @@ pub(crate) fn character_panel(
             "A",
             &tr("docker.text_fill"),
             text_fill.as_ref(),
-            &mut more_fill,
+            text_only.then_some(&mut more_fill),
         ) {
             set_text_fill(app, f);
         }
@@ -935,7 +937,7 @@ pub(crate) fn character_panel(
             "ab",
             &tr("docker.text_background"),
             bg.as_ref(),
-            &mut more_bg,
+            text_only.then_some(&mut more_bg),
         ) {
             edit_spans(app, move |sp| sp.background = f.clone());
         }
@@ -971,9 +973,9 @@ pub(crate) fn character_panel(
                         .clicked()
                     {
                         if w <= 0.0 {
-                            app.apply_outline_color(None);
+                            set_text_outline(app, None, None);
                         } else {
-                            app.apply_outline_width(w * 25.4 / 72.0);
+                            set_text_outline(app, Some(w * 25.4 / 72.0), None);
                         }
                     }
                 }
@@ -995,16 +997,16 @@ pub(crate) fn character_panel(
             .changed()
         {
             if pt <= 0.0 && !char_scoped {
-                app.apply_outline_color(None);
+                set_text_outline(app, None, None);
             } else {
-                app.apply_outline_width(pt * 25.4 / 72.0);
+                set_text_outline(app, Some(pt * 25.4 / 72.0), None);
             }
         }
         let mut c = stroke.as_ref().map_or(app.current_colors.1, |s| s.color);
         if crate::ui::color_picker::color_button(ui, &mut c) {
-            app.apply_outline_color(Some(c));
+            set_text_outline(app, None, Some(c));
         }
-        if ui
+        if !has_nontext_selection(app) && ui
             .small_button("\u{2022}\u{2022}\u{2022}")
             .rich_tip(tr("docker.more_settings"))
             .clicked()
@@ -1029,6 +1031,365 @@ pub(crate) fn character_panel(
     font_axes(app, ui, &sp);
 }
 
+/// The three independently editable paints of characters.
+#[derive(Clone, Copy)]
+enum TextPaint {
+    Fill,
+    Background,
+    Outline,
+}
+
+impl TextPaint {
+    fn opacity(self, span: &TextSpan) -> f64 {
+        match self {
+            Self::Fill => span.paint_opacity.fill,
+            Self::Background => span.paint_opacity.background,
+            Self::Outline => span.paint_opacity.outline,
+        }
+    }
+
+    fn set(self, span: &mut TextSpan, opacity: f64) {
+        match self {
+            Self::Fill => span.paint_opacity.fill = opacity,
+            Self::Background => span.paint_opacity.background = opacity,
+            Self::Outline => span.paint_opacity.outline = opacity,
+        }
+    }
+
+    fn field(self, app: &mut App, ui: &mut Ui, span: &TextSpan) {
+        let mixed = if app.text_selection_active() || app.chosen_chars_active() {
+            false
+        } else {
+            let mut mixed = false;
+            app.for_each_selected_text(|shape, _| {
+                if let ShapeKind::Text { spans, .. } = &shape.kind {
+                    mixed = spans.iter().any(|s| self.opacity(s) != self.opacity(span));
+                }
+                mixed
+            });
+            mixed
+        };
+        if let Some(opacity) = opacity_field(ui, self.opacity(span), mixed) {
+            edit_spans(app, move |s| self.set(s, opacity));
+        }
+    }
+}
+
+fn opacity_field(ui: &mut Ui, opacity: f64, mixed: bool) -> Option<f64> {
+    let mut percent = opacity.clamp(0.0, 1.0) * 100.0;
+    let response = ui
+        .add_sized(
+            [55.0, 22.0],
+            NumField::new(&mut percent)
+                .range(0.0..=100.0)
+                .max_decimals(1)
+                .suffix(" %".to_owned())
+                .mixed(mixed),
+        )
+        .rich_tip(tr("fxp.opacity"));
+    response.changed().then_some(percent / 100.0)
+}
+
+fn paint_type(ui: &mut Ui, id: &str, fill: Option<&Fill>) -> Option<bool> {
+    let present = fill.is_some_and(|f| !matches!(f, Fill::None));
+    crate::ui::keynav::ComboBox::from_id_salt(id)
+        .width(96.0)
+        .selected_text(if !present {
+            tr("docker.no_fill")
+        } else if matches!(fill, Some(Fill::Solid(_))) {
+            tr("docker.uniform_fill")
+        } else {
+            tr("docker.fill")
+        })
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(!present, tr("docker.no_fill"))
+                .clicked()
+            {
+                Some(false)
+            } else if ui
+                .selectable_label(
+                    matches!(fill, Some(Fill::Solid(_))),
+                    tr("docker.uniform_fill"),
+                )
+                .clicked()
+            {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .inner
+        .flatten()
+}
+
+/// The text controls of Properties, laid out as one continuous inspector.
+pub(crate) fn compact_properties(app: &mut App, ui: &mut Ui, target: &Shape, single: bool) {
+    let Some(span) = app.shown_span(target) else {
+        return;
+    };
+    let fill = span.fill.as_ref().unwrap_or(&target.fill);
+    let mut color = fill.preview_color().unwrap_or(Color::BLACK);
+    let width = ui.available_width();
+    let mut changed = crate::ui::font_list::text_font_list(app, ui, "properties_font", width);
+    ui.horizontal_wrapped(|ui| {
+        changed |= crate::ui::toolbar::text_size_list(app, ui);
+        let mut tracking = span.tracking_pct;
+        ui.label("AV").rich_tip(tr("docker.tracking"));
+        if number(ui, &mut tracking, -50.0..=200.0, " %") {
+            edit_spans(app, move |s| s.tracking_pct = tracking);
+        }
+        if crate::ui::color_picker::color_button_with_opacity(
+            ui,
+            &mut color,
+            span.paint_opacity.fill,
+        ) {
+            set_text_fill(app, Some(Fill::Solid(color)));
+        }
+        TextPaint::Fill.field(app, ui, &span);
+    });
+    if changed {
+        app.apply_text_style();
+    }
+    ui.horizontal_wrapped(|ui| {
+        let b = ui
+            .selectable_label(span.bold, egui::RichText::new("B").strong())
+            .rich_tip(tr("docker.style_bold"));
+        if b.clicked() {
+            edit_spans(app, |s| s.bold = !span.bold);
+        }
+        if ui
+            .selectable_label(span.italic, egui::RichText::new("I").italics())
+            .rich_tip(tr("docker.style_italic"))
+            .clicked()
+        {
+            edit_spans(app, |s| s.italic = !span.italic);
+        }
+        if let Some(line) = compact_line(
+            ui,
+            "U",
+            "properties_underline",
+            span.underline,
+            "toolbar.underline",
+        ) {
+            edit_spans(app, move |s| s.underline = line);
+        }
+        if let Some(line) = compact_line(
+            ui,
+            "S",
+            "properties_strike",
+            span.strikethrough,
+            "docker.strikethrough",
+        ) {
+            edit_spans(app, move |s| s.strikethrough = line);
+        }
+        ui.separator();
+        use tracedraw_core::TextPosition as P;
+        for (position, icon, key) in [
+            (P::Superscript, "x²", "docker.superscript"),
+            (P::Subscript, "x₂", "docker.subscript"),
+        ] {
+            if ui
+                .selectable_label(span.position == position, icon)
+                .rich_tip(tr(key))
+                .clicked()
+            {
+                let value = if span.position == position {
+                    P::Normal
+                } else {
+                    position
+                };
+                edit_spans(app, move |s| s.position = value);
+            }
+        }
+        ui.separator();
+        use crate::ops2::CaseMode as C;
+        for (mode, icon, key) in [
+            (C::Sentence, "Aa.", "menu.text.case_sentence"),
+            (C::Lower, "aa", "menu.text.case_lower"),
+            (C::Upper, "AA", "menu.text.case_upper"),
+            (C::Title, "Aa", "menu.text.case_title"),
+            (C::Toggle, "aA", "menu.text.case_toggle"),
+        ] {
+            if ui.small_button(icon).rich_tip(tr(key)).clicked() {
+                app.change_case(mode);
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("A").rich_tip(tr("docker.text_fill"));
+        if let Some(on) = paint_type(ui, "properties_fill", Some(fill)) {
+            set_text_fill(app, on.then_some(Fill::Solid(color)));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("ab").rich_tip(tr("docker.text_background"));
+        let mut color = span
+            .background
+            .as_ref()
+            .and_then(Fill::preview_color)
+            .unwrap_or(Color::WHITE);
+        if let Some(on) = paint_type(ui, "properties_background", span.background.as_ref()) {
+            edit_spans(app, move |s| {
+                s.background = on.then_some(Fill::Solid(color))
+            });
+        }
+        if crate::ui::color_picker::color_button_with_opacity(
+            ui,
+            &mut color,
+            span.paint_opacity.background,
+        ) {
+            edit_spans(app, move |s| s.background = Some(Fill::Solid(color)));
+        }
+        TextPaint::Background.field(app, ui, &span);
+    });
+    ui.horizontal_wrapped(|ui| {
+        let (rect, icon) = ui.allocate_exact_size(Vec2::new(18.0, 22.0), Sense::hover());
+        let point = |x, y| rect.min + Vec2::new(x, y);
+        for (from, to) in [
+            (point(4.0, 17.0), point(9.0, 5.0)),
+            (point(9.0, 5.0), point(14.0, 17.0)),
+            (point(6.0, 13.0), point(12.0, 13.0)),
+        ] {
+            ui.painter().line_segment([from, to], Stroke::new(3.4, Tokens::text_dim()));
+            ui.painter().line_segment([from, to], Stroke::new(1.2, ui.visuals().panel_fill));
+        }
+        icon.rich_tip(tr("docker.text_outline"));
+        let stroke = span.outline.as_ref().or(target.stroke.as_ref());
+        let pt = stroke.map_or(0.0, |s| s.width * 72.0 / 25.4);
+        let mut custom = false;
+        crate::ui::keynav::ComboBox::from_id_salt("properties_outline")
+            .width(96.0)
+            .selected_text(width_name((pt * 1000.0).round() / 1000.0))
+            .show_ui(ui, |ui| {
+                for w in OUTLINE_WIDTHS_PT {
+                    if ui
+                        .selectable_label((w - pt).abs() < 1e-3, width_name(w))
+                        .clicked()
+                    {
+                        set_text_outline(app, (w > 0.0).then_some(w * 25.4 / 72.0), None);
+                    }
+                }
+                custom = ui.button(tr("docker.more_settings")).clicked();
+            })
+            .response
+            .rich_tip(tr("docker.text_outline_width_desc"));
+        let custom_id = ui.id().with("custom_outline_width");
+        if custom {
+            ui.data_mut(|data| data.insert_temp(custom_id, true));
+        }
+        let mut color = stroke.map_or(app.current_colors.1, |s| s.color);
+        if crate::ui::color_picker::color_button_with_opacity(
+            ui,
+            &mut color,
+            span.paint_opacity.outline,
+        ) {
+            set_text_outline(app, None, Some(color));
+        }
+        TextPaint::Outline.field(app, ui, &span);
+        if ui.data(|data| data.get_temp::<bool>(custom_id).unwrap_or(false)) {
+            let mut width = pt;
+            if number(ui, &mut width, 0.0..=40.0, " pt") {
+                set_text_outline(app, (width > 0.0).then_some(width * 25.4 / 72.0), None);
+            }
+        }
+    });
+    ui.separator();
+    ui.strong(tr("docker.paragraph"));
+    paragraph_panel(app, ui, Some(target), "compact_paragraph", false, false);
+    feature_buttons(app, ui, &span);
+    if single && matches!(target.kind, ShapeKind::Text { frame: Some(_), .. }) {
+        ui.separator();
+        ui.strong(tr("docker.frame"));
+        frame_outline_row(app, ui, target);
+    }
+    egui::CollapsingHeader::new(tr("docker.show_more"))
+        .id_salt("properties_text_more")
+        .show(ui, |ui| {
+            if let Some((_, paragraph)) = app.paragraph_style_of(target) {
+                paragraph_tabs(app, ui, &paragraph.tabs);
+            }
+            if style_list(app, ui, "properties_face") {
+                app.apply_text_style();
+            }
+            font_axes(app, ui, &span);
+            let mut width = span.width_pct;
+            ui.horizontal_wrapped(|ui| {
+                char_width_icon(ui).rich_tip(tr("docker.char_width"));
+                if number(ui, &mut width, CHAR_WIDTH_RANGE, " %") {
+                    edit_spans(app, move |s| s.width_pct = width);
+                }
+                crate::ui::propbar::char_offset_part(app, ui);
+            });
+            character_styles(app, ui, &span, Some(target), "compact_details");
+            if single {
+                if ui.button(tr("menu.text.edit_text")).clicked() {
+                    app.open_edit_text_dialog();
+                }
+                if !app.editing_text() && ui.button(tr("docker.edit_with_text_tool")).clicked() {
+                    app.begin_text_edit(target.id);
+                }
+                if matches!(target.kind, ShapeKind::Text { frame: Some(_), .. }) {
+                    frame_panel(app, ui, Some(target), "compact_frame", false, false);
+                }
+            }
+        });
+}
+
+fn compact_line(
+    ui: &mut Ui,
+    glyph: &str,
+    id: &str,
+    current: LineStyle,
+    key: &str,
+) -> Option<LineStyle> {
+    let response = crate::ui::keynav::ComboBox::from_id_salt(id)
+        .width(22.0)
+        .selected_text(glyph)
+        .show_ui(ui, |ui| {
+            LineStyle::ALL.into_iter().find(|style| {
+                ui.selectable_label(*style == current, line_style_name(*style))
+                    .clicked()
+            })
+        });
+    response.response.rich_tip(tr(key));
+    response.inner.flatten()
+}
+
+fn frame_outline_row(app: &mut App, ui: &mut Ui, target: &Shape) {
+    let Some((_, mut para)) = app.paragraph_style_of(target) else {
+        return;
+    };
+    let mut edited = false;
+    ui.horizontal_wrapped(|ui| {
+        let on = para.frame_outline.is_some();
+        if ui.selectable_label(on, tr("docker.outline")).clicked() {
+            para.frame_outline = (!on).then_some(tracedraw_core::Stroke::default());
+            edited = true;
+        }
+        if let Some(stroke) = &mut para.frame_outline {
+            let mut width = stroke.width * 72.0 / 25.4;
+            if number(ui, &mut width, 0.0..=40.0, " pt") {
+                stroke.width = width * 25.4 / 72.0;
+                edited = true;
+            }
+            edited |= crate::ui::color_picker::color_button_with_opacity(
+                ui,
+                &mut stroke.color,
+                para.frame_outline_opacity.unwrap_or(1.0),
+            );
+            if let Some(opacity) =
+                opacity_field(ui, para.frame_outline_opacity.unwrap_or(1.0), false)
+            {
+                para.frame_outline_opacity = Some(opacity);
+                edited = true;
+            }
+        }
+    });
+    if edited {
+        app.set_paragraph_style(target.id, para);
+    }
+}
 /// The OpenType feature buttons of the Character section (#1201), in
 /// their order: the feature's tag and the key of its name (the tip's
 /// second line is the `_desc` of the key).
@@ -1391,7 +1752,7 @@ fn font_axes(app: &mut App, ui: &mut Ui, sp: &TextSpan) {
         if ui
             .add_enabled(
                 !sp.variations.is_empty(),
-                egui::Button::new(tr("docker.font_axes_reset")).small(),
+                crate::ui::btn_icons::Ib::new("docker.font_axes_reset").small(),
             )
             .clicked()
         {
@@ -1452,7 +1813,7 @@ fn end_axis_preview(app: &mut App) {
 /// The first span of the selected text, or of the text being edited:
 /// the font whose axes the axes button offers (#870).
 pub(crate) fn selected_text_span(app: &App) -> Option<TextSpan> {
-    app.selected_shapes().iter().find_map(|s| match &s.kind {
+    app.first_selected_text().and_then(|s| match &s.kind {
         ShapeKind::Text { spans, .. } => spans.first().cloned(),
         _ => None,
     })
@@ -1579,6 +1940,10 @@ fn set_text_fill(app: &mut App, fill: Option<Fill>) {
         app.apply_fill(fill.unwrap_or(Fill::None));
         return;
     }
+    if has_nontext_selection(app) {
+        edit_spans(app, move |sp| sp.fill = Some(fill.clone().unwrap_or(Fill::None)));
+        return;
+    }
     let has_span_fills = app.selected_shapes().iter().any(|s| match &s.kind {
         ShapeKind::Text { spans, .. } => spans.iter().any(|sp| sp.fill.is_some()),
         _ => false,
@@ -1587,6 +1952,44 @@ fn set_text_fill(app: &mut App, fill: Option<Fill>) {
         edit_spans(app, |sp| sp.fill = None);
     }
     app.apply_fill(fill.unwrap_or(Fill::None));
+}
+
+fn has_nontext_selection(app: &App) -> bool {
+    app.selected_rc().iter().any(|s| !matches!(s.kind, ShapeKind::Text { .. }))
+}
+
+fn set_text_outline(app: &mut App, width: Option<f64>, color: Option<Color>) {
+    if !has_nontext_selection(app) || app.text_selection_active() || app.chosen_chars_active() {
+        if let Some(width) = width {
+            app.apply_outline_width(width);
+        } else {
+            app.apply_outline_color(color);
+        }
+        return;
+    }
+    let mut shapes = Vec::new();
+    app.for_each_selected_text(|shape, _| {
+        shapes.push(shape.id);
+        false
+    });
+    if shapes.is_empty() {
+        return;
+    }
+    use tracedraw_core::{patch::StrokeField, Command};
+    let cmd = match (width, color) {
+        (_, Some(color)) => Command::PatchStroke {
+            shapes,
+            stroke: tracedraw_core::Stroke { color, ..Default::default() },
+            fields: vec![StrokeField::Paint],
+        },
+        (Some(width), _) if width > 0.0 => Command::PatchStroke {
+            shapes,
+            stroke: tracedraw_core::Stroke { width, ..Default::default() },
+            fields: vec![StrokeField::Width],
+        },
+        _ => Command::SetStroke { shapes, stroke: None },
+    };
+    app.run(cmd);
 }
 
 pub(crate) fn paragraph_panel(
@@ -1636,20 +2039,29 @@ pub(crate) fn paragraph_panel(
         return;
     };
     // The direction the paragraph runs in (#2670).
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         use tracedraw_core::TextDirection as D;
         let tip = crate::ui::tips::pair("docker.text_direction", "docker.text_direction_desc");
-        ui.label(tr("docker.text_direction")).rich_tip(&tip);
+        if salt != "compact_paragraph" { ui.label(tr("docker.text_direction")).rich_tip(&tip); }
         for (d, key) in [
             (D::LeftToRight, "docker.direction_ltr"),
             (D::RightToLeft, "docker.direction_rtl"),
         ] {
-            if ui
-                .selectable_label(p.direction == d, tr(key))
-                .rich_tip(&tip)
-                .clicked()
-                && p.direction != d
-            {
+            let response = if salt == "compact_paragraph" {
+                let ltr = d == D::LeftToRight;
+                let glyph = if ltr { "¶   " } else { "   ¶" };
+                let response = ui.add_sized(
+                    [31.0, 22.0],
+                    egui::Button::selectable(p.direction == d, glyph),
+                );
+                let start = response.rect.center() + Vec2::new(if ltr { 0.0 } else { -1.0 }, 0.0);
+                let direction = Vec2::new(if ltr { 8.0 } else { -8.0 }, 0.0);
+                ui.painter().arrow(start, direction, Stroke::new(1.0, ui.visuals().text_color()));
+                response
+            } else {
+                ui.selectable_label(p.direction == d, tr(key))
+            };
+            if response.rich_tip(tr(key)).clicked() && p.direction != d {
                 let align = app.paragraph_style_of(t).map(|(a, _)| a);
                 set_direction(app, d, align);
             }
@@ -1696,7 +2108,7 @@ pub(crate) fn paragraph_panel(
         }
         resp.rich_tip(tr(key));
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         line_icon(ui, ParaIcon::Leading, "docker.leading");
         let (range, suffix) = match p.leading_unit {
             LeadingUnit::Points => (0.0..=2000.0, " pt"),
@@ -1740,40 +2152,50 @@ pub(crate) fn paragraph_panel(
             });
         row_check_when(app, ui, "leading", show_checks);
     });
-    egui::Grid::new(format!("{salt}_text_paragraph"))
-        .num_columns(4)
-        .spacing([4.0, 4.0])
-        .show(ui, |ui| {
-            line_icon(ui, ParaIcon::LeftIndent, "docker.left_indent");
-            pc |= length(ui, app, &mut p.left_indent);
-            line_icon(ui, ParaIcon::SpaceBefore, "docker.space_before");
-            pc |= space_field(ui, app, &mut p, true, t_size_pt(t));
-            ui.end_row();
-            line_icon(ui, ParaIcon::FirstLineIndent, "docker.first_line_indent");
-            pc |= length(ui, app, &mut p.first_line_indent);
-            line_icon(ui, ParaIcon::SpaceAfter, "docker.space_after");
-            pc |= space_field(ui, app, &mut p, false, t_size_pt(t));
-            ui.end_row();
-            line_icon(ui, ParaIcon::RightIndent, "docker.right_indent");
-            pc |= length(ui, app, &mut p.right_indent);
-            ui.end_row();
-        });
-    // The paragraph's tab stops at a glance, and the Tabs dialog box that
-    // sets them (#2003).
-    ui.horizontal(|ui| {
-        let tip = crate::ui::tips::pair("dialog.tab_stops", "docker.tabs_tip");
-        ui.label(tr("dialog.tab_stops")).rich_tip(&tip);
-        if ui.button(tr("menu.text.tabs")).rich_tip(&tip).clicked() {
-            app.dialog = crate::ui::dialogs::Dialog::TextTabs;
-        }
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(tab_summary(&p.tabs, app.units)).color(Tokens::text_dim()),
-            )
-            .truncate(),
-        )
-        .rich_tip(&tip);
-    });
+    if salt == "compact_paragraph" {
+        egui::Grid::new(ui.id().with("compact_indents"))
+            .num_columns(4)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                line_icon(ui, ParaIcon::LeftIndent, "docker.left_indent");
+                pc |= length(ui, app, &mut p.left_indent);
+                line_icon(ui, ParaIcon::SpaceBefore, "docker.space_before");
+                pc |= space_field(ui, app, &mut p, true, t_size_pt(t));
+                ui.end_row();
+
+                line_icon(ui, ParaIcon::RightIndent, "docker.right_indent");
+                pc |= length(ui, app, &mut p.right_indent);
+                line_icon(ui, ParaIcon::SpaceAfter, "docker.space_after");
+                pc |= space_field(ui, app, &mut p, false, t_size_pt(t));
+                ui.end_row();
+
+                line_icon(ui, ParaIcon::FirstLineIndent, "docker.first_line_indent");
+                pc |= length(ui, app, &mut p.first_line_indent);
+                ui.end_row();
+            });
+    } else {
+        egui::Grid::new(format!("{salt}_text_paragraph"))
+            .num_columns(4)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                line_icon(ui, ParaIcon::LeftIndent, "docker.left_indent");
+                pc |= length(ui, app, &mut p.left_indent);
+                line_icon(ui, ParaIcon::SpaceBefore, "docker.space_before");
+                pc |= space_field(ui, app, &mut p, true, t_size_pt(t));
+                ui.end_row();
+                line_icon(ui, ParaIcon::FirstLineIndent, "docker.first_line_indent");
+                pc |= length(ui, app, &mut p.first_line_indent);
+                line_icon(ui, ParaIcon::SpaceAfter, "docker.space_after");
+                pc |= space_field(ui, app, &mut p, false, t_size_pt(t));
+                ui.end_row();
+                line_icon(ui, ParaIcon::RightIndent, "docker.right_indent");
+                pc |= length(ui, app, &mut p.right_indent);
+                ui.end_row();
+            });
+    }
+    if salt != "compact_paragraph" {
+        paragraph_tabs(app, ui, &p.tabs);
+    }
     if force_expanded || expander(ui, "paragraph") {
         egui::Grid::new(format!("{salt}_text_paragraph_more"))
             .num_columns(2)
@@ -1797,6 +2219,23 @@ pub(crate) fn paragraph_panel(
             f.apply_to(q);
         });
     }
+}
+
+fn paragraph_tabs(app: &mut App, ui: &mut Ui, tabs: &[tracedraw_core::TabStop]) {
+    ui.horizontal_wrapped(|ui| {
+        let tip = crate::ui::tips::pair("dialog.tab_stops", "docker.tabs_tip");
+        ui.label(tr("dialog.tab_stops")).rich_tip(&tip);
+        if ui.ibutton("menu.text.tabs").rich_tip(&tip).clicked() {
+            app.dialog = crate::ui::dialogs::Dialog::TextTabs;
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tab_summary(tabs, app.units)).color(Tokens::text_dim()),
+            )
+            .truncate(),
+        )
+        .rich_tip(&tip);
+    });
 }
 
 /// The tab stops of a paragraph in a few words: their places in the
@@ -2020,7 +2459,7 @@ pub(crate) fn frame_panel(
             {
                 app.dialog = crate::ui::dialogs::Dialog::TextDropCap;
             }
-            if ui.button(tr("menu.text.columns")).clicked() {
+            if ui.ibutton("menu.text.columns").clicked() {
                 app.dialog = crate::ui::dialogs::Dialog::TextColumns;
             }
         });
@@ -2304,6 +2743,12 @@ mod tests {
         use tracedraw_core::TextPosition;
         let quicksand = include_bytes!("../../../../crates/text/testdata/Quicksand-VF.ttf");
         let _ = tracedraw_text::fonts().add_fonts(vec![quicksand.to_vec()]);
+        // Register Selawik even when this test runs in a separate shard.
+        let selawik = include_bytes!("../../assets/fonts/Selawik-Regular.ttf");
+        let _ = tracedraw_text::fonts().add_document_fonts(&[tracedraw_core::DocumentFont::new(
+            "Selawik",
+            selawik.to_vec(),
+        )]);
         let mut app = App::headless();
         let id = app
             .new_shape(ShapeKind::Text {
@@ -2406,6 +2851,25 @@ mod tests {
     /// own overprint (none again when set as the object's), the line
     /// style lists name every style and set it through the span edit,
     /// and each change is one undo step.
+    #[test]
+    fn text_paint_opacity_changes_only_the_requested_channel() {
+        let mut app = App::headless();
+        app.start_text(Point::new(10.0, 20.0), None);
+        app.text_insert("Paint");
+        app.finish_text();
+        let before = app.first_selected_text().expect("selected text");
+        edit_spans(&mut app, |span| TextPaint::Background.set(span, 0.25));
+        let after = app.first_selected_text().expect("selected text");
+        let ShapeKind::Text { spans, .. } = &after.kind else { panic!("text") };
+        let opacity = spans.first().expect("span").paint_opacity;
+        assert_eq!((opacity.fill, opacity.background, opacity.outline), (1.0, 0.25, 1.0));
+        assert_eq!(after.fill, before.fill);
+        assert_eq!(after.stroke, before.stroke);
+        assert_eq!(after.opacity, before.opacity);
+        app.undo();
+        assert_eq!(app.first_selected_text().expect("restored text").kind, before.kind);
+    }
+
     #[test]
     fn character_styles_switch_on_the_selected_text() {
         let mut app = App::headless();

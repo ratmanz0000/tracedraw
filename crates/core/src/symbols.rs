@@ -9,57 +9,63 @@ use crate::document::{Shape, ShapeKind, Symbol};
 use crate::geometry::{Affine, Point, Rect};
 use crate::{Document, Fill, ShapeId};
 
-/// What an object is, as the similarity measure reads it: the same tags
-/// the Objects docker shows, so a curve and a rectangle never match.
-fn kind_tag(k: &ShapeKind) -> &'static str {
-    match k {
-        ShapeKind::Rect { .. } => "Rectangle",
-        ShapeKind::Ellipse { .. } => "Ellipse",
-        ShapeKind::Polygon {
-            complex: Some(_), ..
-        } => "ComplexStar",
-        ShapeKind::Polygon { sharpness, .. }
-            if crate::geometry::is_star_sharpness(*sharpness) =>
-        {
-            "Star"
-        }
-        ShapeKind::Polygon { .. } => "Polygon",
-        ShapeKind::Path { .. } => "Curve",
-        ShapeKind::Text { .. } => "Text",
-        ShapeKind::Group { .. } => "Group",
-        ShapeKind::Bitmap { .. } => "Bitmap",
-        ShapeKind::ClipFrame { .. } => "ClipFrame",
-        ShapeKind::Table(_) => "Table",
-        ShapeKind::SymbolInstance { .. } => "Symbol",
-    }
-}
-
-/// What makes two groups copies of each other: each object that is not
-/// text, in order, by its kind, its box from the corner of their common
-/// box (to a tenth of a millimetre) and its fill. A copy only moved (by
-/// itself or its objects) matches; a recoloured or reshaped one does not.
-/// The corner comes back with the key: the instance is placed there.
+/// Compare the complete shape data after removing identity and normalizing
+/// translation. Unsupported local geometry stays unchanged, which can miss
+/// a match but cannot turn different geometry into the same symbol.
 pub fn fingerprint(objects: &[&Shape]) -> Option<(String, Point)> {
+    fn has_bitmap(s: &Shape) -> bool {
+        match &s.kind {
+            ShapeKind::Bitmap { .. } => true,
+            ShapeKind::Group { children } => children.iter().any(has_bitmap),
+            ShapeKind::ClipFrame { frame, contents } => {
+                has_bitmap(frame) || contents.iter().any(has_bitmap)
+            }
+            _ => false,
+        }
+    }
+    if objects.iter().any(|s| has_bitmap(s)) {
+        return None;
+    }
     let boxes: Vec<Rect> = objects.iter().map(|s| s.bounds()).collect();
     let all = boxes.iter().copied().reduce(|a, b| a.union(b))?;
     if !all.is_finite() {
         return None;
     }
     let origin = Point::new(all.x0, all.y0);
-    let tenth = |v: f64| (v * 10.0).round() as i64;
-    let mut out = String::new();
-    for (s, b) in objects.iter().zip(&boxes) {
-        let fill = serde_json::to_string(&s.fill).unwrap_or_default();
-        out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{fill};",
-            kind_tag(&s.kind),
-            tenth(b.x0 - origin.x),
-            tenth(b.y0 - origin.y),
-            tenth(b.width()),
-            tenth(b.height()),
-        ));
+    fn clear_identity(s: &mut Shape) {
+        s.id = ShapeId(0);
+        s.uid = None;
+        match &mut s.kind {
+            ShapeKind::Group { children } => children.iter_mut().for_each(clear_identity),
+            ShapeKind::ClipFrame { frame, contents } => {
+                clear_identity(frame);
+                contents.iter_mut().for_each(clear_identity);
+            }
+            _ => {}
+        }
     }
-    Some((out, origin))
+    let mut normalized = Vec::with_capacity(objects.len());
+    for shape in objects {
+        let mut s = (*shape).clone();
+        clear_identity(&mut s);
+        // Rectangular primitives can encode their local position in either
+        // the rectangle or the transform. Normalize both representations.
+        let normalize_rect = s.effects.is_empty() && s.spline.is_none() && s.common_shape.is_none();
+        let rect = match &mut s.kind {
+            ShapeKind::Rect { rect, .. } | ShapeKind::Ellipse { rect, .. }
+            | ShapeKind::Polygon { rect, .. } | ShapeKind::Bitmap { rect, .. } => Some(rect),
+            _ => None,
+        };
+        if let Some(rect) = rect.filter(|_| normalize_rect) {
+            let x = rect.x0;
+            let y = rect.y0;
+            *rect = Rect::new(0.0, 0.0, rect.x1 - x, rect.y1 - y);
+            s.transform *= Affine::translate((x, y));
+        }
+        s.transform = Affine::translate((-origin.x, -origin.y)) * s.transform;
+        normalized.push(s);
+    }
+    Some((serde_json::to_string(&normalized).ok()?, origin))
 }
 
 fn is_text(s: &Shape) -> bool {
@@ -104,6 +110,43 @@ pub struct Plan {
     pub skipped: usize,
 }
 
+/// Whether a definition can be reused without changing its appearance.
+pub fn definition_matches(def: &Shape, key: &str) -> bool {
+    let mut plain = Shape::new(def.id, def.kind.clone());
+    plain.fill = Fill::None;
+    plain.stroke = None;
+    plain.transform = def.transform;
+    plain.uid = def.uid;
+    def == &plain
+        && split_group(def).is_some_and(|(_, texts)| texts.is_empty())
+        && fingerprint(&definition_objects(def)).is_some_and(|(k, at)| {
+            k == key && def.transform == Affine::translate((-at.x, -at.y))
+        })
+}
+
+/// A group can be converted when its own properties and label stacking
+/// survive the replacement.
+pub fn matching_group(s: &Shape, key: &str) -> Option<Match> {
+    let ShapeKind::Group { children } = &s.kind else { return None; };
+    let (graphics, texts) = split_group(s)?;
+    let mut plain = Shape::new(s.id, s.kind.clone());
+    plain.transform = s.transform;
+    plain.name = s.name.clone();
+    plain.uid = s.uid;
+    if s.stroke.is_none() {
+        plain.stroke = None;
+    }
+    if *s != plain || !children.iter().skip_while(|c| !is_text(c)).all(is_text) {
+        return None;
+    }
+    let (k, at) = fingerprint(&graphics)?;
+    (k == key).then(|| Match {
+        group: s.clone(),
+        texts: texts.into_iter().cloned().collect(),
+        at,
+    })
+}
+
 /// Plan the symbolize of every group copying `sample`, at any depth of
 /// layers, groups and clip frames, master layers included. Each match is
 /// replaced where it stands, so an instance keeps the place, the parent
@@ -126,9 +169,7 @@ pub fn plan_graphics(
 ) -> Result<Plan, String> {
     let (key, origin) = fingerprint(graphics).ok_or("the group has no objects to match")?;
     // An existing symbol that draws the same, else a new one appended.
-    let found = doc.symbols.iter().position(|sym| {
-        fingerprint(&definition_objects(&sym.shape)).is_some_and(|(k, _)| k == key)
-    });
+    let found = doc.symbols.iter().position(|sym| definition_matches(&sym.shape, &key));
     let index = found.unwrap_or(doc.symbols.len());
     let name = match found {
         Some(i) => doc.symbols[i].name.clone(),
@@ -153,23 +194,12 @@ pub fn plan_graphics(
     fn walk(s: &Shape, key: &str, loose: bool, out: &mut Vec<Match>, skipped: &mut usize) {
         match &s.kind {
             ShapeKind::Group { children } => {
-                let (graphics, texts) = match split_group(s) {
-                    Some(p) => p,
-                    None => return,
-                };
-                match fingerprint(&graphics) {
-                    Some((k, at)) if k == key => {
-                        out.push(Match {
-                            group: s.clone(),
-                            texts: texts.into_iter().cloned().collect(),
-                            at,
-                        });
-                        // A matched group's own members are not matched
-                        // again: the instance stands for the whole group.
-                        return;
-                    }
-                    _ => *skipped += 1,
+                if let Some(m) = matching_group(s, key) {
+                    out.push(m);
+                    // Do not match members of a matched group again.
+                    return;
                 }
+                *skipped += 1;
                 for c in children {
                     walk(c, key, loose, out, skipped);
                 }
@@ -217,12 +247,26 @@ pub fn plan_graphics(
 /// The shape that replaces a matched group: an instance placed at the
 /// graphics' corner, or, when the group carried labels, a group of the
 /// instance and those labels, keeping the group's transform and name.
-/// `inst_id` and `group_id` come from the executor's id source.
+/// The group's own transparency and shadow go on what replaces it, so a
+/// copy draws as it did (#3497). `inst_id` and `group_id` come from the
+/// executor's id source.
 pub fn replacement(m: &Match, index: usize, inst_id: ShapeId, group_id: ShapeId) -> Shape {
     let place = Affine::translate((m.at.x, m.at.y));
     let mut inst = Shape::new(inst_id, ShapeKind::SymbolInstance { index });
+    inst.fill = Fill::None;
+    inst.stroke = None;
     if m.texts.is_empty() {
-        inst.transform = m.group.transform * place;
+        inst.transform = if matches!(m.group.kind, ShapeKind::Group { .. }) {
+            m.group.transform * place
+        } else {
+            place
+        };
+        inst.name = m.group.name.clone();
+        if matches!(m.group.kind, ShapeKind::Group { .. }) {
+            inst.uid = m.group.uid;
+            inst.opacity = m.group.opacity;
+            inst.shadow = m.group.shadow;
+        }
         return inst;
     }
     inst.transform = place;
@@ -231,8 +275,11 @@ pub fn replacement(m: &Match, index: usize, inst_id: ShapeId, group_id: ShapeId)
     let mut grouped = Shape::new(group_id, ShapeKind::Group { children });
     grouped.transform = m.group.transform;
     grouped.name = m.group.name.clone();
+    grouped.uid = m.group.uid;
     grouped.fill = Fill::None;
     grouped.stroke = None;
+    grouped.opacity = m.group.opacity;
+    grouped.shadow = m.group.shadow;
     grouped
 }
 
@@ -414,6 +461,66 @@ mod tests {
         assert!(matches!(children[0].kind, ShapeKind::Group { .. }));
     }
 
+    #[test]
+    fn loose_replacement_does_not_apply_its_transform_twice() {
+        let mut shape = rect(1, 0.0, 0.0, red());
+        shape.transform = Affine::translate((30.0, 40.0));
+        let (_, at) = fingerprint(&[&shape]).unwrap();
+        let m = Match { group: shape, texts: Vec::new(), at };
+        let instance = replacement(&m, 0, ShapeId(2), ShapeId(3));
+        assert_eq!(instance.transform, Affine::translate((30.0, 40.0)));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_geometry_stroke_and_opacity() {
+        let a = rect(1, 0.0, 0.0, red());
+        let moved = rect(2, 20.0, 30.0, red());
+        assert_eq!(fingerprint(&[&a]).unwrap().0, fingerprint(&[&moved]).unwrap().0);
+        let mut rounded = a.clone();
+        if let ShapeKind::Rect { radius, .. } = &mut rounded.kind { *radius = 1.0; }
+        assert_ne!(fingerprint(&[&a]).unwrap().0, fingerprint(&[&rounded]).unwrap().0);
+        let mut faded = a.clone();
+        faded.opacity = 0.5;
+        assert_ne!(fingerprint(&[&a]).unwrap().0, fingerprint(&[&faded]).unwrap().0);
+        let mut outlined = a.clone();
+        outlined.stroke = None;
+        assert_ne!(fingerprint(&[&a]).unwrap().0, fingerprint(&[&outlined]).unwrap().0);
+    }
+
+    #[test]
+    fn skips_groups_with_appearance_that_would_be_lost() {
+        let (mut e, sample) = drawing();
+        let layer = e.document().pages[0].layers[0].id;
+        let mut faded = Shape::new(ShapeId(90), ShapeKind::Group {
+            children: vec![rect(91, 0.0, 0.0, red()), rect(92, 10.0, 0.0, red())],
+        });
+        faded.opacity = 0.5;
+        e.run(&Command::AddShape { layer, shape: faded }).unwrap();
+        let plan = plan(e.document(), sample, None).unwrap();
+        assert!(!plan.matches.iter().any(|m| m.group.id == ShapeId(90)));
+    }
+
+    #[test]
+    fn reuses_definition_normalized_from_an_offset_sample() {
+        let mut e = Engine::default();
+        let layer = e.document().pages[0].layers[0].id;
+        let sample = Shape::new(ShapeId(1), ShapeKind::Group {
+            children: vec![rect(2, 20.0, 30.0, red()), rect(3, 30.0, 30.0, red())],
+        });
+        e.run(&Command::AddShape { layer, shape: sample }).unwrap();
+        let first = plan(e.document(), ShapeId(1), None).unwrap();
+        for c in &commands(&first, || e.new_shape_id()) {
+            e.run(c).unwrap();
+        }
+        let copy = Shape::new(ShapeId(100), ShapeKind::Group {
+            children: vec![rect(101, 40.0, 50.0, red()), rect(102, 50.0, 50.0, red())],
+        });
+        e.run(&Command::AddShape { layer, shape: copy }).unwrap();
+        let again = plan(e.document(), ShapeId(100), None).unwrap();
+        assert!(again.new_symbol.is_none());
+        assert_eq!(again.index, 0);
+    }
+
     /// An existing symbol that draws the same is reused: no new definition,
     /// and the instances point at it.
     #[test]
@@ -438,5 +545,36 @@ mod tests {
         assert_eq!(again.index, 0);
         assert_eq!(again.name, "Symbol 1", "the existing name stays");
         assert_eq!(again.matches.len(), 1, "only the new copy matches");
+    }
+    /// A copy keeps how it drew as a whole: the group's transparency and
+    /// shadow go on the instance that replaces it, or on the group of the
+    /// instance and its labels (#3497).
+    #[test]
+    fn the_replacement_keeps_the_groups_opacity_and_shadow() {
+        let mut group = Shape::new(
+            ShapeId(1),
+            ShapeKind::Group {
+                children: vec![rect(2, 0.0, 0.0, red())],
+            },
+        );
+        group.opacity = 0.4;
+        group.shadow = Some(crate::Shadow::default());
+        let m = Match {
+            group: group.clone(),
+            texts: Vec::new(),
+            at: Point::new(0.0, 0.0),
+        };
+        let inst = replacement(&m, 0, ShapeId(10), ShapeId(11));
+        assert!(matches!(inst.kind, ShapeKind::SymbolInstance { index: 0 }));
+        assert_eq!(inst.opacity, 0.4);
+        assert_eq!(inst.shadow, group.shadow);
+        let labelled = Match {
+            texts: vec![rect(3, 0.0, 8.0, blue())],
+            ..m
+        };
+        let grouped = replacement(&labelled, 0, ShapeId(12), ShapeId(13));
+        assert!(matches!(grouped.kind, ShapeKind::Group { .. }));
+        assert_eq!(grouped.opacity, 0.4);
+        assert_eq!(grouped.shadow, group.shadow);
     }
 }

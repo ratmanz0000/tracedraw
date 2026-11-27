@@ -5,6 +5,7 @@
 //! the one being edited from the Properties docker's FX section. The
 //! Tone Curve filter shows its curves instead of sliders.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::fx::{new_effect, ParamKind, ParamSpec};
 use crate::i18n::tr;
@@ -510,7 +511,7 @@ fn tone_curve_part(
                 };
             }
             if ui
-                .add_enabled(style == 2, egui::Button::new(tr("dialog.smooth")))
+                .add_enabled(style == 2, crate::ui::btn_icons::Ib::new("dialog.smooth"))
                 .rich_tip(crate::ui::tips::keyed("dialog.smooth"))
                 .rich_disabled_tip(crate::ui::tips::keyed("dialog.smooth"))
                 .clicked()
@@ -527,7 +528,7 @@ fn tone_curve_part(
                 set_curve_style(params, ch, 2);
             }
             if ui
-                .add_enabled(style != 3, egui::Button::new(tr("dialog.invert")))
+                .add_enabled(style != 3, crate::ui::btn_icons::Ib::new("dialog.invert"))
                 .rich_tip(crate::ui::tips::keyed("dialog.invert"))
                 .rich_disabled_tip(crate::ui::tips::keyed("dialog.invert"))
                 .clicked()
@@ -545,14 +546,14 @@ fn tone_curve_part(
                 set_curve_style(params, ch, style);
             }
             if ui
-                .button(tr("dialog.reset_active_channel"))
+                .ibutton("dialog.reset_active_channel")
                 .rich_tip(crate::ui::tips::keyed("dialog.reset_active_channel"))
                 .clicked()
             {
                 params.retain(|k, _| !(k.starts_with(ch) && channel_key_of(k, ch)));
             }
             if ui
-                .button(tr("dialog.reset"))
+                .ibutton("dialog.reset")
                 .rich_tip(crate::ui::tips::keyed("dialog.reset"))
                 .clicked()
             {
@@ -561,7 +562,7 @@ fn tone_curve_part(
             if ui
                 .add_enabled(
                     image.is_some(),
-                    egui::Button::new(tr("dialog.auto_balance_tone")),
+                    crate::ui::btn_icons::Ib::new("dialog.auto_balance_tone"),
                 )
                 .rich_tip(tr("dialog.auto_balance_tone_tip"))
                 .clicked()
@@ -585,7 +586,7 @@ fn tone_curve_part(
             // Presets: the curves of every channel in a JSON file.
             ui.horizontal(|ui| {
                 if ui
-                    .button(tr("dialog.load"))
+                    .ibutton("dialog.load")
                     .rich_tip(crate::ui::tips::pair(
                         "dialog.load",
                         "dialog.curve_load_desc",
@@ -597,7 +598,7 @@ fn tone_curve_part(
                         .pick_into(PRESET_PICK);
                 }
                 if ui
-                    .button(tr("dialog.save"))
+                    .ibutton("dialog.save")
                     .rich_tip(crate::ui::tips::pair(
                         "dialog.save",
                         "dialog.curve_save_desc",
@@ -832,7 +833,7 @@ fn levels_part(
         if ui
             .add_enabled(
                 image.is_some(),
-                egui::Button::new(tr("dialog.lab_auto_adjust")),
+                crate::ui::btn_icons::Ib::new("dialog.lab_auto_adjust"),
             )
             .rich_tip(crate::ui::tips::pair(
                 "dialog.lab_auto_adjust",
@@ -895,6 +896,12 @@ pub fn effect_dialog(app: &mut App, ctx: &Context, st: &mut EffectState, close: 
     };
     if spec.id == "image_adjustments" {
         crate::ui::lab_dialog::lab_dialog(app, ctx, st, close);
+        return;
+    }
+    // Settings in the Effects panel (#4253): the docker takes the effect
+    // and the dialog closes, leaving the drawing in view.
+    if crate::ui::fx_panel::take_over(app, st) {
+        *close = true;
         return;
     }
     if spec.id == "tone_curve" {
@@ -1118,7 +1125,7 @@ fn effect_settings(
 
 /// The effect's presets (#1129): a list that puts a saved preset's
 /// settings in the dialog, the name for a new one, Save and Delete.
-fn presets_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
+pub(crate) fn presets_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
     let presets: Vec<(usize, FxPreset)> = presets_of(&app.settings.fx_presets, &st.effect.id)
         .into_iter()
         .map(|(i, p)| (i, p.clone()))
@@ -1171,7 +1178,7 @@ fn presets_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
         )
         .rich_tip(tr("dialog.fx_preset_name"));
         if ui
-            .button(tr("dialog.fx_preset_save"))
+            .ibutton("dialog.fx_preset_save")
             .rich_tip(crate::ui::tips::pair(
                 "dialog.fx_preset_save",
                 "dialog.fx_preset_save_desc",
@@ -1203,7 +1210,7 @@ fn presets_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
 fn original_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
     ui.horizontal(|ui| {
         let held = ui
-            .add_enabled(st.preview, egui::Button::new(tr("dialog.fx_show_original")))
+            .add_enabled(st.preview, crate::ui::btn_icons::Ib::new("dialog.fx_show_original"))
             .rich_tip(crate::ui::tips::pair(
                 "dialog.fx_show_original",
                 "dialog.fx_show_original_desc",
@@ -1228,6 +1235,19 @@ fn original_row(ui: &mut Ui, app: &mut App, st: &mut EffectState) {
                 st.preview = true;
             }
             app.settings.save();
+        }
+        // The settings beside the drawing in the Effects docker instead
+        // (#4253): the next frame moves them there.
+        if crate::ui::fx_panel::fits(&st.effect.id) {
+            let mut panel = app.settings.fx_in_panel;
+            if ui
+                .checkbox(&mut panel, tr("dialog.fx_in_panel"))
+                .rich_tip(crate::ui::tips::keyed("dialog.fx_in_panel"))
+                .changed()
+            {
+                app.settings.fx_in_panel = panel;
+                app.settings.save();
+            }
         }
     });
 }
@@ -1283,7 +1303,12 @@ pub fn choose_effect(app: &mut App, id: &str) {
 /// show/hide, edit, move up and down and delete, and Add effect.
 pub fn fx_section(app: &mut App, ui: &mut Ui, id: ShapeId) {
     let effects = app.bitmap_effects(id);
-    if effects.is_empty() {
+    // Live effects listed above it count as effects too (#4231).
+    let live = app
+        .doc()
+        .find_shape(id)
+        .is_some_and(|s| !s.effect_stack().is_empty());
+    if effects.is_empty() && !live {
         ui.label(
             egui::RichText::new(tr("docker.no_effects"))
                 .color(crate::theme::Tokens::text_dim())
@@ -1293,11 +1318,12 @@ pub fn fx_section(app: &mut App, ui: &mut Ui, id: ShapeId) {
     let n = effects.len();
     for (i, e) in effects.iter().enumerate() {
         ui.horizontal(|ui| {
-            let mut vis = e.visible;
-            if ui
-                .checkbox(&mut vis, "")
+            // An eye, as the stack's effects above and the objects in
+            // the Objects docker (#4231).
+            let vis = !e.visible;
+            if crate::ui::effects_docker::eye_button(ui, e.visible)
                 .rich_tip(tr("docker.show_hide_effect"))
-                .changed()
+                .clicked()
             {
                 app.edit_bitmap_effects(id, "Show or Hide Effect", move |l| {
                     if let Some(x) = l.get_mut(i) {
@@ -1351,7 +1377,7 @@ pub fn fx_section(app: &mut App, ui: &mut Ui, id: ShapeId) {
         });
     }
     let resp = ui
-        .button(tr("docker.add_effect"))
+        .ibutton("docker.add_effect")
         .rich_tip(crate::ui::tips::keyed("docker.add_effect"));
     egui::Popup::menu(&resp)
         .id(egui::Id::new("fx_add_menu"))

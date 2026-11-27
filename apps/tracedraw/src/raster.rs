@@ -25,12 +25,18 @@ use tracedraw_core::{geometry::Affine, Document, PageId, ShapeId};
 use tracedraw_render::{render_page, Preview, RenderOptions, ViewTransform};
 #[cfg(not(target_arch = "wasm32"))]
 use tracedraw_render::{
-    render_page_cancellable, render_page_on_one_thread, render_page_progressive,
+    render_page_cancellable, render_page_on_one_thread_cancellable, render_page_progressive,
 };
 
 /// How long the view must rest, seconds, before a moved view is
 /// rendered anew instead of showing the last render moved into place.
 pub const SETTLE_SECONDS: f64 = 0.12;
+
+/// How long the drawing must rest at a revision, seconds, before a render
+/// still running for an earlier one is asked to give up (#4233): a few
+/// frames, enough to tell a drag that goes on from one that has stopped.
+#[cfg(not(target_arch = "wasm32"))]
+pub const REVISION_REST: f64 = 0.08;
 
 /// The shortest wait, seconds, after the last step of a zoom before a
 /// render still running for an earlier zoom is asked to give up: a few
@@ -98,6 +104,27 @@ struct BackJob {
     key: BackKey,
     page_rect: tracedraw_core::geometry::Rect,
     rx: std::sync::mpsc::Receiver<Option<ColorImage>>,
+    /// Set to make the backdrop give up when it is no longer wanted
+    /// (#4361).
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A render no longer waited for gives up (#4361): its picture could
+/// never be taken, and on a large drawing it went on for seconds with
+/// the drawing's copy, and the main render the render turn, so a drawing
+/// closed in another tab kept the one left open slow.
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BackJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A render running on its own thread: what it is for, and where its
@@ -288,6 +315,14 @@ fn nearest_level(
 pub struct Raster {
     texture: Option<TextureHandle>,
     key: Option<Key>,
+    // A failed render can record its key without replacing the pixels.
+    picture_failed: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub drag_backdrop_enabled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    drag_backdrop: Option<std::sync::Arc<tracedraw_render::DragBackdrop>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    drag_backdrop_blocked: bool,
     /// The part of the page the texture shows, page mm.
     page_rect: Option<tracedraw_core::geometry::Rect>,
     /// The pictures of the zooms the view showed last, of the drawing as
@@ -302,6 +337,11 @@ pub struct Raster {
     /// render ran: the wait before a render in flight for an earlier
     /// zoom is asked to give up follows the pace of these steps.
     zoom_step: Option<f64>,
+    /// The drawing's revision last asked for and when (egui time) it was
+    /// first asked for: a render for an earlier revision gives up only
+    /// once the drawing has rested at this one (#4233).
+    #[cfg(not(target_arch = "wasm32"))]
+    revision_since: Option<(u64, f64)>,
     /// Proofed colours on a grid of screen colours (View > Proof Colors),
     /// made when first needed and dropped with the texture (the colour
     /// settings changed).
@@ -322,6 +362,10 @@ pub struct Raster {
     /// last picture shows where its part of the page now is, and the
     /// render waits for a later frame (#903).
     pub defer: bool,
+    /// The visible main canvas inside the render's extra margin.
+    pub main_viewport: Option<Rect>,
+    pan_sample: Option<(crate::view::View, Rect, f64)>,
+    pan_lead: egui::Vec2,
     /// Light zoom (Options > Tools > Zoom/Pan, for slow computers): a
     /// zoom shows the last picture scaled, like a pan, and the drawing
     /// is drawn anew once, when the view has rested
@@ -617,6 +661,43 @@ impl Raster {
         self.key = None;
     }
 
+    /// Stop unfinished work while keeping the pictures already drawn.
+    pub(crate) fn cancel_pending(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.job = None;
+            self.backdrop_job = None;
+            self.rested = None;
+        }
+    }
+
+    /// Spend more of the existing render margin in the direction being exposed.
+    pub(crate) fn pan_render_rect(
+        &mut self,
+        view: &View,
+        viewport: Rect,
+        margin: f32,
+        now: f64,
+    ) -> Rect {
+        let previous = self.pan_sample.replace((*view, viewport, now));
+        if let Some((before, old_viewport, time)) = previous {
+            if before.zoom == view.zoom && old_viewport == viewport && self.zoom_target.is_none() {
+                let delta = before.origin - view.origin;
+                if delta.length_sq() > 0.0 {
+                    let dt = (now - time).clamp(1.0 / 120.0, 0.10);
+                    let lead_time = self.last_seconds.clamp(0.05, 0.20);
+                    self.pan_lead = delta * (lead_time / dt) as f32;
+                }
+            } else {
+                self.pan_lead = egui::Vec2::ZERO;
+            }
+        }
+        let limit = margin * 0.75;
+        self.pan_lead.x = self.pan_lead.x.clamp(-limit, limit);
+        self.pan_lead.y = self.pan_lead.y.clamp(-limit, limit);
+        viewport.expand(margin).translate(self.pan_lead)
+    }
+
     /// Drop the cached texture so the next frame re-renders (and the
     /// proofed colours, which the colour settings decide).
     pub fn invalidate(&mut self) {
@@ -625,13 +706,12 @@ impl Raster {
         self.proof = None;
         self.settle = None;
         self.zoom_step = None;
-        // A render under way is for what no longer holds.
+        self.cancel_pending();
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.job = None;
-            self.rested = None;
             self.backdrop = None;
-            self.backdrop_job = None;
+            self.drag_backdrop = None;
+            self.drag_backdrop_blocked = false;
             // Freed on a thread of its own, as a render frees its copy.
             if let Some((_, d)) = self.kept.take() {
                 std::thread::spawn(move || drop(d));
@@ -681,10 +761,45 @@ impl Raster {
         self.hold = Some(hold);
     }
 
+    /// Whether the texture being painted depicts this drag position.
+    pub fn shows_transform(
+        &self,
+        texture: TextureId,
+        page: PageId,
+        revision: u64,
+        ids: &[ShapeId],
+        transform: Affine,
+    ) -> bool {
+        let Some(key) = self.key.as_ref().filter(|key| {
+            !self.picture_failed
+                && key.page == page
+                && key.revision == revision
+                && self.texture.as_ref().is_some_and(|t| t.id() == texture)
+        }) else {
+            return false;
+        };
+        key.preview.as_ref().is_some_and(|(shown, affine)| {
+            !ids.is_empty()
+                && shown.len() == ids.len()
+                && ids.iter().all(|id| shown.contains(id))
+                && *affine == transform.as_coeffs()
+        })
+    }
+
     /// The drawing revision of the picture currently held in `texture`.
     pub fn shown_revision(&self) -> Option<u64> {
         self.texture.as_ref()?;
         self.key.as_ref().map(|k| k.revision)
+    }
+
+    /// Keep the pre-drag picture even if auto-scroll changes the view.
+    /// The live curve overlay draws the geometry being edited.
+    pub(crate) fn node_drag_picture(&self, page: PageId, revision: u64, view: &View) -> Option<(TextureId, Rect)> {
+        let key = self.key.as_ref()?;
+        if key.page != page || key.revision != revision || key.preview.is_some() || key.pixels.is_some() {
+            return None;
+        }
+        Some((self.texture.as_ref()?.id(), view.rect_to_screen(self.page_rect?)))
     }
 
     /// True when `texture` already holds an up-to-date plain render of `page`
@@ -742,6 +857,11 @@ impl Raster {
         focus: Option<(Vec<ShapeId>, f32)>,
         pixel_dpi: Option<f64>,
     ) -> Option<(TextureId, Rect)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.drag_backdrop_enabled || preview.is_none() {
+            self.drag_backdrop = None;
+            self.drag_backdrop_blocked = false;
+        }
         let ppp = ctx.pixels_per_point();
         let rect = whole_device_pixels(rect, ppp);
         // The picture is drawn for the view the wheel's glide lands at,
@@ -839,64 +959,47 @@ impl Raster {
         // view asked for (or the drawing changes faster than it draws), the
         // last picture shows, moved into place.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.poll_job(ctx) {
-            let now = ctx.input(|i| i.time);
-            // The view keeps zooming, a step every few frames: the running
-            // render keeps its turn and is not given up, or every render
-            // would give up before any of them is done, and the one for
-            // the zoom the wheel stopped at would start over from nothing.
-            // Each step re-arms the wait, so a wheel that goes on never
-            // rests it.
-            let stale_zoom = self.job.as_ref().is_some_and(|job| {
-                job.key != key
-                    && job.key.same_but_view(&key, self.follows_zoom)
-                    && self.zooms_at_once(&job.key, &key)
-            });
-            // A render for an earlier revision of the main canvas is
-            // obsolete too (#3903): letting it run to completion wastes
-            // CPU while holding both the render turn and the old document
-            // snapshot.
-            if let Some(job) = &self.job {
-                if !self.follows_zoom && job.key.revision != key.revision {
+        if let Some(job) = &self.job {
+            // Mark stale results before polling, including a result that
+            // arrived since the document changed.
+            if !self.follows_zoom && job.key.revision != key.revision {
+                let now = ctx.input(|i| i.time);
+                let since = match self.revision_since {
+                    Some((rev, t)) if rev == key.revision => t,
+                    _ => {
+                        self.revision_since = Some((key.revision, now));
+                        now
+                    }
+                };
+                let due = since + REVISION_REST;
+                if now >= due {
                     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(due - now));
                 }
-                return self.shown_meanwhile(view, screen);
-            }
-            if stale_zoom {
+            } else if job.key != key
+                && job.key.same_but_view(&key, self.follows_zoom)
+                && self.zooms_at_once(&job.key, &key)
+            {
+                let now = ctx.input(|i| i.time);
+                // Keep the turn through a wheel burst. Once the wheel
+                // settles, stop rendering the zoom the view has left.
                 let due = match &self.settle {
                     Some((k, due)) if *k == key => *due,
                     _ => {
-                        // The wait follows the wheel's own pace, the way
-                        // the glide's length does: notches a beat apart
-                        // wait a few frames, so a wheel that has stopped
-                        // is told from one that goes on soon; slower
-                        // turns wait longer, and the render in flight
-                        // lands between the notches all the same.
-                        let gap = self.zoom_step.take().map_or(0.0, |t| (now - t).max(0.0));
+                        let gap = self.zoom_step.map_or(0.0, |t| (now - t).max(0.0));
                         self.zoom_step = Some(now);
                         now + (gap * ZOOM_SETTLE_PACE).clamp(ZOOM_SETTLE_MIN, SETTLE_SECONDS)
                     }
                 };
                 if now < due {
-                    self.settle = Some((key, due));
+                    self.settle = Some((key.clone(), due));
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(due - now));
                 } else {
-                    // The view has settled: a render for a zoom it has
-                    // already left. Nobody will see its picture, and the
-                    // one for this zoom would wait for all of it, so a
-                    // large drawing stayed blurry for two whole renders
-                    // after each zoom step (#2522). It gives up at its
-                    // next object; the scaled picture shows meanwhile, and
-                    // the settled zoom's render starts when it has.
-                    self.zoom_step = None;
-                    if let Some(job) = &self.job {
-                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                return self.shown_meanwhile(view, screen);
             }
-            let running_for_this = self.job.as_ref().is_some_and(|j| j.key == key);
-            if running_for_this || window.is_none() {
+            if self.poll_job(ctx) {
                 return self.shown_meanwhile(view, screen);
             }
         }
@@ -953,7 +1056,15 @@ impl Raster {
             {
                 let moved = old.same_but_view(&key, self.follows_zoom);
                 zoom_now = moved && self.zooms_at_once(old, &key);
-                if moved && !zoom_now {
+                // Start refreshing while sharp pixels still cover the canvas.
+                let uncovered_pan = old.zoom == key.zoom
+                    && key_view.zoom == view.zoom
+                    && !self.follows_zoom
+                    && self.main_viewport.is_some_and(|viewport| {
+                        let ahead = viewport.union(viewport.translate(self.pan_lead * 0.5));
+                        !view.rect_to_screen(page_rect).contains_rect(ahead)
+                    });
+                if moved && !zoom_now && !uncovered_pan {
                     let now = ctx.input(|i| i.time);
                     let due = match &self.settle {
                         Some((k, due)) if *k == key => *due,
@@ -1055,30 +1166,39 @@ impl Raster {
                 Some(shared) => (shared, None),
                 None => self.copy_of(doc, key.revision),
             };
+            let drag_backdrop = if self.drag_backdrop_enabled && !self.drag_backdrop_blocked
+                && opts.preview.is_some() && opts.focus.is_none() && window.is_none()
+            {
+                if self.drag_backdrop.as_ref().is_some_and(|cache| !cache.matches(&doc, page, &opts)) {
+                    // Do not pay to fill a new cache at every autoscroll step.
+                    self.drag_backdrop = None;
+                    self.drag_backdrop_blocked = true;
+                    None
+                } else {
+                    Some(self.drag_backdrop.get_or_insert_with(|| {
+                        std::sync::Arc::new(tracedraw_render::DragBackdrop::new(doc.clone(), page, &opts))
+                    }).clone())
+                }
+            } else {
+                None
+            };
             let (tx, rx) = std::sync::mpsc::channel();
             let wake = ctx.clone();
             #[cfg(test)]
             let hold = self.hold.clone();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let gives_up = cancel.clone();
-            // SMOOTH_ZOOM_NO_BANDS: the last picture scales on the card,
-            // the new one replaces it whole. The bands of #2389 read as
-            // pieces of a large raster on a slow machine: for a raster
-            // the page is one texture to move and scale, not strips to
-            // redraw. Over a picture of a changed drawing the bands
-            // showed two drawings at once anyway (#3562).
-            const SMOOTH_ZOOM_NO_BANDS: bool = true;
-            let same_drawing = self
-                .key
-                .as_ref()
-                .is_some_and(|old| old.same_but_view(&key, true));
-            let (bands_tx, bands) =
-                if SMOOTH_ZOOM_NO_BANDS || self.follows_zoom || !same_drawing {
-                    (None, None)
-                } else {
-                    let (t, r) = std::sync::mpsc::channel();
-                    (Some(t), Some(r))
-                };
+            // Reveal finished rows only when zooming the same drawing. A
+            // changed revision must replace the picture in one piece (#3562).
+            let progressive_zoom = self.key.as_ref().is_some_and(|old| {
+                self.zooms_at_once(old, &key) && old.same_but_view(&key, true)
+            });
+            let (bands_tx, bands) = if progressive_zoom {
+                let (tx, rx) = std::sync::mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             std::thread::spawn(move || {
                 #[cfg(test)]
                 let _held = hold.as_ref().map(|m| m.lock());
@@ -1094,7 +1214,10 @@ impl Raster {
                         };
                         render_page_progressive(&doc, page, &opts, &gives_up, h / 2, &band)
                     }
-                    None => render_page_cancellable(&doc, page, &opts, &gives_up),
+                    None => match drag_backdrop {
+                        Some(cache) => cache.render(&opts, &gives_up),
+                        None => render_page_cancellable(&doc, page, &opts, &gives_up),
+                    },
                 }
                 .map(|pm| to_image(&pm, lut.as_deref()));
                 let _ = tx.send(image.map(|i| (i, t.elapsed().as_secs_f64())));
@@ -1187,7 +1310,7 @@ impl Raster {
                         };
                         self.backdrop = Some(Backdrop {
                             texture,
-                            key: job.key,
+                            key: job.key.clone(),
                             page_rect: job.page_rect,
                         });
                     }
@@ -1276,16 +1399,24 @@ impl Raster {
                     };
                     let (tx, rx) = std::sync::mpsc::channel();
                     let wake = ctx.clone();
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let gives_up = cancel.clone();
                     std::thread::spawn(move || {
-                        let image = render_page_on_one_thread(&doc, page, &opts)
-                            .map(|pm| to_image(&pm, lut.as_deref()));
+                        let image =
+                            render_page_on_one_thread_cancellable(&doc, page, &opts, &gives_up)
+                                .map(|pm| to_image(&pm, lut.as_deref()));
                         let _ = tx.send(image);
                         drop(doc);
                         drop(stale);
                         wake.request_repaint();
                     });
                     self.backdrops += 1;
-                    self.backdrop_job = Some(BackJob { key, page_rect, rx });
+                    self.backdrop_job = Some(BackJob {
+                        key,
+                        page_rect,
+                        rx,
+                        cancel,
+                    });
                     return None;
                 }
                 Some(since) => {
@@ -1429,6 +1560,7 @@ impl Raster {
         page_rect: Option<tracedraw_core::geometry::Rect>,
     ) {
         let keep = cfg!(not(target_arch = "wasm32"))
+            && !self.picture_failed
             && !self.follows_zoom
             && page_rect.is_some()
             && self
@@ -1464,6 +1596,7 @@ impl Raster {
             self.levels.remove(0);
         }
         self.key = Some(key);
+        self.picture_failed = false;
         self.page_rect = page_rect;
     }
 
@@ -1489,7 +1622,7 @@ impl Raster {
         let level = self.levels.remove(i);
         if let (Some(t), Some(k), Some(r)) = (self.texture.take(), self.key.take(), self.page_rect)
         {
-            if k.same_but_view(key, false) {
+            if !self.picture_failed && k.same_but_view(key, false) {
                 self.levels.push(Level {
                     key: k,
                     texture: t,
@@ -1497,6 +1630,7 @@ impl Raster {
                 });
             }
         }
+        self.picture_failed = false;
         self.texture = Some(level.texture);
         self.page_rect = Some(level.page_rect);
         self.key = Some(key.clone());
@@ -1510,22 +1644,39 @@ impl Raster {
         let Some(job) = &mut self.job else {
             return false;
         };
-        job.take_bands(ctx);
+        use std::sync::atomic::Ordering;
+
+        if !job.cancel.load(Ordering::Relaxed) {
+            job.take_bands(ctx);
+        }
         match job.rx.try_recv() {
             Ok(result) => {
-                let job = self.job.take().expect("job");
-                if let Some((image, seconds)) = result {
-                    self.last_seconds = seconds;
-                    self.take_picture(ctx, image, job.filter, job.key, job.page_rect);
-                } else {
-                    self.key = Some(job.key);
+                if let Some(job) = self.job.take() {
+                    if !job.cancel.load(Ordering::Relaxed) {
+                        if let Some((image, seconds)) = result {
+                            self.last_seconds = seconds;
+                            self.take_picture(
+                                ctx,
+                                image,
+                                job.filter,
+                                job.key.clone(),
+                                job.page_rect,
+                            );
+                        } else {
+                            self.picture_failed = true;
+                            self.key = Some(job.key.clone());
+                        }
+                    }
                 }
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 if let Some(job) = self.job.take() {
-                    self.key = Some(job.key);
+                    if !job.cancel.load(Ordering::Relaxed) {
+                        self.picture_failed = true;
+                        self.key = Some(job.key.clone());
+                    }
                 }
                 false
             }
@@ -2168,6 +2319,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_continuous_pan_refreshes_before_it_leaves_the_sharp_margin() {
+        static TURNS: Turns = Turns::new();
+        let ctx = Context::default();
+        let doc = Document::new("t", Size::new(100.0, 50.0));
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let render_rect = viewport.expand(20.0);
+        let mut raster = Raster {
+            turns: Some(&TURNS),
+            main_viewport: Some(viewport),
+            threaded: true,
+            ..Default::default()
+        };
+        let mut view = View::default();
+        pass(&ctx, &mut raster, &doc, &view, render_rect, 0.0);
+        let renders = raster.render_count();
+
+        raster.pan_lead = egui::vec2(-10.0, 0.0);
+        view.pan(egui::vec2(12.0, 0.0));
+        pass(&ctx, &mut raster, &doc, &view, render_rect, 0.01);
+        assert_eq!(raster.render_count(), renders, "still inside the sharp margin");
+
+        view.pan(egui::vec2(5.0, 0.0));
+        pass(&ctx, &mut raster, &doc, &view, render_rect, 0.02);
+        assert_eq!(raster.render_count(), renders + 1, "while the pan is still moving");
+        assert!(raster.settle.is_none());
+        // Completing or cancelling the job releases the static test turn.
+        for _ in 0..400 {
+            if !raster.poll_job(&ctx) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(raster.job.is_none());
+    }
+
+    #[test]
+    fn pan_lead_keeps_the_pixel_budget_and_switches_on_reversal() {
+        let mut raster = Raster::default();
+        let mut view = View::default();
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let base = raster.pan_render_rect(&view, viewport, 20.0, 0.0);
+        view.pan(egui::vec2(12.0, 0.0));
+        let forward = raster.pan_render_rect(&view, viewport, 20.0, 0.016);
+        assert_eq!(forward.size(), base.size());
+        assert!(forward.contains_rect(viewport));
+        assert!(forward.left() < base.left());
+        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 0.032), forward);
+        view.pan(egui::vec2(-12.0, 0.0));
+        let reverse = raster.pan_render_rect(&view, viewport, 20.0, 0.048);
+        assert!(reverse.right() > base.right());
+        view.zoom *= 1.1;
+        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 0.064), base);
+    }
+
     /// A pan shows the last render moved into place at once, and renders
     /// the page anew once the view has rested; a zoom renders at once (on
     /// its thread), the old picture scaled into place meanwhile.
@@ -2300,15 +2506,19 @@ mod tests {
             t + LIGHT_SETTLE_SECONDS / 2.0,
         );
         assert_eq!(raster.render_count(), renders);
-        // Rested: one render for the zoom it stopped at.
-        let (_, screen) = pass(
-            &ctx,
-            &mut raster,
-            &doc,
-            &view,
-            rect,
-            t + LIGHT_SETTLE_SECONDS + 0.01,
-        );
+        // Rested: launch exactly one render for the final zoom. Its
+        // picture can arrive on a worker when the first render was slow.
+        let mut t = t + LIGHT_SETTLE_SECONDS + 0.01;
+        let (_, mut screen) = pass(&ctx, &mut raster, &doc, &view, rect, t);
+        assert_eq!(raster.render_count(), renders + 1);
+        for _ in 0..400 {
+            if raster.picture_zoom() == Some(view.zoom) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            t += 0.005;
+            screen = pass(&ctx, &mut raster, &doc, &view, rect, t).1;
+        }
         assert_eq!(raster.render_count(), renders + 1);
         assert_eq!(raster.picture_zoom(), Some(view.zoom));
         assert_eq!(screen, rect);
@@ -2370,10 +2580,9 @@ mod tests {
     /// #3562: a change to the drawing is not laid over the last picture
     /// a band at a time: the bands showed the drawing before and after
     /// the change at once, cut along their edges (a shadow being dragged
-    /// flickered in pieces). SMOOTH_ZOOM_NO_BANDS: a moved view comes
-    /// whole too, the last picture scales while the new one renders.
+    /// flickered in pieces). A zoom of the same revision can show bands.
     #[test]
-    fn a_change_comes_whole_and_so_does_a_moved_view() {
+    fn a_change_comes_whole_but_zoom_of_the_same_revision_shows_bands() {
         static TURNS: Turns = Turns::new();
         let ctx = Context::default();
         let doc = Document::new("t", Size::new(100.0, 50.0));
@@ -2434,7 +2643,7 @@ mod tests {
             t += 1.0;
         }
         let job = raster.job.as_ref().expect("the new zoom on its thread");
-        assert!(job.bands.is_none(), "a moved view comes whole");
+        assert!(job.bands.is_some(), "the same drawing sharpens in bands");
         wait(&mut raster, &mut |r| pass(r, 2, 60.0, 200.0));
     }
 
@@ -3118,6 +3327,50 @@ mod tests {
         assert_eq!(raster.render_count(), 2);
     }
 
+    /// #4361: a render or a backdrop no longer waited for (its drawing's
+    /// tab closed, the picture asked for changed) is told to give up, so
+    /// it does not keep the drawing's copy and the render turn for
+    /// nothing.
+    #[test]
+    fn renders_nobody_waits_for_give_up() {
+        let ctx = Context::default();
+        let doc = Document::new("t", Size::new(100.0, 50.0));
+        let view = View::default();
+        let mut raster = Raster::default();
+        let at = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 200.0));
+        pass(&ctx, &mut raster, &doc, &view, at, 0.0);
+        let render = raster.job.as_ref().map(|j| j.cancel.clone());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let back = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        raster.backdrop_job = Some(BackJob {
+            key: BackKey {
+                revision: 0,
+                page: doc.pages[0].id,
+                area: [0; 4],
+                size: (1, 1),
+                wireframe: false,
+                simulate_overprints: false,
+                complex_effects: false,
+                proof: false,
+            },
+            page_rect: tracedraw_core::geometry::Rect::new(0.0, 0.0, 1.0, 1.0),
+            rx,
+            cancel: back.clone(),
+        });
+        raster.invalidate();
+        assert!(back.load(std::sync::atomic::Ordering::Relaxed), "the backdrop");
+        if let Some(c) = render {
+            assert!(c.load(std::sync::atomic::Ordering::Relaxed), "the render");
+        }
+        // A render under way when the tab closes.
+        pass(&ctx, &mut raster, &doc, &view, at, 1.0);
+        let render = raster.job.as_ref().map(|j| j.cancel.clone());
+        drop(raster);
+        if let Some(c) = render {
+            assert!(c.load(std::sync::atomic::Ordering::Relaxed), "the render of a closed tab");
+        }
+    }
+
     #[test]
     fn a_canvas_that_moves_renders_again() {
         let ctx = Context::default();
@@ -3264,10 +3517,74 @@ mod tests {
         assert!(found.is_empty(), "use web_time: {found:?}");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropping_or_parking_a_raster_cancels_its_workers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        for park in [true, false] {
+            let foreground = Arc::new(AtomicBool::new(false));
+            let backdrop = Arc::new(AtomicBool::new(false));
+            let mut raster = Raster {
+                job: Some(Job {
+                    key: Key {
+                        revision: 1,
+                        page: PageId(1),
+                        zoom: 1.0,
+                        offset: egui::Vec2::ZERO,
+                        size: (1, 1),
+                        preview: None,
+                        wireframe: false,
+                        simulate_overprints: false,
+                        complex_effects: false,
+                        proof: false,
+                        focus: None,
+                        pixels: None,
+                    },
+                    page_rect: None,
+                    rx: mpsc::channel().1,
+                    cancel: foreground.clone(),
+                    bands: None,
+                    incoming: None,
+                    arrived: Vec::new(),
+                    size: (1, 1),
+                    filter: TextureOptions::LINEAR,
+                }),
+                backdrop_job: Some(BackJob {
+                    key: BackKey {
+                        revision: 1,
+                        page: PageId(1),
+                        area: [0, 0, 1, 1],
+                        size: (1, 1),
+                        wireframe: false,
+                        simulate_overprints: false,
+                        complex_effects: false,
+                        proof: false,
+                    },
+                    page_rect: tracedraw_core::geometry::Rect::new(0.0, 0.0, 1.0, 1.0),
+                    rx: mpsc::channel().1,
+                    cancel: backdrop.clone(),
+                }),
+                ..Default::default()
+            };
+
+            if park {
+                raster.cancel_pending();
+                assert!(raster.job.is_none() && raster.backdrop_job.is_none());
+            } else {
+                drop(raster);
+            }
+            assert!(foreground.load(Ordering::Relaxed));
+            assert!(backdrop.load(Ordering::Relaxed));
+        }
+    }
+
     /// #3903: when the drawing's revision moves on while a render job for an
     /// earlier revision is still running on its thread, the obsolete job is
-    /// told to give up instead of running to completion and uploading an
-    /// outdated picture, and the latest revision renders right after.
+    /// told to give up once the drawing rests at the new revision, instead
+    /// of running to completion and uploading an outdated picture, and the
+    /// latest revision renders right after.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_newer_revision_cancels_a_stale_render_in_flight() {
@@ -3330,19 +3647,39 @@ mod tests {
             .expect("job 2")
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
+        // While the drawing changes every frame (a drag), job 2 goes on:
+        // giving up at each change would never let a picture come
+        // (#4233).
         for rev in 3..=5 {
             frame(&mut raster, rev);
             assert_eq!(raster.render_count(), renders + 1);
             assert!(
-                raster
+                !raster
                     .job
                     .as_ref()
                     .expect("still job 2")
                     .cancel
                     .load(std::sync::atomic::Ordering::Relaxed),
-                "revision {rev} should cancel stale job 2"
+                "revision {rev}: the drag goes on, job 2 keeps drawing"
             );
         }
+        // Once the drawing rests at revision 5, the stale job gives up.
+        let mut given_up = false;
+        for _ in 0..30 {
+            frame(&mut raster, 5);
+            assert_eq!(raster.render_count(), renders + 1);
+            if raster
+                .job
+                .as_ref()
+                .expect("still job 2")
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                given_up = true;
+                break;
+            }
+        }
+        assert!(given_up, "revision 5 rested: stale job 2 should give up");
         drop(held);
         let mut settled = false;
         for _ in 0..400 {
@@ -3361,4 +3698,43 @@ mod tests {
         assert!(settled, "revision 5 rendered once job 2 aborted");
         assert_eq!(raster.render_count(), renders + 2);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn transform_preview_stale_picture_does_not_hide_outline() {
+    let ctx = Context::default();
+    let mut raster = Raster::default();
+    let page = Document::default().pages[0].id;
+    let id = ShapeId(1);
+    let first = Affine::translate((10.0, 20.0));
+    let second = Affine::translate((40.0, 50.0));
+    let key = Key {
+        revision: 1,
+        page,
+        zoom: 1.0,
+        offset: egui::Vec2::ZERO,
+        size: (1, 1),
+        preview: Some(([id].into_iter().collect(), first.as_coeffs())),
+        wireframe: false,
+        simulate_overprints: false,
+        complex_effects: false,
+        proof: false,
+        focus: None,
+        pixels: None,
+    };
+    raster.take_picture(
+        &ctx,
+        ColorImage::filled([1, 1], egui::Color32::WHITE),
+        TextureOptions::NEAREST,
+        key.clone(),
+        None,
+    );
+    let texture = raster.texture.as_ref().expect("picture").id();
+    assert!(raster.shows_transform(texture, page, 1, &[id], first));
+    assert!(!raster.shows_transform(texture, page, 1, &[id], second));
+    assert!(!raster.shows_transform(texture, page, 1, &[ShapeId(2)], first));
+    assert!(!raster.shows_transform(texture, page, 2, &[id], first));
+    raster.picture_failed = true;
+    assert!(!raster.shows_transform(texture, page, 1, &[id], first));
 }

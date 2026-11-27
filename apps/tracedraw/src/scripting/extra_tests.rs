@@ -275,6 +275,36 @@ fn similar_groups_become_one_symbol_and_keep_their_text() {
 }
 
 #[test]
+fn scripted_similarity_skips_different_rectangle_geometry() {
+    let mut app = App::headless();
+    let mut group = |x, radius| {
+        let make = |app: &mut App, x, radius| {
+            app.new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::Rect::new(x, 0.0, x + 20.0, 10.0),
+                radius,
+                corners: None,
+            })
+            .expect("rectangle")
+        };
+        let first = make(&mut app, x, radius);
+        let second = make(&mut app, x + 25.0, 0.0);
+        app.select(vec![first, second]);
+        app.group_selection();
+        app.selection[0]
+    };
+    let sample = group(0.0, 0.0);
+    group(60.0, 2.0);
+    let out = js(
+        &mut app,
+        &format!(
+            "const r = new Shape({}).SymbolizeSimilar(); print(r.replaced, r.skipped);",
+            sample.raw()
+        ),
+    );
+    assert_eq!(out, vec!["1 1"]);
+}
+
+#[test]
 fn a_script_creates_and_places_symbols() {
     let mut app = App::headless();
     let out = js(

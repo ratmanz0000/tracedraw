@@ -306,12 +306,8 @@ fn cursor_coordinates(app: &App) -> String {
             // document or panel carries a working calibration. Written
             // Y then X as geography reads them; the axes stay put.
             if let Some((t, _)) = crate::map_gk42::preview_transform(app) {
-                let g = t.to_gk(raw_p);
-                s.push_str(&format!(
-                    "  GK-42: Y {}  X {}",
-                    crate::map_gk42::fmt_gk_cursor(g.y),
-                    crate::map_gk42::fmt_gk_cursor(g.x)
-                ));
+                s.push_str("  ");
+                s.push_str(&crate::map_gk42::gk_readout(t.to_gk(raw_p)));
             }
             s
         }
@@ -537,28 +533,37 @@ pub fn status_bar(app: &mut App, ui: &mut Ui) {
             .as_ref()
             .is_some_and(|(s, _)| *s == app.status);
     // A message (a file opened or saved, with its path) gives the tool
-    // hint its place back after a while (#1126).
-    if doc && !linked {
+    // hint its place back after a while (#1126), with no drawing open
+    // too: a file that did not open says why on the welcome screen.
+    if drag.is_none() && !linked {
         expire_status(app, ui.ctx());
     }
     // Left field and object information.
-    let (left, info) = if !doc {
-        (tr("status.tool_hints"), tr("status.object_information"))
-    } else if let Some(drag) = drag {
+    let (left, info) = if let Some(drag) = drag {
         (drag, object_info(app))
+    } else if !doc {
+        let hint = tr("status.tool_hints");
+        let left = if app.status.is_empty() {
+            hint
+        } else {
+            format!("{}    {hint}", app.status)
+        };
+        (left, tr("status.object_information"))
     } else {
-        let left = match app.settings.status_info {
-            StatusInfo::ToolHints => {
-                let hint = tool_hint(app);
-                if app.status.is_empty() {
-                    hint
-                } else {
-                    format!("{}    {hint}", app.status)
-                }
-            }
+        let configured = match app.settings.status_info {
+            StatusInfo::ToolHints => tool_hint(app),
             StatusInfo::ObjectDetails => object_details(app),
             StatusInfo::CursorCoordinates => cursor_coordinates(app),
             StatusInfo::DocumentColor => document_color(app),
+        };
+        // The field's own mode never hides a message: why a file did not
+        // open has to be readable whatever the bar shows otherwise.
+        let left = if app.status.is_empty() {
+            configured
+        } else if app.settings.status_info == StatusInfo::ToolHints {
+            format!("{}    {configured}", app.status)
+        } else {
+            app.status.clone()
         };
         (left, object_info(app))
     };
@@ -1019,6 +1024,57 @@ mod tests {
         assert!(!has_tip(&mut app, 3000.0));
     }
 
+    /// A file that did not open says why on the welcome screen, where no
+    /// drawing is open, and whatever the left field shows otherwise.
+    #[test]
+    fn a_failed_open_says_why_with_no_drawing_open() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        let texts = |app: &mut App, time: f64| -> Vec<String> {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 60.0))),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| status_bar(app, ui),
+            );
+            out.textures_delta.clear();
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let message = "Could not open broken.cdr: bad file".to_string();
+        // The welcome screen: the file did not open, so nothing else is
+        // shown and the message has to be.
+        app.show_welcome = true;
+        app.settings.status_info = StatusInfo::ToolHints;
+        app.status = message.clone();
+        let drawn = texts(&mut app, 100.0);
+        assert!(
+            drawn.iter().any(|t| t.contains("broken.cdr")),
+            "the failure is on the welcome screen: {drawn:?}"
+        );
+        // It goes after a while, like any other message.
+        texts(&mut app, 100.0 + STATUS_SECS + 0.5);
+        assert!(app.status.is_empty(), "gone after a while");
+        // A field set to something else does not hide it either.
+        app.show_welcome = false;
+        app.settings.status_info = StatusInfo::CursorCoordinates;
+        app.status = message.clone();
+        let drawn = texts(&mut app, 300.0);
+        assert!(
+            drawn.iter().any(|t| t.contains("broken.cdr")),
+            "the failure is shown over the cursor coordinates: {drawn:?}"
+        );
+        texts(&mut app, 300.0 + STATUS_SECS + 0.5);
+        assert!(app.status.is_empty(), "gone after a while");
+    }
+
     /// A status message, such as "Saved" with a long file path, gives the
     /// tool hint its place back after a while instead of staying until the
     /// next message (#1126). The same message set again shows again.
@@ -1254,6 +1310,6 @@ mod tests {
         let text = cursor_coordinates(&app);
         assert!(text.starts_with("(120."), "{text}");
         assert!(text.contains("80."), "{text}");
-        assert!(text.contains("GK-42: Y 42 53 4500  X 65 20 260"), "{text}");
+        assert!(text.contains("GK-42: Y 42534500  X 6520260"), "{text}");
     }
 }

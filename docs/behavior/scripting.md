@@ -356,3 +356,14 @@ what the user sees.
 - `scripting::extra::tests::a_script_dimension_follows_its_object`
 - `scripting::extra::tests::similar_groups_become_one_symbol_and_keep_their_text`
 - `scripting::extra::tests::a_script_creates_and_places_symbols`
+
+### Rename Groups from Text
+
+Tools > Macros > Rename Groups from Text runs the bundled JavaScript.
+Select groups to limit the scope to those groups and their subgroups.
+With nothing selected it scans the active layer, unless that layer is locked.
+A group is renamed only if it contains exactly one text object anywhere in
+its nested groups and that text is nonblank. Line breaks and runs of
+whitespace become one space in the name. Groups with no text or multiple
+text objects are unchanged. The text objects themselves are not edited.
+All renames use one Undo step.

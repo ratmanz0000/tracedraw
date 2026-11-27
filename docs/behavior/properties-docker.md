@@ -3,7 +3,7 @@
 The Properties docker shows the selected objects' settings in sections,
 each with a header bar that opens and closes it: Outline, Fill,
 Transparency, the kind's own section (Rectangle corners, QR code,
-Character for text), FX and Summary. Closed sections are remembered.
+Character and Paragraph for text, Frame for framed text), FX and Summary. Closed sections are remembered.
 `mixed-selection.md` says how values that differ between the selected
 objects are shown; `outline-pen.md`, `gradient-fill.md`,
 `vector-pattern-fill.md` and `transparency.md` have the sections'
@@ -12,14 +12,14 @@ controls.
 ## The buttons at the top (#2200)
 
 A row of buttons at the top has one button per section the selection
-has, lit while its section is open.
+has, lit while its section is open. The buttons stay above the scrolling settings.
 
 - A click on a button shows its section alone: every other section is
   closed and only its header bar remains, so the docker's content is
   what was picked at the top and there is nothing to scroll past. The
   sections of other kinds of object are closed too (Character while a
-  rectangle is selected), so the docker stays on the section picked
-  when the selection changes.
+  rectangle is selected), so the docker keeps the section picked when it applies to the selection.
+  Switching to a selection without an open category opens Outline. Text opens Character.
 - A click on the button of the only open section opens all of them
   again.
 - Ctrl+click or Shift+click opens or closes the section beside the
@@ -33,7 +33,7 @@ has, lit while its section is open.
 
 ## Groups in the Outline section (#2573)
 
-The Outline section's settings come in titled groups, each with its
+With no selection, the Outline section's settings come in titled groups, each with its
 title in bold in the full text colour and a light rule to the right
 edge, a little space above: Appearance (paint, Hairline, width), Caps
 and corners, Arrowheads, Line style (dash patterns, Align dashes, Edit
@@ -44,6 +44,16 @@ Pen...). Advanced stays a header that opens. An open section's header
 bar has the accent down its left edge, so sections stand apart from
 the groups inside them (`group_heading`, `section_header`; test
 `every_outline_option_is_in_the_properties_docker`).
+
+For selected objects in the standard layout, the paint icons start the
+section. Complex paints open their own editor without displacing the line
+controls. Open paths have independent arrowhead pickers and editor buttons.
+Closed contours offer placement relative to the filled area. The dash
+sample opens a list, with Edit Line Style next to it. Nib settings, object
+opacity and overprint are visible without a separate Advanced section.
+An outline-only opacity leaves whole-object opacity unchanged. When a
+different transparency mask already occupies that effect, use the
+Transparency section to edit the mask.
 
 ## Fill and Outline (#1200)
 
@@ -56,13 +66,18 @@ all (`overprint_state`, `App::set_overprint`, test
 
 ## Text in the Properties docker (#4097)
 
-When a text object is selected or edited, the Character section hosts the
-live character controls (font family, style, size, kerning, underline,
-strikethrough, character width, fill, background, outline, character
-offsets, OpenType features and variable font axes), a case conversion menu,
-Edit Text... and Edit with Text Tool buttons, plus collapsible Paragraph
-and Frame sections. Editing a text object opens the Properties docker on
-the Character section.
+The Character section of a text selection is a continuous inspector.
+The font, size, tracking, quick color and character actions come first,
+followed by paint, paragraph settings and the OpenType buttons. The
+paragraph tab still takes the user straight to the paragraph controls.
+Tab stops, alternate typefaces and font axes are in the expanded details.
+
+The character fill, character background and glyph outline each have a
+color swatch and an independent opacity field. An empty field indicates
+mixed values across the selected text. Changing opacity preserves the
+paint and the object's overall opacity. Framed text has a separate frame
+outline with its own color and opacity.
+
 
 ## Summary (#1202)
 

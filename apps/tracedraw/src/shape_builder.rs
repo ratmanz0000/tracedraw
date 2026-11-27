@@ -290,9 +290,30 @@ fn usable(s: &Shape) -> bool {
 }
 
 impl App {
+    /// The selected objects, a selected group standing for the objects in
+    /// it (and in the groups inside it): the tool cuts and merges them
+    /// where they are, in their group (#4223).
+    fn builder_selected(&self) -> Vec<Shape> {
+        fn walk(s: Shape, out: &mut Vec<Shape>) {
+            match s.kind {
+                ShapeKind::Group { children } if !s.locked => {
+                    for c in children {
+                        walk(c, out);
+                    }
+                }
+                _ => out.push(s),
+            }
+        }
+        let mut out = Vec::new();
+        for s in self.selected_shapes() {
+            walk(s, &mut out);
+        }
+        out
+    }
+
     /// The selected objects the Shape Builder works on, bottom first.
     pub fn builder_pieces(&self) -> Vec<Piece> {
-        let mut shapes: Vec<Shape> = self.selected_shapes().into_iter().filter(usable).collect();
+        let mut shapes: Vec<Shape> = self.builder_selected().into_iter().filter(usable).collect();
         shapes.sort_by_key(|s| self.z_key(s.id));
         shapes
             .iter()
@@ -314,7 +335,7 @@ impl App {
     /// parts, and the rooms they close in are parts too (#3814: a grid
     /// of lines made no parts).
     pub fn builder_open_lines(&self) -> Vec<(ShapeId, BezPath)> {
-        self.selected_shapes()
+        self.builder_selected()
             .into_iter()
             .filter(open_curve)
             .map(|s| {
@@ -394,13 +415,62 @@ impl App {
         let part = if areas.is_empty() && open.is_empty() {
             guide_room(&lines, self.builder_guide_bounds(), p)?
         } else {
-            part_at_cut(&areas, &lines, &open, p)?
+            match part_at_cut(&areas, &lines, &open, p) {
+                Some(part) => part,
+                // Off the selection, the rooms of the guidelines are
+                // parts as well, at once, with no click to drop the
+                // selection first (#4223).
+                None => self.builder_free_room(&areas, &lines, p)?,
+            }
         };
         *self.builder.hover.borrow_mut() = Some(Hover {
             key,
             part: part.clone(),
         });
         Some(part)
+    }
+
+    /// With Use Guidelines on, the room of the guidelines around `p` when
+    /// it lies clear of every selected object `areas`.
+    fn builder_free_room(
+        &self,
+        areas: &[BezPath],
+        lines: &[tracedraw_core::document::GuideLine],
+        p: Point,
+    ) -> Option<BezPath> {
+        if lines.is_empty() {
+            return None;
+        }
+        let room = guide_room(lines, self.builder_guide_bounds(), p)?;
+        let b = room.bounding_box();
+        let clear = areas.iter().all(|a| {
+            a.bounding_box().intersect(b).area() <= 0.0
+                || overlay_parts(&room, a, Op::Intersect)
+                    .iter()
+                    .all(|q| tracedraw_core::shaping::filled_area(q, Default::default()) < 1e-6)
+        });
+        clear.then_some(room)
+    }
+
+    /// `p` is in a room of the guidelines off the selected objects: the
+    /// selection is dropped so the room is made as one of guidelines
+    /// alone (#4223).
+    fn builder_off_selection(&self, p: Point) -> bool {
+        if self.selection.is_empty() || self.builder_lines().is_empty() {
+            return false;
+        }
+        let areas: Vec<BezPath> = self
+            .builder_pieces()
+            .into_iter()
+            .map(|q| polygon(&q.area))
+            .collect();
+        let open: Vec<BezPath> = self.builder_open_lines().into_iter().map(|(_, o)| o).collect();
+        if areas.is_empty() && open.is_empty() {
+            return false;
+        }
+        let lines = self.builder_lines();
+        part_at_cut(&areas, &lines, &open, p).is_none()
+            && self.builder_free_room(&areas, &lines, p).is_some()
     }
 
     /// Add the part under `p` to the drag's parts, once.
@@ -481,6 +551,9 @@ impl App {
                 }
                 return;
             }
+            if self.builder_off_selection(p) {
+                self.selection.clear();
+            }
             self.builder.parts.clear();
             self.builder_take(p);
             let remove = mods.alt != self.builder.delete_mode;
@@ -488,6 +561,9 @@ impl App {
             return;
         }
         if response.drag_started_by(PointerButton::Primary) {
+            if self.builder_off_selection(p) {
+                self.selection.clear();
+            }
             self.builder.parts.clear();
             self.builder.alt = mods.alt;
             self.builder.remove = mods.alt != self.builder.delete_mode;
@@ -690,8 +766,25 @@ impl App {
         // The objects stay selected, with the new one, to go on building;
         // the lines too (what is left of them).
         kept.extend(lines_left);
-        kept.extend(made);
-        self.select(kept);
+        // An object of a selected group stays selected as that group.
+        let sel = self.selection.clone();
+        let mut chosen: Vec<ShapeId> = Vec::new();
+        for id in kept {
+            let id = if sel.contains(&id) {
+                id
+            } else {
+                self.doc()
+                    .ancestors(id)
+                    .into_iter()
+                    .find(|a| sel.contains(a))
+                    .unwrap_or(id)
+            };
+            if !chosen.contains(&id) && self.doc().find_shape(id).is_some() {
+                chosen.push(id);
+            }
+        }
+        chosen.extend(made);
+        self.select(chosen);
     }
 }
 
@@ -892,7 +985,18 @@ pub fn draw(app: &App, painter: &Painter) {
     if app.tool != Tool::ShapeBuilder {
         return;
     }
-    let color = crate::theme::Tokens::SELECTION;
+    // Taking parts away (Alt, or the Delete mode) shows them in red, a
+    // merge in the selection colour (#4223).
+    let removing = if matches!(app.drag, Drag::Freehand { .. }) && !app.builder.parts.is_empty() {
+        app.builder.remove
+    } else {
+        painter.ctx().input(|i| i.modifiers.alt) != app.builder.delete_mode
+    };
+    let color = if removing {
+        REMOVE_RED
+    } else {
+        crate::theme::Tokens::SELECTION
+    };
     // The objects the tool works on are edged in grey, apart from the
     // usual selection colour, so the ones taking part show (#3220).
     for q in app.builder_pieces() {
@@ -920,7 +1024,40 @@ pub fn draw(app: &App, painter: &Painter) {
     for part in &shown {
         hatch(app, painter, part, color);
     }
+    // The stretches of lines Alt takes away, in red: those a drag has
+    // crossed, or the one an Alt click under the pointer would (#4223).
+    let scope = Some(&app.selection);
+    let doomed: Vec<BezPath> = match &app.drag {
+        Drag::Freehand { points } if app.builder.alt && app.builder_pieces().is_empty() => {
+            app.virtual_segments_along(points, scope)
+        }
+        Drag::None if painter.ctx().input(|i| i.modifiers.alt) && !app.selection.is_empty() => painter
+            .ctx()
+            .pointer_hover_pos()
+            .filter(|at| painter.clip_rect().contains(*at))
+            .map(|at| app.view.to_page(at))
+            .filter(|p| app.builder_outline_near(*p))
+            .and_then(|p| app.virtual_segment_at(p, scope))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    for path in &doomed {
+        for seg in path.segments() {
+            let pts: Vec<egui::Pos2> = (0..=8)
+                .map(|i| app.view.to_screen(seg.eval(i as f64 / 8.0)))
+                .collect();
+            painter.add(egui::Shape::line(
+                pts.clone(),
+                egui::Stroke::new(4.0, Color32::from_white_alpha(200)),
+            ));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.5, REMOVE_RED)));
+        }
+    }
 }
+
+/// The colour of parts about to be taken away.
+pub const REMOVE_RED: Color32 = Color32::from_rgb(0xE0, 0x24, 0x24);
 
 /// `part` filled with thin diagonal lines in `color`, edged with it.
 fn hatch(app: &App, painter: &Painter, part: &BezPath, color: Color32) {
@@ -1096,6 +1233,28 @@ mod tests {
         app.engine.undo().unwrap();
         assert!(app.doc().find_shape(a).is_some());
         assert!(app.doc().find_shape(made).is_none());
+    }
+
+    /// #4223: a group selected works as the objects in it; the part left
+    /// of a grouped square stays in the group, which stays selected.
+    #[test]
+    fn a_selected_group_is_cut_and_merged_as_its_objects() {
+        let mut app = App::headless();
+        let a = square(&mut app, 0.0, 0.0, 20.0, 20.0);
+        let b = square(&mut app, 10.0, 0.0, 30.0, 20.0);
+        app.select(vec![a, b]);
+        app.group_selection();
+        let g = app.selection[0];
+        assert!(matches!(app.doc().find_shape(g).map(|s| &s.kind), Some(ShapeKind::Group { .. })));
+        app.tool = Tool::ShapeBuilder;
+        assert_eq!(app.builder_pieces().len(), 2);
+        app.builder_take(Point::new(15.0, 10.0));
+        app.builder_finish(false);
+        assert!(app.selection.contains(&g), "{:?}", app.selection);
+        assert!((page_area(&app, a) - 200.0).abs() < 1e-6);
+        assert!((page_area(&app, b) - 200.0).abs() < 1e-6);
+        let made = *app.selection.iter().find(|id| **id != g).unwrap();
+        assert!((page_area(&app, made) - 200.0).abs() < 1e-6);
     }
 
     /// #3814: a grid of 6 straight lines each way (open curves) makes
@@ -1302,6 +1461,82 @@ mod tests {
         let corner = part_at_cut(&areas, &lines, &[], Point::new(15.0, 5.0)).unwrap();
         assert!((area(&corner) - 187.5).abs() < 1e-6, "{}", area(&corner));
         assert!(part_at_cut(&areas, &lines, &[], Point::new(5.0, 10.0)).is_none(), "on a line");
+    }
+
+    /// With Use Guidelines on and an object still selected, a room of
+    /// the guidelines clear of it is a part at once: no click to drop the
+    /// selection first; taking it makes an object of the room (#4223).
+    #[test]
+    fn guideline_rooms_off_the_selection_are_ready_at_once() {
+        use tracedraw_core::document::GuideLine;
+        let mut app = App::headless();
+        let a = square(&mut app, 0.0, 0.0, 10.0, 10.0);
+        let page = app.page;
+        for line in [
+            GuideLine::Vertical { x: 20.0 },
+            GuideLine::Vertical { x: 30.0 },
+            GuideLine::Horizontal { y: 20.0 },
+            GuideLine::Horizontal { y: 30.0 },
+        ] {
+            app.run(Command::AddGuide { page, guide: line.into() });
+        }
+        app.select(vec![a]);
+        app.set_tool(Tool::ShapeBuilder);
+        let p = Point::new(25.0, 25.0);
+        assert!(app.builder_part_at(p).is_none(), "Use Guidelines off");
+        app.builder.use_guides = true;
+        let room = app.builder_part_at(p).expect("the room is ready");
+        assert!((area(&room) - 100.0).abs() < 1e-6, "{}", area(&room));
+        assert!(app.builder_off_selection(p));
+        assert!(!app.builder_off_selection(Point::new(5.0, 5.0)), "on the object");
+        app.selection.clear();
+        app.builder_take(p);
+        app.builder_finish(false);
+        let made = app.selection[0];
+        assert_ne!(made, a);
+        assert!((page_area(&app, made) - 100.0).abs() < 1e-6);
+        assert!((page_area(&app, a) - 100.0).abs() < 1e-6, "the object is untouched");
+    }
+
+    /// An Alt drag over lines shows, before it ends, the stretches it
+    /// takes away: the same ones that go when it ends (#4223).
+    #[test]
+    fn alt_drag_shows_the_stretches_it_takes_away() {
+        let mut app = App::headless();
+        let layer = app.active_layer().unwrap();
+        let mut ids = Vec::new();
+        for (a, b) in [((0.0, 10.0), (30.0, 10.0)), ((10.0, 0.0), (10.0, 30.0)), ((20.0, 0.0), (20.0, 30.0))] {
+            let mut path = BezPath::new();
+            path.move_to(a);
+            path.line_to(b);
+            let id = app.engine.new_shape_id();
+            app.run(Command::AddShape {
+                layer,
+                shape: Shape::new(id, ShapeKind::Path { path, closed: false }),
+            });
+            ids.push(id);
+        }
+        app.select(ids.clone());
+        app.tool = Tool::ShapeBuilder;
+        // Across the horizontal line between the two upright ones.
+        let stroke = [Point::new(15.0, 5.0), Point::new(15.0, 15.0)];
+        let shown = app.virtual_segments_along(&stroke, Some(&app.selection.clone()));
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        let b = shown[0].bounding_box();
+        assert!((b.x0 - 10.0).abs() < 1e-6 && (b.x1 - 20.0).abs() < 1e-6, "{b:?}");
+        // The segment an Alt click would take.
+        let one = app.virtual_segment_at(Point::new(25.0, 10.0), Some(&app.selection.clone())).expect("a segment");
+        let b = one.bounding_box();
+        assert!((b.x0 - 20.0).abs() < 1e-6 && (b.x1 - 30.0).abs() < 1e-6, "{b:?}");
+        app.builder.alt = true;
+        app.builder_drag_end(&stroke);
+        let h = app.doc().find_shape(ids[0]).expect("the line stays in two");
+        let hb = h.page_path().bounding_box();
+        assert!((hb.x0 - 0.0).abs() < 1e-6 && (hb.x1 - 30.0).abs() < 1e-6);
+        assert!(
+            app.doc().find_shape(ids[0]).map(|s| s.page_path().segments().count()).unwrap_or(0) == 2,
+            "the middle stretch went"
+        );
     }
 
     /// With Use Guidelines on, the page's guidelines cut the objects: a

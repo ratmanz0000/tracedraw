@@ -224,6 +224,21 @@ pub fn blind() -> bool {
     BLIND.load(Ordering::SeqCst)
 }
 
+/// Whether an earlier start read the OpenGL renderer back drawn on this
+/// computer (`Settings::gl_drawn`): its frames are not checked again.
+pub fn gl_drawn_before() -> bool {
+    crate::settings::Settings::load().gl_drawn
+}
+
+/// The OpenGL renderer read back drawn: remembered for later starts.
+pub fn note_gl_drawn() {
+    let mut s = crate::settings::Settings::load();
+    if !s.gl_drawn {
+        s.gl_drawn = true;
+        s.save();
+    }
+}
+
 pub fn note_blind() {
     BLIND.store(true, Ordering::SeqCst);
 }
@@ -501,7 +516,11 @@ pub fn watch_start(
                         if let Some(d) = &decline {
                             d.store(true, Ordering::SeqCst);
                         }
+                        // The splash says another way is tried and stays
+                        // until the new start shows its own (#4321).
+                        crate::native_splash::set_status(crate::native_splash::Status::TryingAnother);
                         if spawn_with(n, &args) {
+                            std::thread::sleep(crate::native_splash::HAND_OVER);
                             std::process::exit(0);
                         }
                         log::error!("could not start TraceDraw again with {n:?}");
@@ -539,6 +558,9 @@ fn note_presented(mode: Mode) {
         return;
     }
     end_attempt();
+    // The splash drawn by the system goes: the window shows (#4321).
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::native_splash::close();
     let mut s = crate::settings::Settings::load();
     let remember = remembered(mode, Mode::first(&s));
     if s.working_renderer != remember {
@@ -1002,17 +1024,24 @@ pub fn take_restart_after_exit() -> Option<Mode> {
 }
 
 /// Run TraceDraw again with `next`, the other arguments kept, until it
-/// ends; false when it did not start.
-pub fn restart_with(next: Mode, args: &[String]) -> bool {
+/// ends; false when it did not start. `retry`: the renderer of this start
+/// failed, and the new start's splash says another way is tried, this
+/// start's splash staying up until that one shows (#4321).
+pub fn restart_with(next: Mode, args: &[String], retry: bool) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
     hand_over();
     let args = crate::instance::with_files_opened_by_system(args);
-    std::process::Command::new(exe)
-        .args(args_with(next, &args))
-        .status()
-        .is_ok()
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args_with(next, &args));
+    if retry {
+        cmd.env(crate::native_splash::RETRY_ENV, "1");
+        crate::native_splash::hand_over();
+    } else {
+        cmd.env_remove(crate::native_splash::RETRY_ENV);
+    }
+    cmd.status().is_ok()
 }
 
 /// Start TraceDraw again with `next` without waiting for it; false when
@@ -1024,6 +1053,7 @@ fn spawn_with(next: Mode, args: &[String]) -> bool {
     let args = crate::instance::with_files_opened_by_system(args);
     std::process::Command::new(exe)
         .args(args_with(next, &args))
+        .env(crate::native_splash::RETRY_ENV, "1")
         .spawn()
         .is_ok()
 }

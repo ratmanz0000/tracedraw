@@ -49,6 +49,7 @@ pure-Rust `vaam-image-webp` crate (MIT OR Apache-2.0) for it instead.
 | Picture import test files (a progressive RGB JPEG, a progressive CMYK JPEG, a palette PNG; a few flat colours each) | `apps/tracedraw/testdata/` | Made for TraceDraw's tests with a general-purpose imaging library | MIT OR Apache-2.0 |
 | Screenshots | `docs/images/` | TraceDraw itself, captured with `scripts/visual/readme_shots.sh` from drawings made for TraceDraw by `apps/tracedraw-cli/examples/showcase.rs`; their text is set in Inter and Lora (SIL Open Font License 1.1), fonts installed on the capture machine and not bundled | MIT OR Apache-2.0 |
 | Symbols docker and Replace Symbol dialog design mockups | `docs/design/symbols/` | Generated for this change by a TraceDraw contributor with an AI image generator; original work, no third-party assets | MIT OR Apache-2.0 |
+| Select Same panel screenshot | `docs/images/select-same.png` | TraceDraw interface and an original drawing made for this contribution, captured and provided by the contributor | MIT OR Apache-2.0 |
 
 Not bundled on purpose: licensed spot colour libraries, third-party
 clipart, templates, fonts other than the ones above, and colour profiles

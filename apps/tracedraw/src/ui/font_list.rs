@@ -1267,7 +1267,7 @@ fn filter_panel(
     if ui
         .add_enabled(
             filter_count(st) > 0,
-            egui::Button::new(tr("font_list.filter_clear")),
+            crate::ui::btn_icons::Ib::new("font_list.filter_clear"),
         )
         .clicked()
     {
@@ -2136,10 +2136,14 @@ impl App {
     pub fn has_text_target(&self) -> bool {
         self.text_edit.is_some()
             || self.table_edit.is_some()
-            || self
-                .selected_shapes()
-                .iter()
-                .any(|s| matches!(s.kind, tracedraw_core::ShapeKind::Text { .. }))
+            || {
+                let mut found = false;
+                self.for_each_selected_text(|_, _| {
+                    found = true;
+                    true
+                });
+                found
+            }
     }
 
     /// The unit font sizes are shown and typed in (#529).

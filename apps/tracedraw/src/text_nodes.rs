@@ -564,7 +564,7 @@ impl App {
                 return vec![(s.clone(), chars)];
             }
         }
-        self.selected_shapes()
+        self.selected_text_objects()
             .into_iter()
             .filter(|s| matches!(s.kind, ShapeKind::Text { .. }))
             .map(|s| {

@@ -113,7 +113,11 @@ mod pattern_fill_tool;
 mod fit_live;
 mod fit_path;
 mod focus;
+mod chart;
 mod formula;
+mod pins;
+mod symbol_copies;
+mod weave;
 #[cfg(any(target_arch = "wasm32", test))]
 mod font_folder;
 #[cfg(not(target_arch = "wasm32"))]
@@ -189,6 +193,10 @@ mod text_height;
 mod blur_bar;
 mod trace_sketch;
 mod mixed;
+mod mockup;
+mod mockup_photos;
+#[cfg(test)]
+mod mockup_gen_tests;
 #[cfg(test)]
 mod mockup_tests;
 mod multipage;
@@ -249,10 +257,16 @@ mod recovery;
 mod resample;
 mod script_debug;
 mod script_filters;
+mod scale_known;
+mod table_shapes;
+mod clip_copy;
+mod effect_drag_preview;
 mod scripting;
 mod segment_delete;
 mod select_region;
+mod select_same;
 mod select_similar;
+mod slices;
 mod settings;
 mod shadow_tool;
 #[cfg(test)]
@@ -271,6 +285,8 @@ mod soft_keyboard;
 mod spell;
 #[cfg(windows)]
 mod spell_windows;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_splash;
 #[cfg(not(target_arch = "wasm32"))]
 mod splash;
 #[cfg(not(target_arch = "wasm32"))]
@@ -331,6 +347,7 @@ mod trace_fonts;
 mod trace_job;
 mod trace_preview;
 mod trace_progress;
+mod trace_shapes;
 mod trace_strokes;
 mod trace_text;
 mod tracecut;
@@ -344,6 +361,7 @@ mod upscale;
 #[cfg(not(target_arch = "wasm32"))]
 mod upscale_net;
 mod variable_outline;
+mod symbol_brush;
 mod symbol_scatter;
 mod vector_mosaic;
 mod view;
@@ -572,6 +590,7 @@ pub fn run() -> eframe::Result<()> {
         log::info!("opening the window through X11 for the desktop's title bar");
     }
     let splash = settings.show_splash && !plain;
+    let splash_seconds = f64::from(settings.splash_seconds);
     let viewport = if splash {
         // The splash has no frame, so it cannot be dragged larger; it is
         // still created resizable: some window managers (Xfwm4) keep a
@@ -601,6 +620,17 @@ pub fn run() -> eframe::Result<()> {
         .is_none()
         .then_some(last_failed)
         .flatten();
+    // The splash drawn by the system, at once and without the graphics
+    // card, while the renderer is set up (#4321): the other splash is
+    // drawn by that renderer, so nothing showed while it was tried.
+    let retrying = native_splash::retrying(failed.is_some());
+    if native_splash::wanted(plain, settings.show_splash, retrying) {
+        native_splash::show(if retrying {
+            native_splash::Status::TryingAnother
+        } else {
+            native_splash::Status::SettingUp
+        });
+    }
     let mode = gpu::Mode::for_start(&args, &settings, failed);
     // An OpenGL fallback after wgpu has failed on this driver: ask for the
     // compatibility profile first, which Windows Intel drivers accept more
@@ -665,7 +695,7 @@ pub fn run() -> eframe::Result<()> {
                     let _ = w.set(cc.egui_ctx.clone());
                 }
                 let mut shell = if splash {
-                    Shell::with_splash(cc, open_path)
+                    Shell::with_splash(cc, open_path, splash_seconds)
                 } else {
                     Shell::new(cc, open_path)
                 };
@@ -698,7 +728,7 @@ pub fn run() -> eframe::Result<()> {
             log::warn!(
                 "the window opened with {mode:?} but its frames came back nearly black; trying {next:?}"
             );
-            if !gpu::restart_with(next, &args) {
+            if !gpu::restart_with(next, &args, true) {
                 let what = format!(
                     "the window opened with {mode:?} but what it drew came back nearly black, and TraceDraw could not start again with {next:?}"
                 );
@@ -708,7 +738,7 @@ pub fn run() -> eframe::Result<()> {
         } else if let Some(next) = gpu::take_restart_after_exit() {
             // Help > Benchmark: with or without the graphics card.
             log::info!("starting again with {next:?} for the benchmark");
-            if !gpu::restart_with(next, &args) {
+            if !gpu::restart_with(next, &args, false) {
                 log::error!("TraceDraw could not start again with {next:?}");
             }
         }
@@ -718,7 +748,7 @@ pub fn run() -> eframe::Result<()> {
     // new start (a window system cannot be set up twice in one).
     if let Some(next) = next {
         log::warn!("the window did not open with {mode:?} ({e}); trying {next:?}");
-        if gpu::restart_with(next, &args) {
+        if gpu::restart_with(next, &args, true) {
             return Ok(());
         }
     }
@@ -852,10 +882,16 @@ impl Shell {
 
     /// The splash screen first; the editor is built when it is done.
     #[cfg(not(target_arch = "wasm32"))]
-    fn with_splash(cc: &eframe::CreationContext<'_>, open: Option<std::path::PathBuf>) -> Self {
+    fn with_splash(
+        cc: &eframe::CreationContext<'_>,
+        open: Option<std::path::PathBuf>,
+        least_seconds: f64,
+    ) -> Self {
         Shell {
             app: None,
-            splash: Some(splash::Splash::start(&cc.egui_ctx, open.as_deref())),
+            splash: Some(
+                splash::Splash::start(&cc.egui_ctx, open.as_deref()).at_least(least_seconds),
+            ),
             open,
             handed_over: None,
             pacer: gpu::Pacer::new(cc),
@@ -1131,8 +1167,8 @@ impl eframe::App for Shell {
         app.sync_document_colors();
         // File dialogs that finished in the background.
         files::run_finished(app, ui.ctx());
-        // Pictures, files and text a browser handed over for a paste.
-        app.take_handed_pastes();
+        // Clipboard pictures are read and encoded away from the UI thread.
+        app.poll_clipboard_paste();
         // Files a later start handed over (one try_recv when none came).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(inbox) = &mut self.handed_over {
@@ -1211,6 +1247,9 @@ impl eframe::App for Shell {
         frame_mark("before the interface");
         ui::root(app, ui);
         ui::text_field_menu::show(ui.ctx());
+        // Keyboard handling captures a browser paste's target before its
+        // files are applied, even if their promise finished before this frame.
+        app.take_handed_pastes();
         frame_mark("the dialogs");
         // The frame around the safe area (#1917).
         ui::screen_margins::paint(ui.ctx(), &app.settings);
@@ -1247,6 +1286,11 @@ impl eframe::App for Shell {
         app.autosave_settings(Some(ui.ctx()));
         // Bitmaps edited outside follow their files.
         app.watch_linked_bitmaps(Some(ui.ctx()), web_time::Instant::now());
+        if app.clipboard_paste_busy() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Progress);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // A pointer left hidden shows as a blank image on Windows, where
         // hiding it waits for the mouse to move (#1124).
         ui::cursors::finish_frame(ui.ctx());

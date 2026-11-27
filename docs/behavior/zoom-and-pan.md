@@ -190,6 +190,13 @@
   closes the pop-up; a press anywhere else or Esc closes it. Check:
   `ui::window_bars::tests::view_navigator_has_the_key_n`.
 
+## Continuously panning past the sharp margin
+
+Small pans reuse the extra pixels around the sharp canvas texture.
+When a pan exposes more than a thin edge of the smaller whole-page
+preview, the main canvas requests a new texture while the drag is
+still in progress. Only one main render is in flight at a time.
+
 ## Progressive preview memory
 
 The desktop canvas assembles completed render bands directly into one
@@ -198,6 +205,30 @@ they do not accumulate into another whole picture before assembly. The
 assembly lock is released before the callback, so a slow consumer does
 not hold up workers copying other bands. Cancellation discards the
 incomplete output and never returns it as a finished picture (#3883).
+
+The canvas keeps a running render during a continuous wheel burst. When
+the zoom settles, a render aimed at an earlier zoom is cancelled and
+the settled view takes the next turn. A render of an earlier document
+revision is cancelled as soon as the revision changes. Cancelled jobs
+leave the previous picture in place, including when their result has
+already reached the queue.
+
+For banded rendering, the renderer prepares lists of visible objects in
+painting order, using each band's blur margins. Objects with uncertain
+bounds stay eligible for every band. A drag preview or a page whose
+lists would grow too large uses the regular culling path.
+
+When an original bitmap is too large for the shared image cache, a banded
+desktop render may retain one such bitmap until its workers finish. This
+lets later bands reuse the decoded pixels without extending the shared
+cache budget. A separate handoff can keep one current original for up to
+1.5 seconds of inactivity, only while there is measured memory headroom.
+It is not a permanent increase to the image cache.
+
+For the draft canvas, a top bitmap that covers a whole band can replace
+that band. The renderer checks actual output alpha before skipping lower
+objects. Wireframe, overprint, focus and live transform previews keep the
+normal drawing order.
 
 This reduces temporary band storage; it does not cap image decoding,
 effect buffers, or the interface's queued texture uploads. The synthetic

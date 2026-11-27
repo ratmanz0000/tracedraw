@@ -17,6 +17,7 @@
 //! ([`run_untrusted`]): without file access, with limits, all or nothing.
 
 mod extra;
+pub mod vba_files;
 pub mod vba_run;
 mod vg;
 pub mod vg_catalog;
@@ -56,7 +57,7 @@ struct HostInner {
     simulate_overprints: Option<bool>,
     /// The view steps a script asked for (#4020), taken once its objects
     /// are in the drawing.
-    view_steps: Vec<crate::view_steps::ViewStep>,
+    view_steps: Vec<crate::view_steps::Taken>,
     /// What a macro's `Copy` or `Cut` took, for its `Paste`: the macro's
     /// own, not the system clipboard, which macros do not reach.
     clip: Vec<Shape>,
@@ -469,6 +470,7 @@ for (const name of ['ActiveDocument', 'ActivePage', 'ActiveLayer', 'ActiveSelect
 }
 "#;
 
+pub(crate) const RENAME_GROUPS_FROM_TEXT: &str = include_str!("scripting/rename_groups_from_text.js");
 /// Run a script against the app; returns the printed lines.
 pub fn run(app: &mut App, src: &str) -> Result<Vec<String>, String> {
     run_with(app, src, Trust::User, "Script").map(|(output, _)| output)
@@ -668,8 +670,8 @@ fn run_host(
     }
     let views = inner.view_steps;
     apply(app, inner.commands, inner.selection, inner.page, label);
-    for step in views {
-        app.run_view_step(step);
+    for (step, selection) in views {
+        app.run_view_step_with(step, &selection);
     }
     Ok((output, changes))
 }
@@ -1404,7 +1406,10 @@ impl HostInner {
                 let name = a.get("step").and_then(|v| v.as_str()).unwrap_or("");
                 let step = crate::view_steps::ViewStep::from_name(name)
                     .ok_or_else(|| format!("no view step {name:?}"))?;
-                self.view_steps.push(step);
+                // With the selection of that moment: a Zoom To Selection
+                // followed by Clear Selection still fits what was
+                // selected (#4269).
+                self.view_steps.push((step, self.selection.clone()));
                 json!({})
             }
             "log" => {
@@ -2943,6 +2948,44 @@ mod tests {
 
     fn app() -> App {
         App::headless()
+    }
+
+    #[test]
+    fn bundled_rename_groups_from_text_respects_scope_and_undo() {
+        let mut a = app();
+        let output = run(
+            &mut a,
+            r#"
+            const label = text => ActiveLayer.CreateArtisticText(5, 5, text, 'sans-serif', 12);
+            const rect = () => ActiveLayer.CreateRectangle(5, 5, 10, 10);
+            const group = (...shapes) => new ShapeRange(shapes.map(s => s.id)).Group();
+            const inner = group(label('  Station   42  '), rect());
+            const outer = group(inner, rect());
+            const empty = group(rect(), rect());
+            const multiple = group(label('First'), label('Second'));
+            const blank = group(label('   '), rect());
+            const other = group(label('Other'), rect());
+            outer.CreateSelection();
+            print([inner.id, outer.id, empty.id, multiple.id, blank.id, other.id].join(','));
+            "#,
+        ).expect("fixture");
+        let ids: Vec<_> = output[0].split(',').map(|id| ShapeId(id.parse().unwrap())).collect();
+        let name = |a: &App, i: usize| a.doc().find_shape(ids[i]).unwrap().name.clone();
+        let originals: Vec<_> = (0..ids.len()).map(|i| name(&a, i)).collect();
+        assert_eq!(run(&mut a, RENAME_GROUPS_FROM_TEXT).unwrap(), ["2"]);
+        assert_eq!(name(&a, 0).as_deref(), Some("Station 42"));
+        assert_eq!(name(&a, 1).as_deref(), Some("Station 42"));
+        assert_eq!(a.selection, vec![ids[1]]);
+        assert_eq!(name(&a, 5), originals[5]);
+        assert_eq!(run(&mut a, RENAME_GROUPS_FROM_TEXT).unwrap(), ["0"]);
+        a.undo();
+        assert_eq!((0..ids.len()).map(|i| name(&a, i)).collect::<Vec<_>>(), originals);
+        a.select(Vec::new());
+        assert_eq!(run(&mut a, RENAME_GROUPS_FROM_TEXT).unwrap(), ["3"]);
+        for i in 2..=4 {
+            assert_eq!(name(&a, i), originals[i]);
+        }
+        assert_eq!(name(&a, 5).as_deref(), Some("Other"));
     }
 
     #[test]

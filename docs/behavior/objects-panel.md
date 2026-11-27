@@ -9,7 +9,7 @@ the right.
 
 | Row | Contents |
 |---|---|
-| Page, Master Page | open or close arrow, a sheet (cream for the Master Page), name (in bold for the current page and the Master Page); a click opens or closes it |
+| Page, Master Page, Range Pages | open or close arrow, a sheet (cream for the Master Page), name (in bold for the current page and the shared-layer groups); a click opens or closes it |
 | Layer (light grey), one step in | collapse arrow, eye (show or hide), printer (print and export or not), padlock (lock or unlock), layer icon (its top sheet blue for a page's layers, amber for master layers), name |
 | Active layer | as a layer, on `#D4E6F7` with a 3 px accent bar at the left, name in bold; selected non-active layers are highlighted like selected object rows |
 | Master layer for odd or even pages | as a layer, followed by "Odd pages" or "Even pages" in small grey; dimmed on the pages it does not show on |
@@ -43,6 +43,11 @@ the right.
   Layer's Objects, Cut, Copy and Move to Master Page or Move to Page
   then act on all selected layers together in one undo step
   (`ui::objects_docker::tests::selected_layers_batch_visibility_lock_print_select_and_delete`).
+- An eye shows effective visibility, including every containing group and
+  the layer. An ordinary hide and show keeps the children's own visibility.
+  A repeated hide and show on the same container enables all descendants.
+  Showing a child of a hidden container opens its ancestor path and leaves
+  the other branches hidden. All changes from that click undo together.
 - With several objects selected, the eye of one of them hides them all
   when it is visible and shows them all when it is hidden, whatever each
   was; they stay selected, and one undo step brings each back as it
@@ -193,6 +198,14 @@ the right.
     nothing it can delete.
 - Which layers are closed, which groups are open and which page nodes
   and the Master Page node are closed lasts for the session.
+
+## Range pages
+
+The **Range Pages** group contains shared layers limited to named page
+positions, such as `1-8, 12, 15-20`. Its menu and the New Master Layer
+button's menu create a range layer. Layer Properties edits the range.
+See [Page range layers](page-range-layers.md) for page-order rules,
+validation, saving and output behavior.
 
 ## Thumbnails
 

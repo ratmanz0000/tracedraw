@@ -4,6 +4,7 @@
 //! text (tabs, columns, bullets, drop cap, statistics, spell check),
 //! colour management, font manager, palette editor, confirmations.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::{App, Units};
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
@@ -73,6 +74,14 @@ pub struct ExportState {
     /// file, 1 the classic version 8 file (#1728).
     pub ai_version: usize,
     pub bleed_mm: f64,
+    /// PDF: colour and gray pictures JPEG compressed at `pdf_quality`
+    /// (1 to 100), for smaller files to share (#4265).
+    pub pdf_compress: bool,
+    pub pdf_quality: u8,
+    /// PDF: the pictures compressed harder, and downsampled if need be,
+    /// until the file fits in `pdf_target_mb` megabytes (#4265).
+    pub pdf_target: bool,
+    pub pdf_target_mb: f64,
     pub output_condition: String,
     /// An installed script filter chosen instead of `format`, by name.
     pub script: Option<String>,
@@ -98,6 +107,10 @@ pub struct ExportState {
     /// JPEG and TIFF: the colours written, an index into
     /// [`EXPORT_COLOR_MODES`] (0 RGB, 1 CMYK, 2 Grayscale; #1763).
     pub color_mode: usize,
+    /// An area of the current page (page millimetres) exported with
+    /// everything that shows in it, cut to it: a slice of the Export
+    /// docker.
+    pub area: Option<tracedraw_core::geometry::Rect>,
     /// The file chosen in the Save dialog before the options were shown
     /// (File > Export on the desktop): OK writes it, its extension
     /// following the format chosen. `None`: OK asks where to save (the
@@ -148,6 +161,10 @@ impl Default for ExportState {
             pdf_standard: 0,
             ai_version: 0,
             bleed_mm: 0.0,
+            pdf_compress: false,
+            pdf_quality: 75,
+            pdf_target: false,
+            pdf_target_mb: 5.0,
             // Empty: the drawing's CMYK profile (#3829).
             output_condition: String::new(),
             script: None,
@@ -160,6 +177,7 @@ impl Default for ExportState {
             size_unit: 0,
             scale: 1.0,
             color_mode: 0,
+            area: None,
             target: None,
             dont_show: false,
             plt_scale: 1.0,
@@ -177,10 +195,12 @@ impl Default for ExportState {
 
 /// The colour modes of a JPEG or TIFF export (#1763): RGB as drawn on
 /// screen, CMYK inks for print, or one channel of grey.
-pub const EXPORT_COLOR_MODES: [ExportColorMode; 3] = [
+pub const EXPORT_COLOR_MODES: [ExportColorMode; 5] = [
     ExportColorMode::Rgb,
     ExportColorMode::Cmyk,
     ExportColorMode::Gray,
+    ExportColorMode::Paletted,
+    ExportColorMode::BlackWhite,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +208,10 @@ pub enum ExportColorMode {
     Rgb,
     Cmyk,
     Gray,
+    /// Indexed: a PNG with a palette of at most 256 colours (#4314).
+    Paletted,
+    /// Black and white: a 1-bit PNG (#4314).
+    BlackWhite,
 }
 
 impl ExportColorMode {
@@ -197,12 +221,28 @@ impl ExportColorMode {
             ExportColorMode::Rgb => "RGB".into(),
             ExportColorMode::Cmyk => "CMYK".into(),
             ExportColorMode::Gray => tr("palette.model_gray"),
+            ExportColorMode::Paletted => tr("dialog.convert_mode_paletted"),
+            ExportColorMode::BlackWhite => tr("dialog.black_and_white"),
+        }
+    }
+
+    /// Whether the format `ext` can be written in this mode: JPEG and
+    /// TIFF in RGB, CMYK or grey; PNG in RGB, grey, indexed or black and
+    /// white (#4314).
+    pub fn offered_for(self, ext: &str) -> bool {
+        match ext {
+            "jpg" | "tif" => matches!(
+                self,
+                ExportColorMode::Rgb | ExportColorMode::Cmyk | ExportColorMode::Gray
+            ),
+            "png" => self != ExportColorMode::Cmyk,
+            _ => self == ExportColorMode::Rgb,
         }
     }
 
     /// The bitmap formats (by extension) that take a colour mode.
     pub fn applies_to(ext: &str) -> bool {
-        matches!(ext, "jpg" | "tif")
+        matches!(ext, "jpg" | "tif" | "png")
     }
 }
 
@@ -214,6 +254,7 @@ impl ExportState {
             EXPORT_COLOR_MODES
                 .get(self.color_mode)
                 .copied()
+                .filter(|m| m.offered_for(ext))
                 .unwrap_or(ExportColorMode::Rgb)
         } else {
             ExportColorMode::Rgb
@@ -635,10 +676,11 @@ pub struct PrintState {
     pub booklet_binding: usize,
     /// Sheets in each signature of a perfect-bound booklet.
     pub signature_sheets: u32,
-    /// Booklet pages on each side of a sheet: 0 two, 1 four, 2 eight
-    /// (#3380).
+    /// Booklet pages on each side of a sheet: 0 two, 1 four, 2 eight,
+    /// 3 sixteen (#3380, #4279).
     pub booklet_up: usize,
-    /// Saddle-stitch creep compensation at the innermost sheet, mm.
+    /// Creep compensation at the innermost leaf, mm (saddle stitch, or
+    /// any folded signature).
     pub creep: f64,
     /// Space between the two pages of a booklet spread, mm (#947).
     pub booklet_gap: f64,
@@ -840,6 +882,7 @@ impl PrintState {
             up: match self.booklet_up {
                 1 => 4,
                 2 => 8,
+                3 => 16,
                 _ => 2,
             },
         }
@@ -1350,6 +1393,7 @@ pub use crate::ui::palette_editor::PaletteEditorState;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
     None,
+    OptimizeRaster(Box<crate::ui::optimize_raster::State>),
     /// The window of a trace running off the interface thread
     /// (`ui/trace_progress.rs`); the trace itself is `App::trace_job`.
     Tracing,
@@ -1416,6 +1460,10 @@ pub enum Dialog {
     TextHeight { height: f64 },
     /// Object > Outline Offset (#2622): the distance, in the drawing's
     /// units, and whether the new outline goes outside or inside.
+    /// Bitmaps > Scale to Known Size (#4215).
+    ScaleKnown(crate::scale_known::ScaleKnown),
+    /// Object > Insert > Shapes from Spreadsheet (#4270).
+    TableShapes(Box<crate::table_shapes::TableShapes>),
     OutlineOffset {
         distance: f64,
         outside: bool,
@@ -1472,6 +1520,7 @@ pub enum Dialog {
     },
     /// A layer's Properties from its menu in the Objects docker (#1477).
     LayerProperties(crate::ui::objects_docker::LayerProps),
+    NewRangeLayer(crate::ui::objects_docker::NewRangeLayer),
     RenameObject {
         shape: tracedraw_core::ShapeId,
         name: String,
@@ -1515,6 +1564,12 @@ pub enum Dialog {
         version: u16,
     },
     ConfirmClose,
+    /// A `.cdr` file refused as damaged (#4332): said plainly, with an
+    /// offer to open it anyway, reading what can be read.
+    DamagedFile {
+        path: std::path::PathBuf,
+        reason: String,
+    },
     /// A font or size picked with no text selected: make it the default
     /// of new text? (as the reference program asks)
     /// Edit > Copy Properties From (Ctrl+Shift+A): what to copy.
@@ -1601,6 +1656,10 @@ pub enum Dialog {
     TransformEach(crate::ui::transform_each::TransformEach),
     /// Object > Insert > Light Flare.
     Flare(crate::ui::flare::Flare),
+    /// Object > Insert > Chart from Data.
+    Chart(crate::ui::chart_dialog::ChartState),
+    /// Effects > Bend with Pins.
+    Pins(crate::ui::pins_dialog::PinsState),
     ConvertToBitmap(crate::bitmap_modes::ConvertOptions),
     StraightenImage(crate::ui::straighten_dialog::StraightenState),
     Resample(crate::resample::ResampleState),
@@ -2225,12 +2284,25 @@ pub fn show(app: &mut App, ctx: &Context) {
     }
     crate::ui::line_style::apply_units_request(app, ctx);
     let line_style = crate::ui::line_style::take_request(ctx);
-    if line_style && matches!(app.dialog, Dialog::OutlinePen(_)) {
+    if let (true, Dialog::OutlinePen(pen)) = (line_style, &app.dialog) {
         // Edit Line Style from the Outline Pen dialog: back to it after.
-        let back = std::mem::replace(&mut app.dialog, Dialog::LineStyle(Default::default()));
+        // It opens on the style picked there (#4288).
+        let st = crate::ui::line_style::State::for_dash(&pen.stroke.dash, &app.settings.custom_dashes);
+        let back = std::mem::replace(&mut app.dialog, Dialog::LineStyle(st));
         app.dialog_return = Some(Box::new(back));
     } else if line_style && matches!(app.dialog, Dialog::None) {
-        app.dialog = Dialog::LineStyle(Default::default());
+        // From a panel or a bar: on the selection's style (#4288).
+        let dash = app
+            .selection
+            .first()
+            .and_then(|id| app.doc().find_shape(*id))
+            .and_then(|s| s.stroke.as_ref())
+            .map(|st| st.dash.clone())
+            .unwrap_or_default();
+        app.dialog = Dialog::LineStyle(crate::ui::line_style::State::for_dash(
+            &dash,
+            &app.settings.custom_dashes,
+        ));
     } else if matches!(app.dialog, Dialog::None) {
         if let Some(back) = app.dialog_return.take() {
             app.dialog = *back;
@@ -2259,9 +2331,12 @@ pub fn show(app: &mut App, ctx: &Context) {
     if !matches!(app.dialog, Dialog::Trace(_)) && app.trace_live.is_active() {
         app.trace_live.clear();
     }
-    // And for a bitmap effect's dialog: the effect leaves the drawing.
+    // And for a bitmap effect's dialog: the effect leaves the drawing,
+    // unless the Effects docker holds its settings now (#4253).
+    crate::ui::fx_panel::watch(app);
     if (app.fx_preview.shown.is_some() || app.fx_preview.busy())
         && !matches!(app.dialog, Dialog::Effect(_))
+        && app.fx_panel.is_none()
     {
         app.end_bitmap_effect_preview();
     }
@@ -2289,6 +2364,7 @@ pub fn show(app: &mut App, ctx: &Context) {
     let mut close = false;
     match &mut dialog {
         Dialog::None => {}
+        Dialog::OptimizeRaster(st) => crate::ui::optimize_raster::dialog(app, ctx, st, &mut close),
         Dialog::Tracing => crate::ui::trace_progress::dialog(app, ctx, &mut close),
         Dialog::LineStyle(st) => crate::ui::line_style::dialog(app, ctx, st, &mut close),
         Dialog::BitmapBw(s) => crate::ui::bitmap_dialogs::bw_dialog(app, ctx, s, &mut close),
@@ -2889,7 +2965,7 @@ pub fn show(app: &mut App, ctx: &Context) {
                         },
                     );
                     if ui
-                        .button(tr("dialog.swap"))
+                        .ibutton("dialog.swap")
                         .rich_tip(crate::ui::tips::keyed("dialog.swap"))
                         .clicked()
                     {
@@ -2951,14 +3027,40 @@ pub fn show(app: &mut App, ctx: &Context) {
         }
         Dialog::LayerProperties(st) => {
             window(ctx, tr("docker.layer_properties")).show(ctx, |ui| {
-                crate::ui::objects_docker::layer_properties_fields(ui, st);
+                crate::ui::objects_docker::layer_properties_fields(ui, st, app.doc().pages.len());
                 if ok_cancel(ui, &mut close) {
-                    let cmds = st.commands(app);
-                    if !cmds.is_empty() {
-                        if let Err(e) = app.engine.run_batch("Layer Properties", &cmds) {
-                            app.status = e.to_string();
+                    if !st.valid() {
+                        close = false;
+                    } else {
+                        let cmds = st.commands(app);
+                        if !cmds.is_empty() {
+                            if cmds.iter().any(|command| {
+                                matches!(
+                                    command,
+                                    Command::SetLayerScope { .. }
+                                        | Command::SetLayerPageRange { .. }
+                                )
+                            }) {
+                                app.prepare_layer_range_change(st.layer);
+                            }
+                            if let Err(e) = app.engine.run_batch("Layer Properties", &cmds) {
+                                app.status = e.to_string();
+                                close = false;
+                            } else {
+                                app.sync_layer_range(st.layer);
+                            }
                         }
                     }
+                }
+            });
+        }
+        Dialog::NewRangeLayer(st) => {
+            window(ctx, tr("docker.new_range_layer")).show(ctx, |ui| {
+                crate::ui::objects_docker::new_range_layer_fields(ui, st, app.doc().pages.len());
+                if ok_cancel(ui, &mut close)
+                    && !crate::ui::objects_docker::create_range_layer(app, st)
+                {
+                    close = false;
                 }
             });
         }
@@ -3095,6 +3197,34 @@ pub fn show(app: &mut App, ctx: &Context) {
         }
         Dialog::DocumentProperties(st) => {
             crate::ui::doc_properties::dialog(app, ctx, st, &mut close)
+        }
+        Dialog::DamagedFile { path, reason } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = trf(
+                "dialog.damaged_file_text",
+                &[("name", &name), ("reason", reason.as_str())],
+            );
+            let (anyway, cancel) = (tr("dialog.damaged_open_anyway"), tr("dialog.cancel"));
+            match crate::ui::chrome::message_box(
+                ctx,
+                crate::ui::chrome::MessageIcon::Info,
+                &text,
+                &[&anyway, &cancel],
+            ) {
+                Some(0) => {
+                    let path = path.clone();
+                    app.dialog = Dialog::None;
+                    app.open_damaged_anyway = true;
+                    app.open_path(path);
+                    app.open_damaged_anyway = false;
+                    return;
+                }
+                Some(_) => close = true,
+                None => {}
+            }
         }
         Dialog::ConfirmClose => {
             let text = trf("dialog.save_changes_to", &[("name", &app.document_name())]);
@@ -3752,6 +3882,8 @@ pub fn show(app: &mut App, ctx: &Context) {
         Dialog::Formula(st) => crate::ui::formula_dialog::dialog(app, ctx, st, &mut close),
         Dialog::TransformEach(st) => crate::ui::transform_each::dialog(app, ctx, st, &mut close),
         Dialog::Flare(st) => crate::ui::flare::dialog(app, ctx, st, &mut close),
+        Dialog::Chart(st) => crate::ui::chart_dialog::dialog(app, ctx, st, &mut close),
+        Dialog::Pins(st) => crate::ui::pins_dialog::dialog(app, ctx, st, &mut close),
         Dialog::CopyProperties(c) => {
             window(ctx, tr("dialog.copy_properties")).show(ctx, |ui| {
                 ui.checkbox(&mut c.outline_pen, tr("dialog.copy_outline_pen"));
@@ -4094,6 +4226,8 @@ pub fn show(app: &mut App, ctx: &Context) {
         }
         Dialog::Encode(st) => encode_dialog(app, ctx, st, &mut close),
         Dialog::PictureCaptions(st) => crate::captions::dialog(app, ctx, st, &mut close),
+        Dialog::ScaleKnown(st) => crate::scale_known::dialog(app, ctx, st, &mut close),
+        Dialog::TableShapes(st) => crate::table_shapes::dialog(app, ctx, st, &mut close),
         Dialog::AiTurn(st) => crate::ai_photo::turn_dialog(app, ctx, st, &mut close),
         Dialog::AiSketch(st) => crate::ai_photo::sketch_dialog(app, ctx, st, &mut close),
         Dialog::AiRemove(st) => crate::ai_photo::remove_dialog(app, ctx, st, &mut close),
@@ -4755,7 +4889,7 @@ pub(crate) fn page_size_page(app: &mut App, ui: &mut Ui) {
                 "options.label_preset_tip",
             ));
         if ui
-            .button(tr("options.apply_labels"))
+            .ibutton("options.apply_labels")
             .rich_tip(crate::ui::tips::pair(
                 "options.apply_labels",
                 "options.apply_labels_tip",
@@ -4968,7 +5102,7 @@ pub(crate) fn page_size_page(app: &mut App, ui: &mut Ui) {
         if ui
             .add_enabled(
                 !app.selection.is_empty(),
-                egui::Button::new(tr("options.fit_page_selection")),
+                crate::ui::btn_icons::Ib::new("options.fit_page_selection"),
             )
             .rich_tip_always(crate::ui::tips::pair(
                 "options.fit_page_selection",
@@ -4981,7 +5115,7 @@ pub(crate) fn page_size_page(app: &mut App, ui: &mut Ui) {
         if ui
             .add_enabled(
                 app.drawing_bounds().is_some(),
-                egui::Button::new(tr("options.fit_page_drawing")),
+                crate::ui::btn_icons::Ib::new("options.fit_page_drawing"),
             )
             .rich_tip_always(crate::ui::tips::pair(
                 "options.fit_page_drawing",
@@ -5017,7 +5151,7 @@ pub(crate) fn page_size_page(app: &mut App, ui: &mut Ui) {
         if ui
             .add_sized(
                 [150.0, 26.0],
-                egui::Button::new(tr("options.add_page_frame")),
+                crate::ui::btn_icons::Ib::new("options.add_page_frame"),
             )
             .rich_tip(crate::ui::tips::pair(
                 "options.add_page_frame",
@@ -5136,6 +5270,10 @@ fn export_preview_key(app: &App, st: &ExportState) -> u64 {
     st.pages.hash(&mut h);
     st.spreads.hash(&mut h);
     st.text_as_curves.hash(&mut h);
+    st.pdf_compress.hash(&mut h);
+    st.pdf_quality.hash(&mut h);
+    st.pdf_target.hash(&mut h);
+    st.pdf_target_mb.to_bits().hash(&mut h);
     st.svg_text.hash(&mut h);
     st.ai_version.hash(&mut h);
     st.quality.hash(&mut h);
@@ -5800,7 +5938,9 @@ fn export_dialog(app: &mut App, ctx: &Context, st: &mut ExportState, close: &mut
                                 .selected_text(st.color_mode_for(ext).label())
                                 .show_ui(ui, |ui| {
                                     for (i, m) in EXPORT_COLOR_MODES.iter().enumerate() {
-                                        ui.selectable_value(&mut st.color_mode, i, m.label());
+                                        if m.offered_for(ext) {
+                                            ui.selectable_value(&mut st.color_mode, i, m.label());
+                                        }
                                     }
                                 })
                                 .response
@@ -5942,6 +6082,7 @@ fn export_dialog(app: &mut App, ctx: &Context, st: &mut ExportState, close: &mut
                         )
                         .rich_tip(crate::ui::tips::keyed("dialog.bleed"));
                     });
+                    pdf_compression_rows(ui, st);
                     if st.pdf_standard > 0 {
                         ui.horizontal(|ui| {
                             ui.label(tr("dialog.output_condition"));
@@ -5961,7 +6102,7 @@ fn export_dialog(app: &mut App, ctx: &Context, st: &mut ExportState, close: &mut
                     // and colour bars, passwords and the rest (#2197):
                     // the PDF Settings dialog, for the same file.
                     if ui
-                        .button(tr("dialog.export_pdf_settings"))
+                        .ibutton("dialog.export_pdf_settings")
                         .rich_tip(crate::ui::tips::keyed("dialog.export_pdf_settings"))
                         .clicked()
                     {
@@ -6185,6 +6326,33 @@ fn plt_export_fields(ui: &mut Ui, st: &mut ExportState) {
         .rich_tip(crate::ui::tips::keyed("dialog.plt_one_pen"));
 }
 
+/// The Export dialog's PDF compression (#4265): Compress pictures with
+/// its quality slider, and a target file size.
+fn pdf_compression_rows(ui: &mut Ui, st: &mut ExportState) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut st.pdf_compress, tr("dialog.pdf_compress"))
+            .rich_tip(crate::ui::tips::keyed("dialog.pdf_compress"));
+        ui.add_enabled_ui(st.pdf_compress, |ui| {
+            ui.add(crate::ui::Slider::new(&mut st.pdf_quality, 1..=100))
+                .rich_tip(crate::ui::tips::keyed("dialog.pdf_compress"));
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut st.pdf_target, tr("publish.target_size"))
+            .rich_tip(crate::ui::tips::keyed("publish.target_size"));
+        ui.add_enabled_ui(st.pdf_target, |ui| {
+            ui.add(
+                crate::ui::field::NumField::new(&mut st.pdf_target_mb)
+                    .range(0.01..=10_000.0)
+                    .speed(0.1)
+                    .max_decimals(2)
+                    .suffix(" MB"),
+            )
+            .rich_tip(crate::ui::tips::keyed("publish.target_size"));
+        });
+    });
+}
+
 /// The Export dialog's PDF Settings button (#2197): the PDF Settings
 /// dialog in its place, writing to the file the Export dialog chose and
 /// keeping its text as curves, standard and bleed.
@@ -6196,6 +6364,12 @@ pub fn open_pdf_settings(app: &mut App, st: &ExportState) {
         }
         p.prefs.text_as_curves = st.text_as_curves;
         p.bleed_mm = st.bleed_mm.max(0.0);
+        if st.pdf_compress {
+            p.prefs.bitmaps.jpeg = true;
+            p.prefs.bitmaps.jpeg_quality = st.pdf_quality.clamp(1, 100);
+        }
+        p.prefs.bitmaps.target_size = st.pdf_target;
+        p.prefs.bitmaps.target_mb = st.pdf_target_mb;
         if st.pdf_standard < PDF_STANDARDS.len() {
             p.prefs.standard = st.pdf_standard;
         }
@@ -6790,7 +6964,7 @@ pub(crate) fn print_layout_fields(app: &App, ui: &mut Ui, st: &mut PrintState) {
                             if ui
                                 .add_enabled(
                                     !name.is_empty(),
-                                    egui::Button::new(tr("print.sheet_save")),
+                                    crate::ui::btn_icons::Ib::new("print.sheet_save"),
                                 )
                                 .clicked()
                             {
@@ -7005,12 +7179,17 @@ fn booklet_fields(ui: &mut Ui, st: &mut PrintState) {
 
 fn booklet_rows(ui: &mut Ui, st: &mut PrintState) {
     // Pages on each side of the sheet: one fold, or a large sheet folded
-    // into a signature of 8 or 16 pages (#3380).
-    let ups = ["print.booklet_up_2", "print.booklet_up_4", "print.booklet_up_8"];
+    // into a signature of 8, 16 or 32 pages (#3380, #4279).
+    let ups = [
+        "print.booklet_up_2",
+        "print.booklet_up_4",
+        "print.booklet_up_8",
+        "print.booklet_up_16",
+    ];
     ui.label(tr("print.booklet_up"))
         .rich_tip(crate::ui::tips::keyed("print.booklet_up"));
     egui::ComboBox::from_id_salt("print_booklet_up")
-        .selected_text(tr(ups[st.booklet_up.min(2)]))
+        .selected_text(tr(ups[st.booklet_up.min(ups.len() - 1)]))
         .show_ui(ui, |ui| {
             for (i, key) in ups.iter().enumerate() {
                 ui.selectable_value(&mut st.booklet_up, i, tr(key));
@@ -7025,7 +7204,8 @@ fn booklet_rows(ui: &mut Ui, st: &mut PrintState) {
         ui.add(crate::ui::field::NumField::new(&mut st.signature_sheets).range(1..=32))
             .rich_tip(crate::ui::tips::keyed("print.signature_sheets"));
         ui.end_row();
-    } else if st.booklet_up == 0 {
+    } else {
+        // Creep: saddle stitch, or any folded signature (#4280).
         ui.label(tr("print.creep"))
             .rich_tip(crate::ui::tips::keyed("print.creep"));
         ui.add(
@@ -7217,7 +7397,7 @@ fn print_dialog(app: &mut App, ctx: &Context, st: &mut PrintState, close: &mut b
         ui.separator();
         ui.horizontal(|ui| {
             if ui
-                .button(tr("menu.file.print_preview"))
+                .ibutton("menu.file.print_preview")
                 .rich_tip(crate::ui::tips::pair(
                     "menu.file.print_preview",
                     "print.preview_desc",
@@ -7229,7 +7409,7 @@ fn print_dialog(app: &mut App, ctx: &Context, st: &mut PrintState, close: &mut b
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button(tr("print.apply"))
+                    .ibutton("print.apply")
                     .rich_tip(crate::ui::tips::keyed("print.apply"))
                     .clicked()
                 {
@@ -7255,7 +7435,7 @@ fn print_dialog(app: &mut App, ctx: &Context, st: &mut PrintState, close: &mut b
                     && !ui.memory(|m| m.focused().is_some())
                     && !egui::Popup::is_any_open(ui.ctx());
                 if ui
-                    .add_enabled(!waiting, egui::Button::new(tr("dialog.print")))
+                    .add_enabled(!waiting, crate::ui::btn_icons::Ib::new("dialog.print"))
                     .rich_tip(crate::ui::tips::pair("dialog.print", "print.print_desc"))
                     .rich_disabled_tip(crate::ui::tips::pair("dialog.print", "print.print_desc"))
                     .clicked()
@@ -7889,7 +8069,7 @@ fn print_tab_issues(
             }
         });
     ui.add_space(6.0);
-    if ui.button(tr("preflight.open")).clicked() {
+    if ui.ibutton("preflight.open").clicked() {
         app.dialog = Dialog::Preflight(Default::default());
         *close = true;
     }
@@ -8018,7 +8198,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             ui.label(tr("merge.hint"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button(tr("merge.import_file"))
+                    .ibutton("merge.import_file")
                     .rich_tip(crate::ui::tips::keyed("merge.import_file"))
                     .clicked()
                 {
@@ -8048,7 +8228,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
         ui.strong(tr("merge.add_or_edit"));
         ui.horizontal(|ui| {
             if ui
-                .button(tr("merge.add_column"))
+                .ibutton("merge.add_column")
                 .rich_tip(crate::ui::tips::keyed("merge.add_column"))
                 .clicked()
             {
@@ -8058,7 +8238,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             if ui
                 .add_enabled(
                     !st.headers.is_empty(),
-                    egui::Button::new(tr("merge.configure")).selected(st.configure),
+                    crate::ui::btn_icons::Ib::new("merge.configure").selected(st.configure),
                 )
                 .rich_tip_always(crate::ui::tips::keyed("merge.configure"))
                 .clicked()
@@ -8077,7 +8257,10 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
                     crate::ui::tips::keyed("merge.view_single")
                 };
                 if ui
-                    .add_enabled(!st.rows.is_empty(), egui::Button::new(label))
+                    .add_enabled(
+                        !st.rows.is_empty(),
+                        crate::ui::btn_icons::Ib::with_text("merge.view_all", label),
+                    )
                     .rich_tip_always(tip)
                     .clicked()
                 {
@@ -8163,7 +8346,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
                 ui.horizontal(|ui| {
                     let ok = !name.trim().is_empty();
                     if ui
-                        .add_enabled(ok, egui::Button::new(tr("merge.add")))
+                        .add_enabled(ok, crate::ui::btn_icons::Ib::new("merge.add"))
                         .rich_tip_always(crate::ui::tips::keyed("merge.add"))
                         .clicked()
                     {
@@ -8308,7 +8491,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
                                     {
                                         merge_random_fields(ui, min, max, digits, prefix, unique);
                                         if ui
-                                            .button(tr("merge.random_draw"))
+                                            .ibutton("merge.random_draw")
                                             .rich_tip(crate::ui::tips::keyed("merge.random_draw"))
                                             .clicked()
                                         {
@@ -8525,7 +8708,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             let sel = st.cells.filter(|_| !st.single && !st.rows.is_empty());
             ui.separator();
             if ui
-                .add_enabled(sel.is_some(), egui::Button::new(tr("merge.sel_add")))
+                .add_enabled(sel.is_some(), crate::ui::btn_icons::Ib::new("merge.sel_add"))
                 .rich_tip_always(crate::ui::tips::pair("merge.sel_add", "merge.sel_add_tip"))
                 .clicked()
             {
@@ -8539,7 +8722,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
                 }
             }
             if ui
-                .add_enabled(sel.is_some(), egui::Button::new(tr("merge.sel_delete")))
+                .add_enabled(sel.is_some(), crate::ui::btn_icons::Ib::new("merge.sel_delete"))
                 .rich_tip_always(crate::ui::tips::pair(
                     "merge.sel_delete",
                     "merge.sel_delete_tip",
@@ -8554,7 +8737,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             let clear_key = ui.memory(|m| m.focused().is_none())
                 && ui.input(|i| i.key_pressed(egui::Key::Delete));
             if ui
-                .add_enabled(sel.is_some(), egui::Button::new(tr("merge.sel_clear")))
+                .add_enabled(sel.is_some(), crate::ui::btn_icons::Ib::new("merge.sel_clear"))
                 .rich_tip_always(crate::ui::tips::pair(
                     "merge.sel_clear",
                     "merge.sel_clear_tip",
@@ -8569,7 +8752,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let n = st.rows.len();
                 if ui
-                    .add_enabled(n > 0, egui::Button::new(tr("merge.go_to")))
+                    .add_enabled(n > 0, crate::ui::btn_icons::Ib::new("merge.go_to"))
                     .rich_tip_always(crate::ui::tips::keyed("merge.go_to"))
                     .clicked()
                 {
@@ -8639,7 +8822,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
             if ui
                 .add_enabled(
                     !st.headers.is_empty(),
-                    egui::Button::new(tr("merge.save_data")),
+                    crate::ui::btn_icons::Ib::new("merge.save_data"),
                 )
                 .rich_tip_always(crate::ui::tips::keyed("merge.save_data"))
                 .clicked()
@@ -8669,7 +8852,7 @@ fn print_merge_dialog(app: &mut App, ctx: &Context, st: &mut PrintMergeState, cl
                 if ui
                     .add_enabled(
                         !st.headers.is_empty(),
-                        egui::Button::new(tr("merge.finish")),
+                        crate::ui::btn_icons::Ib::new("merge.finish"),
                     )
                     .rich_tip_always(crate::ui::tips::keyed("merge.finish"))
                     .clicked()
@@ -9134,7 +9317,7 @@ fn paragraph_dialog(app: &mut App, ctx: &Context, which: &Dialog, close: &mut bo
                     changed = true;
                 }
                 if ui
-                    .button(tr("dialog.add_tab"))
+                    .ibutton("dialog.add_tab")
                     .rich_tip(crate::ui::tips::keyed("dialog.add_tab"))
                     .clicked()
                 {
@@ -9422,7 +9605,7 @@ fn border_grommet_dialog(
                 .rich_tip(crate::ui::tips::keyed("dialog.help_button"))
                 .clicked();
             if ui
-                .add_sized([100.0, 27.0], egui::Button::new(tr("dialog.reset")))
+                .add_sized([100.0, 27.0], crate::ui::btn_icons::Ib::new("dialog.reset"))
                 .rich_tip(crate::ui::tips::keyed("dialog.reset"))
                 .clicked()
             {
@@ -9994,12 +10177,19 @@ pub(crate) mod tests {
                 printable: true,
                 locked: false,
                 master: true,
+                desktop: false,
                 scope: tracedraw_core::MasterScope::All,
+                use_page_range: false,
+                page_range: "1".into(),
                 in_front: false,
             }),
             Dialog::DocumentProperties(Box::default()),
             Dialog::OldCdrVersion { version: 9 },
             Dialog::ConfirmClose,
+            Dialog::DamagedFile {
+                path: "/nowhere/art.cdr".into(),
+                reason: "content/riffData.cdr: Invalid checksum".into(),
+            },
             Dialog::ConfirmResetSettings,
             Dialog::Updates,
             Dialog::Benchmark,
@@ -10039,6 +10229,8 @@ pub(crate) mod tests {
             Dialog::Formula(Default::default()),
             Dialog::TransformEach(Default::default()),
             Dialog::Flare(Default::default()),
+            Dialog::Chart(Default::default()),
+            Dialog::Pins(Default::default()),
             Dialog::ConvertToBitmap(crate::bitmap_modes::ConvertOptions {
                 dpi: 150.0,
                 mode: crate::bitmap_modes::ConvertMode::BlackWhite,
@@ -10083,6 +10275,8 @@ pub(crate) mod tests {
             Dialog::CustomHyphens(Default::default()),
             Dialog::Encode(EncodeState::default()),
             Dialog::PictureCaptions(Default::default()),
+            Dialog::ScaleKnown(Default::default()),
+            Dialog::TableShapes(Default::default()),
             Dialog::AiTurn(Default::default()),
             Dialog::AiSketch(Default::default()),
             Dialog::AiRemove(Default::default()),
@@ -11127,17 +11321,23 @@ mod booklet_fields_tests {
         assert_eq!(o.booklet.binding, crate::imposition::Binding::PerfectBound);
         assert_eq!(o.layout, crate::imposition::Layout::Booklet);
         // Pages per side (#3380): 4 a side folds a sheet into a signature
-        // of 8 pages, so 6 pages take one sheet; sheets per signature and
-        // creep do not apply.
+        // of 8 pages, so 6 pages take one sheet; sheets per signature do
+        // not apply, creep does (#4280).
         assert!(has(&texts, &tr("print.booklet_up")));
         assert!(has(&texts, &tr("print.booklet_up_2")));
         st.booklet_up = 1;
         let texts = run(&mut st, Vec::new());
         assert!(has(&texts, &tr("print.booklet_up_4")));
         assert!(!has(&texts, &tr("print.signature_sheets")));
-        assert!(!has(&texts, &tr("print.creep")));
+        assert!(has(&texts, &tr("print.creep")));
         let o = crate::export::print_layout(&app, &st, app.doc());
         assert_eq!(o.booklet.up, 4);
+        // 16 a side (#4279).
+        st.booklet_up = 3;
+        let texts = run(&mut st, Vec::new());
+        assert!(has(&texts, &tr("print.booklet_up_16")));
+        let o = crate::export::print_layout(&app, &st, app.doc());
+        assert_eq!(o.booklet.up, 16);
         assert_eq!(crate::imposition::booklet_info(6, &o.booklet).sheets, 1);
     }
 
@@ -11799,14 +11999,14 @@ fn edit_text_box(
             .rich_tip(crate::ui::tips::pair("edit_text.marks", "edit_text.marks_tip"));
         ui.separator();
         if ui
-            .button(tr("edit_text.import"))
+            .ibutton("edit_text.import")
             .rich_tip(crate::ui::tips::pair("edit_text.import", "edit_text.import_tip"))
             .clicked()
         {
             asked = EditTextAsk::Import;
         }
         if ui
-            .button(tr("edit_text.spell"))
+            .ibutton("edit_text.spell")
             .rich_tip(crate::ui::tips::pair("edit_text.spell", "edit_text.spell_tip"))
             .clicked()
         {
@@ -12118,7 +12318,7 @@ fn resample_file_section(
             "resample.target_desc",
         ));
         if ui
-            .add_enabled(st.target_kb > 0.0, egui::Button::new(tr("resample.fit")))
+            .add_enabled(st.target_kb > 0.0, crate::ui::btn_icons::Ib::new("resample.fit"))
             .rich_tip(crate::ui::tips::pair(
                 "resample.fit",
                 "resample.target_desc",
@@ -12133,7 +12333,7 @@ fn resample_file_section(
         }
     });
     if ui
-        .button(tr("resample.save_as"))
+        .ibutton("resample.save_as")
         .rich_tip(crate::ui::tips::pair(
             "resample.save_as",
             "resample.save_as_desc",
@@ -12216,7 +12416,7 @@ pub(crate) fn page_look_editor(ui: &mut egui::Ui, look: &mut crate::settings::Pa
             if ui
                 .add_enabled(
                     !look.is_default(),
-                    egui::Button::new(tr("options.page_look_reset")),
+                    crate::ui::btn_icons::Ib::new("options.page_look_reset"),
                 )
                 .rich_tip(tip("options.page_look_reset"))
                 .clicked()

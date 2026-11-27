@@ -124,7 +124,19 @@ fn leading_zero(t: &str) -> bool {
 /// plain numbers as numbers, the rest as text; `merged` lists blocks of
 /// cells joined into one as (first row, first column, last row, last
 /// column), counted from 0. Written from the public ECMA-376 structure.
-pub fn write_rows(rows: &[Vec<String>], merged: &[(u32, u32, u32, u32)]) -> Result<Vec<u8>, String> {
+pub fn write_rows(
+    rows: &[Vec<String>],
+    merged: &[(u32, u32, u32, u32)],
+) -> Result<Vec<u8>, String> {
+    write_rows_with_text_columns(rows, merged, &[])
+}
+
+/// Write selected zero-based columns as text, even for numeric-looking values.
+pub fn write_rows_with_text_columns(
+    rows: &[Vec<String>],
+    merged: &[(u32, u32, u32, u32)],
+    text_columns: &[usize],
+) -> Result<Vec<u8>, String> {
     use std::fmt::Write as _;
     use std::io::Write as _;
     let mut sheet = String::from(
@@ -139,7 +151,7 @@ pub fn write_rows(rows: &[Vec<String>], merged: &[(u32, u32, u32, u32)]) -> Resu
                 continue;
             }
             let at = format!("{}{}", column_name(c), r + 1);
-            if plain_number(text) {
+            if !text_columns.contains(&c) && plain_number(text) {
                 let _ = write!(sheet, "<c r=\"{at}\"><v>{text}</v></c>");
             } else {
                 let _ = write!(
@@ -276,7 +288,10 @@ fn xml_declared_encoding(head: &str) -> Option<&str> {
 }
 
 fn strip_xml_encoding(xml: &str) -> String {
-    match xml.find("?>").filter(|&end| xml[..end].starts_with("<?xml")) {
+    match xml
+        .find("?>")
+        .filter(|&end| xml[..end].starts_with("<?xml"))
+    {
         Some(end) => format!("<?xml version=\"1.0\"?>{}", &xml[end + 2..]),
         None => xml.to_string(),
     }
@@ -434,6 +449,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn specified_columns_keep_numeric_looking_values_as_text() {
+        use std::io::Read;
+
+        let rows = vec![vec!["42".into(), "7000000".into()]];
+        let bytes = write_rows_with_text_columns(&rows, &[], &[0]).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(xml.contains("<c r=\"A1\" t=\"inlineStr\">"));
+        assert!(xml.contains("<c r=\"B1\"><v>7000000</v></c>"));
+    }
+
     /// A workbook made here, as a spreadsheet program writes one.
     fn book(sheet: &str, shared: &str) -> Vec<u8> {
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -538,6 +569,9 @@ mod tests {
         let xml_1251 = "<?xml version=\"1.0\" encoding=\"windows-1251\"?><sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><si><t>Бумага</t></si></sst>";
         let (raw_1251, _, _) = encoding_rs::WINDOWS_1251.encode(xml_1251);
         let decoded = decode_xml_bytes(&raw_1251);
-        assert_eq!(shared_strings(&decoded).unwrap(), vec!["Бумага".to_string()]);
+        assert_eq!(
+            shared_strings(&decoded).unwrap(),
+            vec!["Бумага".to_string()]
+        );
     }
 }

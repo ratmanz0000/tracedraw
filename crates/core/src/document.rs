@@ -5,7 +5,7 @@ use crate::geometry::{self, Affine, BezPath, Point, Rect, Shape as _, Vec2};
 use crate::gk42::GkCalibration;
 use crate::id::{IdSource, LayerId, PageId, ShapeId};
 use crate::style::{Fill, Stroke};
-use crate::{Error, Result};
+use crate::{Error, PageRanges, Result};
 use serde::{Deserialize, Serialize};
 
 /// Hook for the text engine. The core cannot depend on fonts, so the app
@@ -324,6 +324,11 @@ pub fn vertical_line_frame() -> Affine {
 /// of a span with a background on each line, from descent to ascent.
 /// Empty for other shapes, text on a path and without a text engine.
 pub fn text_backgrounds(kind: &ShapeKind) -> Vec<(Rect, Fill)> {
+    text_background_paints(kind).into_iter().map(|(rect, fill, _)| (rect, fill)).collect()
+}
+
+/// The frame and character backgrounds with their independent paint opacity.
+pub fn text_background_paints(kind: &ShapeKind) -> Vec<(Rect, Fill, f64)> {
     let ShapeKind::Text {
         spans,
         origin,
@@ -339,6 +344,7 @@ pub fn text_backgrounds(kind: &ShapeKind) -> Vec<(Rect, Fill)> {
         (Some(f), Some(fill)) => Some((
             Rect::new(origin.x, origin.y, origin.x + f.width, origin.y + f.height),
             fill.clone(),
+            1.0,
         )),
         _ => None,
     };
@@ -362,7 +368,7 @@ pub fn text_backgrounds(kind: &ShapeKind) -> Vec<(Rect, Fill)> {
         } else {
             Affine::IDENTITY
         };
-    let mut out: Vec<(Rect, Fill)> = frame_bg.into_iter().collect();
+    let mut out: Vec<(Rect, Fill, f64)> = frame_bg.into_iter().collect();
     let mut stretches = Vec::new();
     let mut span_start = 0usize;
     for sp in spans {
@@ -388,7 +394,7 @@ pub fn text_backgrounds(kind: &ShapeKind) -> Vec<(Rect, Fill)> {
                     x1,
                     line.baseline + line.ascent,
                 );
-                out.push(((to_local * r.to_path(0.01)).bounding_box(), fill.clone()));
+                out.push(((to_local * r.to_path(0.01)).bounding_box(), fill.clone(), sp.paint_opacity.background));
             }
         }
     }
@@ -1675,6 +1681,9 @@ pub struct TextSpan {
     /// object's outline off these characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outline: Option<Stroke>,
+    /// Independent opacity of glyph fill, character background and glyph outline.
+    #[serde(default, skip_serializing_if = "TextPaintOpacity::is_default")]
+    pub paint_opacity: TextPaintOpacity,
     /// Laid out but not drawn: set only on the parts a text with its own
     /// character colours is drawn in (see [`Shape::text_parts`]), never
     /// saved.
@@ -1723,8 +1732,33 @@ fn is_false(v: &bool) -> bool {
 
 /// One look of a text's characters (see [`Shape::text_parts`]): the fill,
 /// outline and overprints they are drawn with.
+/// Opacity of the paint applied to the characters, independent of the object.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextPaintOpacity {
+    pub fill: f64,
+    pub background: f64,
+    pub outline: f64,
+}
+
+impl Default for TextPaintOpacity {
+    fn default() -> Self {
+        Self {
+            fill: 1.0,
+            background: 1.0,
+            outline: 1.0,
+        }
+    }
+}
+
+impl TextPaintOpacity {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 #[derive(Clone, PartialEq)]
 struct TextLook {
+    fill_opacity: f64,
+    outline_opacity: f64,
     fill: Fill,
     stroke: Option<Stroke>,
     overprint_fill: bool,
@@ -1753,6 +1787,7 @@ impl TextSpan {
             fill: None,
             background: None,
             outline: None,
+            paint_opacity: TextPaintOpacity::default(),
             layout_only: false,
             features: Vec::new(),
             position: TextPosition::Normal,
@@ -2113,6 +2148,10 @@ pub struct ParagraphStyle {
     /// The paragraph frame's background; `None` = transparent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_fill: Option<Fill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_outline: Option<Stroke>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_outline_opacity: Option<f64>,
     /// What the frame's text wraps around and where the page's baseline
     /// grid falls, worked out from the drawing (see
     /// [`crate::text_flow`]); not saved.
@@ -2478,6 +2517,8 @@ impl Default for ParagraphStyle {
             direction: TextDirection::LeftToRight,
             kashida: Kashida::Off,
             frame_fill: None,
+            frame_outline: None,
+            frame_outline_opacity: None,
             bullet_part: None,
             flow: crate::text_flow::FrameFlow::default(),
             inside: None,
@@ -2992,6 +3033,9 @@ pub enum PathTextVertical {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TextOnPath {
     pub path: BezPath,
+    /// The editable outline, if the text was attached by dropping onto it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::text_path::PathSource>,
     /// Start offset along the baseline, mm (with centred or right-aligned
     /// text, added to the alignment's own start).
     #[serde(default)]
@@ -3399,7 +3443,10 @@ impl FillLook {
             });
         }
         if self.blur > 1e-9 {
-            out.push(Effect::GaussianBlur { radius: self.blur });
+            out.push(Effect::GaussianBlur {
+                radius: self.blur,
+                pins: Vec::new(),
+            });
         }
         out
     }
@@ -3413,6 +3460,10 @@ pub struct Shape {
     /// Local-to-page transform.
     pub transform: Affine,
     pub fill: Fill,
+    /// Paint a bitmap with its fill, using the original pixels as an alpha
+    /// mask. Used by detached shadows to retain their feathered silhouette.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bitmap_alpha_fill: bool,
     pub stroke: Option<Stroke>,
     pub visible: bool,
     pub locked: bool,
@@ -3577,10 +3628,14 @@ pub enum QrKind {
     Contact,
     Text,
     Location,
+    /// A Brazilian instant payment (Pix): the receiver's key, name and
+    /// city, and an optional amount, reference and message, written as
+    /// the payment code banks' apps read (see [`pix_payload`]).
+    Pix,
 }
 
 impl QrKind {
-    pub const ALL: [QrKind; 7] = [
+    pub const ALL: [QrKind; 8] = [
         QrKind::Url,
         QrKind::Email,
         QrKind::Phone,
@@ -3588,6 +3643,7 @@ impl QrKind {
         QrKind::Contact,
         QrKind::Text,
         QrKind::Location,
+        QrKind::Pix,
     ];
 
     /// The names of the kind's fields (keys of the interface's strings),
@@ -3609,6 +3665,14 @@ impl QrKind {
             ],
             QrKind::Text => &["qr.field_text"],
             QrKind::Location => &["qr.field_latitude", "qr.field_longitude"],
+            QrKind::Pix => &[
+                "qr.field_pix_key",
+                "qr.field_receiver",
+                "qr.field_city",
+                "qr.field_amount",
+                "qr.field_reference",
+                "qr.field_message",
+            ],
         }
     }
 
@@ -3628,10 +3692,28 @@ impl QrKind {
     }
 }
 
+/// The kind of 2D code a QR code object draws (#4228): a QR code, a
+/// Data Matrix (square, for small parts and labels) or a rectangular
+/// micro QR code (rMQR, for narrow spaces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QrSymbol {
+    #[default]
+    Qr,
+    DataMatrix,
+    Rmqr,
+}
+
+impl QrSymbol {
+    pub const ALL: [QrSymbol; 3] = [QrSymbol::Qr, QrSymbol::DataMatrix, QrSymbol::Rmqr];
+}
+
 /// A QR code object's settings (see [`Shape::qr`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QrCode {
+    /// The kind of code drawn; a QR code in drawings that don't say.
+    #[serde(skip_serializing_if = "is_qr_symbol")]
+    pub symbol: QrSymbol,
     pub kind: QrKind,
     /// The kind's fields, in the order [`QrKind::fields`] names them.
     pub fields: Vec<String>,
@@ -3648,6 +3730,7 @@ pub struct QrCode {
 impl Default for QrCode {
     fn default() -> Self {
         QrCode {
+            symbol: QrSymbol::Qr,
             kind: QrKind::Url,
             fields: vec!["https://github.com/tracedraw/tracedraw".into()],
             pixel_mm: 2.5,
@@ -3656,6 +3739,10 @@ impl Default for QrCode {
             outline: None,
         }
     }
+}
+
+fn is_qr_symbol(s: &QrSymbol) -> bool {
+    *s == QrSymbol::Qr
 }
 
 impl QrCode {
@@ -3697,8 +3784,138 @@ impl QrCode {
             }
             QrKind::Location if f(0).is_empty() || f(1).is_empty() => String::new(),
             QrKind::Location => format!("geo:{},{}", f(0), f(1)),
+            QrKind::Pix => pix_payload(f(0), f(1), f(2), f(3), f(4), f(5)),
         }
     }
+}
+
+/// A Pix payment code: the fields as tag, two-digit length and value
+/// (the merchant-presented code layout), ending with the CRC-16 (CCITT,
+/// start 0xFFFF) of everything before it. Empty while the key, the
+/// receiver's name or the city is missing.
+///
+/// Names and cities are written in plain ASCII (accents
+/// taken off) and cut to the lengths the layout allows (25 and 15); a
+/// key made of a tax number's digits and dots, dashes or slashes keeps
+/// only its digits; the amount takes a comma or a point and is written
+/// with two decimals (left out when empty or not above zero); the
+/// reference keeps letters and digits, up to 25, `***` when empty.
+pub fn pix_payload(
+    key: &str,
+    name: &str,
+    city: &str,
+    amount: &str,
+    reference: &str,
+    message: &str,
+) -> String {
+    let key = pix_key(key);
+    let name = pix_text(name, 25);
+    let city = pix_text(city, 15);
+    if key.is_empty() || name.is_empty() || city.is_empty() {
+        return String::new();
+    }
+    let tlv = |tag: &str, v: &str| format!("{tag}{:02}{v}", v.len());
+    let mut account = tlv("00", "br.gov.bcb.pix") + &tlv("01", &key);
+    let message = pix_text(message, 99);
+    // The account field holds 99 characters at most.
+    let room = 99usize.saturating_sub(account.len() + 4);
+    let message: String = message.chars().take(room).collect();
+    if !message.is_empty() {
+        account += &tlv("02", &message);
+    }
+    if account.len() > 99 {
+        return String::new();
+    }
+    let mut out = tlv("00", "01") + &tlv("26", &account) + &tlv("52", "0000") + &tlv("53", "986");
+    let amount = amount.trim().replace(',', ".");
+    if let Ok(v) = amount.parse::<f64>() {
+        if v.is_finite() && v > 0.0 && v < 1e10 {
+            out += &tlv("54", &format!("{v:.2}"));
+        }
+    }
+    out += &tlv("58", "BR");
+    out += &tlv("59", &name);
+    out += &tlv("60", &city);
+    let mut reference: String = reference
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(25)
+        .collect();
+    if reference.is_empty() {
+        reference = "***".into();
+    }
+    out += &tlv("62", &tlv("05", &reference));
+    out += "6304";
+    let crc = crc16_ccitt(out.as_bytes());
+    out + &format!("{crc:04X}")
+}
+
+/// A Pix key as written in the code: an email or random key as typed, a
+/// phone number with its `+` and digits, a tax number as its digits.
+fn pix_key(key: &str) -> String {
+    let key = key.trim();
+    let digits_only = |s: &str| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    if let Some(rest) = key.strip_prefix('+') {
+        if rest.chars().all(|c| c.is_ascii_digit() || " ()-.".contains(c)) {
+            return format!("+{}", digits_only(rest));
+        }
+    }
+    if !key.is_empty()
+        && key.chars().any(|c| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_digit() || " .-/".contains(c))
+    {
+        return digits_only(key);
+    }
+    key.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Text for a Pix code: accents taken off, other characters outside
+/// printable ASCII left out, spaces run together, cut to `max`.
+fn pix_text(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let plain = match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'A',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'É' | 'È' | 'Ê' | 'Ë' => 'E',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'O',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+            'ç' => 'c',
+            'Ç' => 'C',
+            'ñ' => 'n',
+            'Ñ' => 'N',
+            c if c.is_ascii_graphic() => c,
+            c if c.is_whitespace() => ' ',
+            _ => continue,
+        };
+        if plain == ' ' && (out.is_empty() || out.ends_with(' ')) {
+            continue;
+        }
+        out.push(plain);
+    }
+    let out = out.trim_end();
+    out.chars().take(max).collect::<String>().trim_end().to_string()
+}
+
+/// CRC-16/CCITT with start value 0xFFFF and no final change.
+fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 /// Bitmap effects on a vector object, and the picture they make of it.
@@ -3899,6 +4116,7 @@ impl Shape {
             kind,
             transform: Affine::IDENTITY,
             fill: Fill::None,
+            bitmap_alpha_fill: false,
             stroke: Some(Stroke::default()),
             visible: true,
             locked: false,
@@ -4028,6 +4246,8 @@ impl Shape {
         if bullet_colors.is_empty()
             && spans.iter().all(|s| {
                 s.fill.is_none()
+                    && s.paint_opacity.fill == 1.0
+                    && s.paint_opacity.outline == 1.0
                     && s.outline.is_none()
                     && s.overprint_fill.is_none_or(|o| o == self.overprint_fill)
                     && s.overprint_outline
@@ -4045,6 +4265,8 @@ impl Shape {
                 None => self.stroke.clone(),
             };
             TextLook {
+                fill_opacity: s.paint_opacity.fill,
+                outline_opacity: s.paint_opacity.outline,
                 fill,
                 stroke,
                 overprint_fill: s.overprint_fill.unwrap_or(self.overprint_fill),
@@ -4061,7 +4283,7 @@ impl Shape {
         let mut parts = looks
             .into_iter()
             .enumerate()
-            .map(|(i, l)| {
+            .flat_map(|(i, l)| {
                 let mut part = self.clone();
                 if let ShapeKind::Text { spans, para, .. } = &mut part.kind {
                     for s in spans.iter_mut() {
@@ -4069,10 +4291,12 @@ impl Shape {
                         s.background = None;
                         s.fill = None;
                         s.outline = None;
+                        s.paint_opacity = TextPaintOpacity::default();
                         s.overprint_fill = None;
                         s.overprint_outline = None;
                     }
                     para.frame_fill = None;
+                    para.frame_outline = None;
                     para.bullet_part = bullet_part;
                 }
                 part.fill = l.fill;
@@ -4082,7 +4306,21 @@ impl Shape {
                 if i > 0 {
                     part.shadow = None;
                 }
-                part
+                if part.stroke.is_none() || l.fill_opacity == l.outline_opacity {
+                    part.opacity *= l.fill_opacity.clamp(0.0, 1.0);
+                    return vec![part];
+                }
+                let mut outline = part.clone();
+                outline.fill = Fill::None;
+                outline.opacity *= l.outline_opacity.clamp(0.0, 1.0);
+                outline.shadow = None;
+                part.stroke = None;
+                part.opacity *= l.fill_opacity.clamp(0.0, 1.0);
+                if outline.stroke.as_ref().is_some_and(|stroke| stroke.behind_fill) {
+                    vec![outline, part]
+                } else {
+                    vec![part, outline]
+                }
             })
             .collect::<Vec<_>>();
         for c in bullet_colors {
@@ -4093,10 +4331,12 @@ impl Shape {
                     s.background = None;
                     s.fill = None;
                     s.outline = None;
+                    s.paint_opacity = TextPaintOpacity::default();
                     s.overprint_fill = None;
                     s.overprint_outline = None;
                 }
                 para.frame_fill = None;
+                para.frame_outline = None;
                 para.bullet_part = Some(BulletPart::Color(c));
             }
             part.fill = Fill::Solid(c);
@@ -4337,6 +4577,16 @@ impl Shape {
         self.opacity = (self.opacity * parent).clamp(0.0, 1.0);
     }
 
+    /// A clip frame whose transparency fades only the frame's fill and
+    /// outline, the objects inside keeping their own (#4360).
+    pub fn clip_contents_opaque(&self) -> bool {
+        matches!(self.kind, ShapeKind::ClipFrame { .. })
+            && self
+                .data
+                .iter()
+                .any(|(k, v)| k == CLIP_CONTENTS_OPAQUE && v == "1")
+    }
+
     /// A clip frame whose frame is a group: Ungroup takes it apart into
     /// the group's objects, each a clip frame holding the contents (#1605).
     pub fn is_clip_frame_of_group(&self) -> bool {
@@ -4446,6 +4696,7 @@ impl Shape {
         c.id = next();
         c.uid = None;
         match &mut c.kind {
+            ShapeKind::Text { on_path: Some(tp), .. } => tp.source = None,
             ShapeKind::Group { children } => {
                 let copies: Vec<Shape> =
                     children.iter().map(|ch| ch.with_fresh_ids(next)).collect();
@@ -5443,6 +5694,9 @@ pub struct Layer {
     /// For master layers: which pages show this layer.
     #[serde(default)]
     pub scope: MasterScope,
+    /// For master layers: the document positions where the layer appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_range: Option<PageRanges>,
     /// For master layers: drawn in front of the page's own layers
     /// instead of behind them (#1132).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -5494,6 +5748,64 @@ pub struct ObjectStyle {
     /// The transparency part: opacity, 1 being opaque.
     #[serde(default = "one")]
     pub opacity: f64,
+    /// The text parts (#4235): the characters' look and the paragraphs'
+    /// layout, taken from a text object. Not in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Box<StyleText>>,
+}
+
+/// What an object style holds for text (#4235).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StyleText {
+    /// The character part: font, size, bold and italic, spacing, width,
+    /// lines, capitals and the characters' own colour; its text unused.
+    pub character: TextSpan,
+    /// The paragraph part: the alignment and the paragraph settings
+    /// (spacing, indents, tabs, bullets, columns).
+    pub align: TextAlign,
+    pub para: ParagraphStyle,
+}
+
+impl StyleText {
+    /// The text parts of a text object: its first run's character look,
+    /// its alignment and paragraph settings.
+    pub fn of(shape: &Shape) -> Option<StyleText> {
+        let ShapeKind::Text {
+            spans, align, para, ..
+        } = &shape.kind
+        else {
+            return None;
+        };
+        let mut character = spans.first()?.clone();
+        character.text.clear();
+        character.paragraph = None;
+        Some(StyleText {
+            character,
+            align: *align,
+            para: para.clone(),
+        })
+    }
+
+    /// Give every run of `spans` the character part, keeping its text.
+    fn apply_character(&self, spans: &mut [TextSpan]) {
+        let c = &self.character;
+        for s in spans {
+            s.font_family = c.font_family.clone();
+            s.size_pt = c.size_pt;
+            s.bold = c.bold;
+            s.italic = c.italic;
+            s.tracking_pct = c.tracking_pct;
+            s.width_pct = c.width_pct;
+            s.underline = c.underline;
+            s.strikethrough = c.strikethrough;
+            s.all_caps = c.all_caps;
+            s.fill = c.fill.clone();
+            s.outline = c.outline.clone();
+            s.background = c.background.clone();
+            s.features = c.features.clone();
+            s.variations = c.variations.clone();
+        }
+    }
 }
 
 /// Which properties an object style sets.
@@ -5503,6 +5815,10 @@ pub struct StyleParts {
     pub fill: bool,
     pub outline: bool,
     pub transparency: bool,
+    /// The text parts (#4235): the characters' look, and the paragraphs'
+    /// alignment and settings. Off in older files.
+    pub character: bool,
+    pub paragraph: bool,
 }
 
 impl Default for StyleParts {
@@ -5512,14 +5828,18 @@ impl Default for StyleParts {
             fill: true,
             outline: true,
             transparency: false,
+            character: false,
+            paragraph: false,
         }
     }
 }
 
 impl ObjectStyle {
-    /// A style named `name` with the fill and outline of `shape`, and its
-    /// transparency when it has some.
+    /// A style named `name` with the fill and outline of `shape`, its
+    /// transparency when it has some, and of a text object its character
+    /// and paragraph parts (#4235).
     pub fn from_shape(name: impl Into<String>, shape: &Shape) -> ObjectStyle {
+        let text = StyleText::of(shape);
         ObjectStyle {
             name: name.into(),
             fill: shape.fill.clone(),
@@ -5529,8 +5849,22 @@ impl ObjectStyle {
                 fill: true,
                 outline: true,
                 transparency: shape.opacity < 1.0,
+                character: text.is_some(),
+                paragraph: text.is_some(),
             },
             opacity: shape.opacity,
+            text: text.map(Box::new),
+        }
+    }
+
+    /// Take the parts' values from `shape` (Update from selection): its
+    /// fill, outline and opacity, and of a text object its text parts.
+    pub fn update_from(&mut self, shape: &Shape) {
+        self.fill = shape.fill.clone();
+        self.stroke = shape.stroke.clone();
+        self.opacity = shape.opacity;
+        if let Some(t) = StyleText::of(shape) {
+            self.text = Some(Box::new(t));
         }
     }
 
@@ -5544,6 +5878,18 @@ impl ObjectStyle {
         }
         if self.parts.transparency {
             shape.opacity = self.opacity.clamp(0.0, 1.0);
+        }
+        // The text parts reach text objects only.
+        if let (Some(t), ShapeKind::Text { spans, align, para, .. }) =
+            (self.text.as_deref(), &mut shape.kind)
+        {
+            if self.parts.character {
+                t.apply_character(spans);
+            }
+            if self.parts.paragraph {
+                *align = t.align;
+                *para = t.para.clone();
+            }
         }
     }
 }
@@ -5815,6 +6161,11 @@ pub struct ColorStyle {
     #[serde(default)]
     pub harmony: Option<String>,
 }
+
+/// The data key of a clip frame whose transparency fades the frame's own
+/// fill and outline only, the objects inside keeping their own opacity
+/// (#4360: as `.cdr` files draw a see-through container).
+pub const CLIP_CONTENTS_OPAQUE: &str = "clip.contents_opaque";
 
 /// A symbol definition; instances reference it by index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6342,6 +6693,15 @@ impl Shape {
 }
 
 impl Layer {
+    /// Whether this master layer appears at the 0-based page position.
+    pub fn applies_to(&self, index: usize) -> bool {
+        self.scope.applies(index)
+            && self
+                .page_range
+                .as_ref()
+                .is_none_or(|range| range.contains(index))
+    }
+
     pub fn master(id: LayerId, name: impl Into<String>, scope: MasterScope) -> Self {
         let mut l = Layer::new(id, name);
         l.scope = scope;
@@ -6357,6 +6717,7 @@ impl Layer {
             locked: false,
             shapes: Vec::new(),
             scope: MasterScope::All,
+            page_range: None,
             in_front: false,
             desktop: false,
         }
@@ -6500,6 +6861,56 @@ pub struct Guide {
     /// instead of where the guideline is (#3574).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A margin or bleed guideline of a preset: the page edge it keeps
+    /// its distance from, so it follows that edge when the page is
+    /// resized (#4268).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<GuideAnchor>,
+}
+
+/// The page edge a preset guideline keeps its distance from (#4268).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuideEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// A guideline's distance from a page edge, mm, inward (negative:
+/// outside the page, as bleed guidelines are).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GuideAnchor {
+    pub edge: GuideEdge,
+    pub distance: f64,
+}
+
+impl GuideAnchor {
+    /// The line at this distance from the edge of a page of `size`.
+    pub fn line(&self, size: crate::geometry::Size) -> GuideLine {
+        match self.edge {
+            GuideEdge::Left => GuideLine::Vertical { x: self.distance },
+            GuideEdge::Right => GuideLine::Vertical {
+                x: size.width - self.distance,
+            },
+            GuideEdge::Bottom => GuideLine::Horizontal { y: self.distance },
+            GuideEdge::Top => GuideLine::Horizontal {
+                y: size.height - self.distance,
+            },
+        }
+    }
+
+    /// The same distance from the opposite side edge: the left and right
+    /// margins of a page facing the other way.
+    pub fn mirrored(&self) -> GuideAnchor {
+        let edge = match self.edge {
+            GuideEdge::Left => GuideEdge::Right,
+            GuideEdge::Right => GuideEdge::Left,
+            e => e,
+        };
+        GuideAnchor { edge, ..*self }
+    }
 }
 
 impl From<GuideLine> for Guide {
@@ -6511,6 +6922,7 @@ impl From<GuideLine> for Guide {
             locked: false,
             hidden: false,
             name: None,
+            anchor: None,
         }
     }
 }
@@ -6547,6 +6959,14 @@ impl Guide {
         Guide {
             line,
             ..self.clone()
+        }
+    }
+
+    /// An anchored guideline put back at its distance from its edge on a
+    /// page of `size` (#4268); others stay.
+    pub fn refit(&mut self, size: crate::geometry::Size) {
+        if let Some(a) = self.anchor {
+            self.line = a.line(size);
         }
     }
 }
@@ -7402,7 +7822,7 @@ impl Document {
         let masters = |front: bool| {
             self.master
                 .iter()
-                .filter(move |l| l.scope.applies(idx) && l.in_front == front)
+                .filter(move |l| l.applies_to(idx) && l.in_front == front)
         };
         let mut out: Vec<&Layer> = masters(false).collect();
         out.extend(self.pages[idx].layers.iter());
@@ -8496,6 +8916,52 @@ mod index_keys {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pix_codes_are_written_as_banks_read_them() {
+        use super::{crc16_ccitt, pix_payload, QrCode, QrKind};
+        // The example of the payment code's published layout.
+        let p = pix_payload(
+            "123e4567-e12b-12d1-a456-426655440000",
+            "Fulano de Tal",
+            "BRASILIA",
+            "",
+            "",
+            "",
+        );
+        assert_eq!(
+            p,
+            "00020126580014br.gov.bcb.pix0136123e4567-e12b-12d1-a456-426655440000\
+             5204000053039865802BR5913Fulano de Tal6008BRASILIA62070503***63041D3D"
+        );
+        // Accents off, tax number digits, amount with a comma, a
+        // reference and a message, names cut to their room.
+        let p = pix_payload(
+            "123.456.789-09",
+            "Gráfica São João Comunicação Visual Ltda",
+            "São José dos Campos",
+            "15,5",
+            "PED-0042",
+            "Pedido 42",
+        );
+        assert!(p.contains("0111123456789090209Pedido 42"), "{p}");
+        assert!(p.contains("540515.50"), "{p}");
+        assert!(p.contains("5925Grafica Sao Joao Comunica"), "{p}");
+        assert!(p.contains("6015Sao Jose dos Ca"), "{p}");
+        assert!(p.contains("62110507PED0042"), "{p}");
+        let crc = crc16_ccitt(p[..p.len() - 4].as_bytes());
+        assert!(p.ends_with(&format!("{crc:04X}")));
+        // A phone key keeps its plus; missing city: no code.
+        assert!(pix_payload("+55 (11) 91234-5678", "A", "B", "", "", "").contains("0114+5511912345678"));
+        assert_eq!(pix_payload("k", "A", " ", "", "", ""), "");
+        assert!(pix_payload("k", "A", "B", "0", "", "").contains("9865802BR"));
+        let q = QrCode {
+            kind: QrKind::Pix,
+            fields: vec!["k@x.br".into(), "Ana".into(), "Rio".into()],
+            ..QrCode::default()
+        };
+        assert!(q.payload().starts_with("000201"));
+    }
+
     /// #3559: a curve's box is measured from its own segments, without
     /// copying the curve; it is the box of the placed curve, turned,
     /// slanted and inside a turned group too, and empty for no segments.
@@ -10463,6 +10929,7 @@ mod tests {
             locked: true,
             hidden: true,
             name: Some("Fold".into()),
+            anchor: None,
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("\"dir\":\"vertical\""));
@@ -11963,6 +12430,38 @@ mod tests {
     /// their own, each part marked as its characters say (the object's
     /// overprint where they say nothing); characters that agree with the
     /// object make no parts.
+    #[test]
+    fn text_paint_opacity_keeps_channels_independent_and_round_trips() {
+        let mut span = TextSpan::new("A", "Arial", 12.0);
+        span.paint_opacity = TextPaintOpacity { fill: 0.8, background: 0.25, outline: 0.4 };
+        let bytes = serde_json::to_string(&span).expect("text span");
+        assert_eq!(serde_json::from_str::<TextSpan>(&bytes).expect("read span"), span);
+        let original = TextSpan::new("A", "Arial", 12.0);
+        let bytes = serde_json::to_string(&original).expect("plain span");
+        assert!(!bytes.contains("paint_opacity"));
+        assert_eq!(serde_json::from_str::<TextSpan>(&bytes).expect("legacy span").paint_opacity,
+                   TextPaintOpacity::default());
+
+        let mut shape = Shape::new(ShapeId(1), ShapeKind::Text {
+            spans: vec![span],
+            origin: Point::ZERO,
+            frame: None,
+            align: TextAlign::Left,
+            para: ParagraphStyle::default(),
+            on_path: None,
+        });
+        shape.fill = Fill::Solid(crate::Color::BLACK);
+        shape.opacity = 0.5;
+        let parts = shape.text_parts().expect("separate paints");
+        assert_eq!(parts.len(), 2);
+        let fill = parts.iter().find(|p| p.stroke.is_none()).expect("fill");
+        let outline = parts.iter().find(|p| p.stroke.is_some()).expect("outline");
+        assert_eq!(fill.opacity, 0.4);
+        assert_eq!(outline.opacity, 0.2);
+        assert!(matches!(outline.fill, Fill::None));
+        assert!(parts.iter().all(|p| p.text_parts().is_none()));
+    }
+
     #[test]
     fn text_parts_carry_the_characters_overprint() {
         let mut plain = TextSpan::new("ab", "Arial", 12.0);

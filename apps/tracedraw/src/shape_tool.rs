@@ -401,12 +401,13 @@ impl App {
     /// selection: a press there that took nothing is a near miss.
     pub(crate) fn near_selected_nodes(&self, p: Point) -> bool {
         let reach = 3.0 * self.settings.nodes.pick_px() / self.view.zoom as f64;
+        let shown = self.handle_nodes();
         for id in &self.node_targets() {
             let Some((path, _, t)) = self.path_of(*id) else {
                 continue;
             };
             for n in nodes::nodes(&(t * path)) {
-                let chosen = self.node_selection.contains(&(*id, n.index));
+                let chosen = shown.contains(&(*id, n.index));
                 let mut spots = vec![n.pos];
                 if chosen {
                     spots.extend(n.ctrl_in);
@@ -448,6 +449,24 @@ impl App {
             .find_map(|s| crate::kind_nodes::spline_with_point(&s, p, tol).map(|pts| (s, pts)))
     }
 
+    /// The nodes whose control handles show and take a press (#4337):
+    /// with one node chosen, it and the nodes joined to it by a segment
+    /// (the first and last of a closed subpath joined too), so the curves
+    /// on both sides of it can be shaped; with several chosen, none, and
+    /// only the chosen nodes' markers show.
+    pub(crate) fn handle_nodes(&self) -> Vec<(ShapeId, usize)> {
+        let [(id, index)] = self.node_selection[..] else {
+            return Vec::new();
+        };
+        let Some((path, _, _)) = self.path_of(id) else {
+            return Vec::new();
+        };
+        nodes::handle_neighbours(&path, index)
+            .into_iter()
+            .map(|n| (id, n))
+            .collect()
+    }
+
     /// Control handle under the pointer, for selected nodes only, or one
     /// of the two handles a chosen segment shows (its start node's
     /// outgoing handle and its end node's incoming one).
@@ -475,16 +494,17 @@ impl App {
             }
             return best.map(|b| b.0);
         }
-        // The nodes of each curve with chosen nodes, worked out once.
-        for (k, &(id, _)) in self.node_selection.iter().enumerate() {
-            if self.node_selection[..k].iter().any(|s| s.0 == id) {
+        // The nodes whose handles show (#4337), each curve worked out once.
+        let shown = self.handle_nodes();
+        for (k, &(id, _)) in shown.iter().enumerate() {
+            if shown[..k].iter().any(|s| s.0 == id) {
                 continue;
             }
             let Some((path, _, t)) = self.path_of(id) else {
                 continue;
             };
             for n in nodes::nodes(&(t * path)) {
-                if self.node_selection.contains(&(id, n.index)) {
+                if shown.contains(&(id, n.index)) {
                     take((id, n.index, Which::In), n.ctrl_in);
                     take((id, n.index, Which::Out), n.ctrl_out);
                 }
@@ -564,6 +584,265 @@ impl App {
             begun: begun || ran,
             turn,
         };
+    }
+
+    fn shape_drag_to(&mut self, p: Point, mods: Modifiers) {
+        match self.drag.clone() {
+            Drag::TextChars {
+                start,
+                chars,
+                from,
+                begun,
+            } => {
+                let mut d = p - from;
+                if mods.ctrl || mods.command {
+                    if d.x.abs() >= d.y.abs() {
+                        d.y = 0.0;
+                    } else {
+                        d.x = 0.0;
+                    }
+                }
+                self.move_text_chars(&start, &chars, d, begun);
+                self.drag = Drag::TextChars {
+                    start,
+                    chars,
+                    from,
+                    begun: true,
+                };
+            }
+            Drag::TextSpacing {
+                start,
+                horizontal,
+                word,
+                from,
+                begun,
+            } => {
+                self.drag_text_spacing(&start, horizontal, word, p - from, begun);
+                self.drag = Drag::TextSpacing {
+                    start,
+                    horizontal,
+                    word,
+                    from,
+                    begun: true,
+                };
+            }
+            Drag::NodeMove { .. } => self.node_move_to(p, mods),
+            Drag::PolygonEdge {
+                shape,
+                from,
+                start,
+                to_local,
+                begun,
+            } if !matches!(
+                start,
+                ShapeKind::Polygon {
+                    complex: Some(_),
+                    ..
+                }
+            ) =>
+            {
+                // Every side bends alike as the pointer goes across
+                // the edge grabbed; one undo step for the drag.
+                if begun || (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
+                    if let Some(kind) =
+                        crate::kind_nodes::polygon_bent(&start, to_local * from, to_local * p)
+                    {
+                        let cmd = Command::SetShapeKind { shape, kind };
+                        let _ = if begun {
+                            self.engine.amend(&cmd)
+                        } else {
+                            self.engine.run_with_label(&cmd, "Bend Sides")
+                        };
+                    }
+                    self.drag = Drag::PolygonEdge {
+                        shape,
+                        from,
+                        start,
+                        to_local,
+                        begun: true,
+                    };
+                }
+            }
+            Drag::PolygonEdge { from, .. } => {
+                // A complex star: curve first, then the edge bends.
+                if (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
+                    self.drag = Drag::None;
+                    if self.polygon_edge_to_curve(from) {
+                        if let Some((shape, index, t)) = self.segment_at(from) {
+                            if let Some((path, closed, _)) = self.path_of(shape) {
+                                self.drag = Drag::SegmentBend {
+                                    shape,
+                                    path,
+                                    closed,
+                                    index,
+                                    t,
+                                    from,
+                                    begun: false,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            Drag::CornerWidget(d) => self.corner_drag_to(*d, p),
+            Drag::NodeTransform {
+                handle,
+                start,
+                bounds,
+                from,
+                begun,
+            } => {
+                let a = crate::node_edit::handle_transform(
+                    self.node_transform,
+                    handle,
+                    bounds,
+                    from,
+                    p,
+                    mods.shift,
+                );
+                self.note_node_drag_step(begun);
+                self.transform_start_nodes(&start, a, begun);
+                self.drag = Drag::NodeTransform {
+                    handle,
+                    start,
+                    bounds,
+                    from,
+                    begun: true,
+                };
+            }
+            Drag::NodeLasso { mut points } => {
+                if points
+                    .last()
+                    .is_none_or(|q| (*q - p).hypot() > 0.2 / self.view.zoom as f64)
+                {
+                    points.push(p);
+                }
+                self.drag = Drag::NodeLasso { points };
+            }
+            Drag::Handle {
+                shape,
+                index,
+                which,
+            } => {
+                // A handle dragged is not chosen: no ring follows it,
+                // and none stays once the button is let go. A click
+                // without a drag chooses it for the arrow keys
+                // (#2819, #3041, #3042).
+                self.chosen_handle = None;
+                // Alt held: the node is dragged by its handle, the
+                // handle keeping its place about it (#3719).
+                let by_handle = mods.alt
+                    && self.path_of(shape).is_some_and(|(path, closed, t)| {
+                        let Some(n) = nodes::nodes(&path).into_iter().find(|n| n.index == index)
+                        else {
+                            return false;
+                        };
+                        let tip = match which {
+                            nodes::Which::In => n.ctrl_in,
+                            nodes::Which::Out => n.ctrl_out,
+                        };
+                        let Some(tip) = tip else { return false };
+                        let q = t.inverse() * self.snap_point_excluding(p, &[shape]);
+                        let np = nodes::move_node(&path, index, q - tip);
+                        let begun = self.node_drag_shown.is_some();
+                        self.note_node_drag_step(begun);
+                        self.set_path(shape, np, closed, "Edit Handle", begun);
+                        true
+                    });
+                let plain = if by_handle { None } else { self.path_of(shape) };
+                if let Some((path, closed, t)) = plain {
+                    // The handle snaps like a node does; Ctrl or Shift
+                    // keeps it to the constrain angle about its node,
+                    // on the page, and a smooth node's other handle
+                    // still follows (#510).
+                    let mut q = self.snap_point_excluding(p, &[shape]);
+                    if mods.ctrl || mods.command || mods.shift {
+                        if let Some(n) = nodes::nodes(&path).iter().find(|n| n.index == index) {
+                            q = crate::interaction::constrain_from(
+                                t * n.pos,
+                                q,
+                                self.settings.constrain_angle,
+                            );
+                        }
+                    }
+                    let lp = t.inverse() * q;
+                    let ty = self.node_type_of(shape, index);
+                    let np = nodes::move_handle(&path, index, which, lp, ty);
+                    // The press cleared the page's kept picture: it is
+                    // there from the drag's first step on.
+                    let begun = self.node_drag_shown.is_some();
+                    self.note_node_drag_step(begun);
+                    self.set_path(shape, np, closed, "Edit Handle", begun);
+                }
+            }
+            Drag::NodeMarquee { start, .. } => {
+                self.drag = Drag::NodeMarquee { start, current: p }
+            }
+            Drag::SegmentBend {
+                shape,
+                path,
+                closed,
+                index,
+                t,
+                from,
+                begun,
+            } => {
+                // The grabbed point follows the pointer (in the curve's
+                // own space); one undo step for the whole drag.
+                if let Some((_, _, tf)) = self.path_of(shape) {
+                    let det = tf.determinant();
+                    if det.is_finite() && det.abs() > 1e-12 {
+                        let inv = tf.inverse();
+                        let d = (inv * p) - (inv * from);
+                        let chosen = match self.doc().shape(shape) {
+                            Ok((_, s)) => s.node_types.clone(),
+                            Err(_) => Default::default(),
+                        };
+                        // Rounded corners beside the segment stay
+                        // round (#3265).
+                        let bent = if self.keeps_rounded_corners()(&path) {
+                            tracedraw_core::corner_cut::bend_keeping_fillets(
+                                &path,
+                                index,
+                                t,
+                                |p, i, t, map| {
+                                    let chosen = chosen
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            Some((map.get(*k).copied().flatten()?, *v))
+                                        })
+                                        .collect();
+                                    nodes::bend_segment_with(p, i, t, d, &chosen)
+                                },
+                            )
+                        } else {
+                            nodes::bend_segment_with(&path, index, t, d, &chosen)
+                        };
+                        let cmd = Command::SetShapeKind {
+                            shape,
+                            kind: ShapeKind::Path { path: bent, closed },
+                        };
+                        self.note_node_drag_step(begun);
+                        let _ = if begun {
+                            self.engine.amend(&cmd)
+                        } else {
+                            self.engine.run_with_label(&cmd, "Bend Segment")
+                        };
+                    }
+                }
+                self.drag = Drag::SegmentBend {
+                    shape,
+                    path,
+                    closed,
+                    index,
+                    t,
+                    from,
+                    begun: true,
+                };
+            }
+            Drag::KindNode { .. } => self.kind_node_drag_step(p, mods),
+            _ => {}
+        }
     }
 
     pub fn shape_tool_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
@@ -745,7 +1024,10 @@ impl App {
             if let Some(w) = self.corner_widget_at(p) {
                 // Ctrl+click chooses the corner, or takes it out.
                 let one_at_a_time = self.settings.nodes.corner_one_at_a_time;
-                if self.start_corner_drag(w, p, one_at_a_time && mods.shift) {
+                // With every corner rounding together, Ctrl+drag rounds
+                // this corner alone (#4216).
+                let own_only = !one_at_a_time && mods.command && !mods.shift;
+                if self.start_corner_drag_with(w, p, one_at_a_time && mods.shift, own_only) {
                     return;
                 }
             }
@@ -759,6 +1041,9 @@ impl App {
                     index,
                     which,
                 };
+                if let Some(now) = self.pointer_page {
+                    self.shape_drag_to(now, mods);
+                }
                 return;
             }
             if let Some(hit) = self.node_at(p) {
@@ -791,6 +1076,9 @@ impl App {
                     begun: false,
                     still: None,
                 };
+                if let Some(now) = self.pointer_page {
+                    self.shape_drag_to(now, mods);
+                }
                 return;
             }
             // Alt: a freehand marquee whatever the bar's selection mode,
@@ -814,7 +1102,10 @@ impl App {
                         from: p,
                         begun: false,
                     };
-                    return;
+                    if let Some(now) = self.pointer_page {
+                    self.shape_drag_to(now, mods);
+                }
+                return;
                 }
             }
             // An edge of a selected polygon or star: a drag bends all its
@@ -862,263 +1153,11 @@ impl App {
             };
         }
 
-        if response.dragged_by(PointerButton::Primary) {
-            match self.drag.clone() {
-                Drag::TextChars {
-                    start,
-                    chars,
-                    from,
-                    begun,
-                } => {
-                    let mut d = p - from;
-                    if mods.ctrl || mods.command {
-                        if d.x.abs() >= d.y.abs() {
-                            d.y = 0.0;
-                        } else {
-                            d.x = 0.0;
-                        }
-                    }
-                    self.move_text_chars(&start, &chars, d, begun);
-                    self.drag = Drag::TextChars {
-                        start,
-                        chars,
-                        from,
-                        begun: true,
-                    };
-                }
-                Drag::TextSpacing {
-                    start,
-                    horizontal,
-                    word,
-                    from,
-                    begun,
-                } => {
-                    self.drag_text_spacing(&start, horizontal, word, p - from, begun);
-                    self.drag = Drag::TextSpacing {
-                        start,
-                        horizontal,
-                        word,
-                        from,
-                        begun: true,
-                    };
-                }
-                Drag::NodeMove { .. } => self.node_move_to(p, mods),
-                Drag::PolygonEdge {
-                    shape,
-                    from,
-                    start,
-                    to_local,
-                    begun,
-                } if !matches!(
-                    start,
-                    ShapeKind::Polygon {
-                        complex: Some(_),
-                        ..
-                    }
-                ) =>
-                {
-                    // Every side bends alike as the pointer goes across
-                    // the edge grabbed; one undo step for the drag.
-                    if begun || (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
-                        if let Some(kind) =
-                            crate::kind_nodes::polygon_bent(&start, to_local * from, to_local * p)
-                        {
-                            let cmd = Command::SetShapeKind { shape, kind };
-                            let _ = if begun {
-                                self.engine.amend(&cmd)
-                            } else {
-                                self.engine.run_with_label(&cmd, "Bend Sides")
-                            };
-                        }
-                        self.drag = Drag::PolygonEdge {
-                            shape,
-                            from,
-                            start,
-                            to_local,
-                            begun: true,
-                        };
-                    }
-                }
-                Drag::PolygonEdge { from, .. } => {
-                    // A complex star: curve first, then the edge bends.
-                    if (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
-                        self.drag = Drag::None;
-                        if self.polygon_edge_to_curve(from) {
-                            if let Some((shape, index, t)) = self.segment_at(from) {
-                                if let Some((path, closed, _)) = self.path_of(shape) {
-                                    self.drag = Drag::SegmentBend {
-                                        shape,
-                                        path,
-                                        closed,
-                                        index,
-                                        t,
-                                        from,
-                                        begun: false,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-                Drag::CornerWidget(d) => self.corner_drag_to(*d, p),
-                Drag::NodeTransform {
-                    handle,
-                    start,
-                    bounds,
-                    from,
-                    begun,
-                } => {
-                    let a = crate::node_edit::handle_transform(
-                        self.node_transform,
-                        handle,
-                        bounds,
-                        from,
-                        p,
-                        mods.shift,
-                    );
-                    self.note_node_drag_step(begun);
-                    self.transform_start_nodes(&start, a, begun);
-                    self.drag = Drag::NodeTransform {
-                        handle,
-                        start,
-                        bounds,
-                        from,
-                        begun: true,
-                    };
-                }
-                Drag::NodeLasso { mut points } => {
-                    if points
-                        .last()
-                        .is_none_or(|q| (*q - p).hypot() > 0.2 / self.view.zoom as f64)
-                    {
-                        points.push(p);
-                    }
-                    self.drag = Drag::NodeLasso { points };
-                }
-                Drag::Handle {
-                    shape,
-                    index,
-                    which,
-                } => {
-                    // A handle dragged is not chosen: no ring follows it,
-                    // and none stays once the button is let go. A click
-                    // without a drag chooses it for the arrow keys
-                    // (#2819, #3041, #3042).
-                    self.chosen_handle = None;
-                    // Alt held: the node is dragged by its handle, the
-                    // handle keeping its place about it (#3719).
-                    let by_handle = mods.alt
-                        && self.path_of(shape).is_some_and(|(path, closed, t)| {
-                            let Some(n) = nodes::nodes(&path).into_iter().find(|n| n.index == index)
-                            else {
-                                return false;
-                            };
-                            let tip = match which {
-                                nodes::Which::In => n.ctrl_in,
-                                nodes::Which::Out => n.ctrl_out,
-                            };
-                            let Some(tip) = tip else { return false };
-                            let q = t.inverse() * self.snap_point_excluding(p, &[shape]);
-                            let np = nodes::move_node(&path, index, q - tip);
-                            let begun = self.node_drag_shown.is_some();
-                            self.note_node_drag_step(begun);
-                            self.set_path(shape, np, closed, "Edit Handle", begun);
-                            true
-                        });
-                    let plain = if by_handle { None } else { self.path_of(shape) };
-                    if let Some((path, closed, t)) = plain {
-                        // The handle snaps like a node does; Ctrl or Shift
-                        // keeps it to the constrain angle about its node,
-                        // on the page, and a smooth node's other handle
-                        // still follows (#510).
-                        let mut q = self.snap_point_excluding(p, &[shape]);
-                        if mods.ctrl || mods.command || mods.shift {
-                            if let Some(n) = nodes::nodes(&path).iter().find(|n| n.index == index) {
-                                q = crate::interaction::constrain_from(
-                                    t * n.pos,
-                                    q,
-                                    self.settings.constrain_angle,
-                                );
-                            }
-                        }
-                        let lp = t.inverse() * q;
-                        let ty = self.node_type_of(shape, index);
-                        let np = nodes::move_handle(&path, index, which, lp, ty);
-                        // The press cleared the page's kept picture: it is
-                        // there from the drag's first step on.
-                        let begun = self.node_drag_shown.is_some();
-                        self.note_node_drag_step(begun);
-                        self.set_path(shape, np, closed, "Edit Handle", begun);
-                    }
-                }
-                Drag::NodeMarquee { start, .. } => {
-                    self.drag = Drag::NodeMarquee { start, current: p }
-                }
-                Drag::SegmentBend {
-                    shape,
-                    path,
-                    closed,
-                    index,
-                    t,
-                    from,
-                    begun,
-                } => {
-                    // The grabbed point follows the pointer (in the curve's
-                    // own space); one undo step for the whole drag.
-                    if let Some((_, _, tf)) = self.path_of(shape) {
-                        let det = tf.determinant();
-                        if det.is_finite() && det.abs() > 1e-12 {
-                            let inv = tf.inverse();
-                            let d = (inv * p) - (inv * from);
-                            let chosen = match self.doc().shape(shape) {
-                                Ok((_, s)) => s.node_types.clone(),
-                                Err(_) => Default::default(),
-                            };
-                            // Rounded corners beside the segment stay
-                            // round (#3265).
-                            let bent = if self.keeps_rounded_corners()(&path) {
-                                tracedraw_core::corner_cut::bend_keeping_fillets(
-                                    &path,
-                                    index,
-                                    t,
-                                    |p, i, t, map| {
-                                        let chosen = chosen
-                                            .iter()
-                                            .filter_map(|(k, v)| {
-                                                Some((map.get(*k).copied().flatten()?, *v))
-                                            })
-                                            .collect();
-                                        nodes::bend_segment_with(p, i, t, d, &chosen)
-                                    },
-                                )
-                            } else {
-                                nodes::bend_segment_with(&path, index, t, d, &chosen)
-                            };
-                            let cmd = Command::SetShapeKind {
-                                shape,
-                                kind: ShapeKind::Path { path: bent, closed },
-                            };
-                            self.note_node_drag_step(begun);
-                            let _ = if begun {
-                                self.engine.amend(&cmd)
-                            } else {
-                                self.engine.run_with_label(&cmd, "Bend Segment")
-                            };
-                        }
-                    }
-                    self.drag = Drag::SegmentBend {
-                        shape,
-                        path,
-                        closed,
-                        index,
-                        t,
-                        from,
-                        begun: true,
-                    };
-                }
-                Drag::KindNode { .. } => self.kind_node_drag_step(p, mods),
-                _ => {}
-            }
+        let final_move = response.drag_stopped_by(PointerButton::Primary)
+            && matches!(self.drag, Drag::NodeMove { .. } | Drag::Handle { .. } | Drag::SegmentBend { .. })
+            && response.ctx.input(|i| i.pointer.delta().length_sq() > 0.0);
+        if response.dragged_by(PointerButton::Primary) || final_move {
+            self.shape_drag_to(p, mods);
         }
 
         if response.clicked_by(PointerButton::Primary) {

@@ -345,12 +345,7 @@ impl App {
                     Vec::new()
                 },
             ),
-            None => (
-                (1..=key.settings.copies.max(1))
-                    .map(|k| step * k as f64)
-                    .collect(),
-                Vec::new(),
-            ),
+            None => (key.settings.offsets(step), Vec::new()),
         };
         // A quarter of a screen pixel, as the canvas flattens.
         let tol = 0.25 / self.view.zoom.max(0.05) as f64;
@@ -553,6 +548,21 @@ mod tests {
         let (n, unique) = ids_are_unique(&app);
         assert_eq!(n, 6, "two groups of two");
         assert!(unique);
+    }
+
+    #[test]
+    fn reverted_instance_keeps_its_opacity() {
+        let mut app = app_with_group();
+        app.create_symbol_from_selection();
+        let id = app.selection[0];
+        app.engine.run(&tracedraw_core::Command::SetOpacity {
+            shapes: vec![id], opacity: 0.4,
+        }).unwrap();
+        app.revert_symbol_instances();
+        let reverted = app.selected_shapes();
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].opacity, 0.4);
+        assert!(matches!(reverted[0].kind, ShapeKind::Group { .. }));
     }
 
     /// #1197: the preview has a copy for each one Apply makes, at the
@@ -765,6 +775,48 @@ mod tests {
 
     /// #2572: an axis turned off adds nothing that way, so the copies go
     /// along the other one only; Left and Up send them the other way.
+    /// Across and down at once (#4230): 3 across and 2 down make a grid
+    /// of 4 by 3 places, the rectangle in its corner, so 11 copies, each
+    /// at its own place, previewed the same; off, the 3 copies go along
+    /// the diagonal step as before.
+    #[test]
+    fn copies_go_across_and_down_at_once() {
+        let (mut app, _) = app_with_rect();
+        let sr = &mut app.step_repeat;
+        sr.copies = 3;
+        sr.copies_down = 2;
+        sr.mode_x = 0;
+        sr.dx = 30.0;
+        sr.mode_y = 0;
+        sr.dy = 20.0;
+        let step = app.step_and_repeat_step().expect("step");
+        assert_eq!(app.step_repeat.offsets(step).len(), 3, "off: a run");
+        app.step_repeat.grid = true;
+        let offsets = app.step_repeat.offsets(step);
+        assert_eq!(offsets.len(), 11);
+        assert!(offsets.contains(&Vec2::new(90.0, 40.0)));
+        assert!(offsets.contains(&Vec2::new(0.0, 20.0)));
+        assert!(!offsets.contains(&Vec2::new(0.0, 0.0)));
+        assert_eq!(app.step_and_repeat_preview().expect("preview").copies, 11);
+        let before = shape_count(&app);
+        app.step_and_repeat_apply();
+        assert_eq!(shape_count(&app), before + 11);
+        let mut places: Vec<(i64, i64)> = app
+            .selected_shapes()
+            .iter()
+            .map(|s| {
+                let b = tracedraw_core::geometry::Shape::bounding_box(&s.page_path());
+                (b.x0.round() as i64, b.y0.round() as i64)
+            })
+            .collect();
+        places.sort();
+        places.dedup();
+        assert_eq!(places.len(), 11, "every copy at its own place");
+        // One axis off: a run again.
+        app.step_repeat.use_y = false;
+        assert!(!app.step_repeat.is_grid());
+    }
+
     #[test]
     fn copies_go_along_one_axis_either_way() {
         let (mut app, _) = app_with_rect();

@@ -9,6 +9,7 @@
 //! the picture. The picture shows alone, upright, at a zoom of its own.
 //! See docs/behavior/edit-inside-picture.md.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::{App, DockerTab};
 use crate::i18n::tr;
 use crate::pixel_edit::PixelTool;
@@ -219,6 +220,8 @@ pub fn choose_tool(pe: &mut crate::pixel_edit_app::PixelEdit, t: PixelTool) {
         pe.apply_warp();
     }
     pe.tool = t;
+    pe.move_drag = None;
+    pe.sync_place_preview();
     pe.drag_from = None;
     pe.drag_to = None;
     pe.lasso.clear();
@@ -272,6 +275,10 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
             menu(ui, "menu.edit", &mut |ui| {
                 cmd(app, ui, PixelCmd::Undo);
                 cmd(app, ui, PixelCmd::Redo);
+                sep(ui);
+                cmd(app, ui, PixelCmd::Cut);
+                cmd(app, ui, PixelCmd::Copy);
+                cmd(app, ui, PixelCmd::Paste);
                 sep(ui);
                 cmd(app, ui, PixelCmd::CopyToLayer);
                 cmd(app, ui, PixelCmd::CutToLayer);
@@ -777,17 +784,17 @@ fn bar_item(app: &mut App, ui: &mut Ui, _bar: &str, id: &str) {
                     .rich_tip(tr("pixel.finish_tip"))
                     .clicked(),
                 (PixelCmd::Cancel, _) => ui
-                    .button(tr("pixel.cancel"))
+                    .ibutton("pixel.cancel")
                     .rich_tip(tr("pixel.cancel_tip"))
                     .clicked(),
                 (_, Some(a)) => std_button(ui, a, &tip_of(c), enabled, false).clicked(),
                 (_, None) => match c.checked(app) {
                     Some(on) => ui
-                        .selectable_label(on, tr(c.key()))
+                        .iselectable(on, c.key())
                         .rich_tip(tip_of(c))
                         .clicked(),
                     None => ui
-                        .add_enabled(enabled, egui::Button::new(tr(c.key())))
+                        .add_enabled(enabled, crate::ui::btn_icons::Ib::new(c.key()))
                         .rich_tip(tip_of(c))
                         .clicked(),
                 },
@@ -875,7 +882,7 @@ fn zoom_controls(app: &mut App, ui: &mut Ui) {
         PixelCmd::ZoomIn.run(app);
     }
     if ui
-        .button(tr("pixel.zoom_fit"))
+        .ibutton("pixel.zoom_fit")
         .rich_tip(tip_of(PixelCmd::ZoomFit))
         .clicked()
     {

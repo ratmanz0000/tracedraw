@@ -67,6 +67,10 @@ pub struct DocSlot {
     /// The layers picked with Ctrl or Shift in the Objects docker
     /// (#3966), kept with the window as the pick is.
     pub selected_layers: Vec<tracedraw_core::LayerId>,
+    /// Draft calibration and picked points in this window.
+    pub map_gk42: crate::map_gk42::Gk42State,
+    /// Layers folded in this window's Objects docker.
+    pub objects_collapsed: std::collections::HashSet<tracedraw_core::LayerId>,
     /// The drawing's rendered page, kept while another drawing is active
     /// (its window shows it when windows are tiled or cascaded).
     pub raster: crate::raster::Raster,
@@ -108,6 +112,8 @@ impl Default for DocSlot {
             pivots: Default::default(),
             picked_layer: None,
             selected_layers: Vec::new(),
+            map_gk42: Default::default(),
+            objects_collapsed: Default::default(),
             raster: Default::default(),
             page_rasters: Default::default(),
             page_snapshot: None,
@@ -137,6 +143,8 @@ impl App {
         std::mem::swap(&mut self.open_view_pending, &mut slot.open_view_pending);
         std::mem::swap(&mut self.picked_layer, &mut slot.picked_layer);
         std::mem::swap(&mut self.selected_layers, &mut slot.selected_layers);
+        std::mem::swap(&mut self.map_gk42, &mut slot.map_gk42);
+        std::mem::swap(&mut self.objects_collapsed, &mut slot.objects_collapsed);
         std::mem::swap(self.raster.get_mut(), &mut slot.raster);
         std::mem::swap(self.page_rasters.get_mut(), &mut slot.page_rasters);
         std::mem::swap(&mut self.view_anchor, &mut slot.view_anchor);
@@ -220,6 +228,9 @@ impl App {
 
     /// Put the active window, and its drawing, in its slot.
     fn park_active(&mut self) {
+        for raster in self.page_rasters.get_mut().values_mut() {
+            raster.cancel_pending();
+        }
         let a = self.active_doc;
         self.swap_window(a);
         self.swap_drawing(a);
@@ -300,6 +311,8 @@ impl App {
         self.pending_merge_frame = false;
         self.pending_copy_effect = None;
         self.pending_copy_envelope = false;
+        self.pending_replace = None;
+        self.pending_copy_clip = false;
         self.pending_copy_fill = false;
         self.fill_swatch_drag = None;
         self.envelope_drag = None;
@@ -321,6 +334,13 @@ impl App {
         self.repeatables.clear();
         self.flyout_open = None;
         self.raster.borrow_mut().invalidate();
+    }
+
+    /// Show a drawing read from a file with its layers folded.
+    pub(crate) fn open_loaded_document(&mut self, doc: Document) {
+        let collapsed = doc.all_layers().map(|layer| layer.id).collect();
+        self.open_document(doc, None);
+        self.objects_collapsed = collapsed;
     }
 
     /// Open `doc` in a new tab after the others and make it active.
@@ -354,6 +374,8 @@ impl App {
         self.pivots = Default::default();
         self.picked_layer = None;
         self.selected_layers.clear();
+        self.objects_collapsed.clear();
+        self.map_gk42 = Default::default();
         *self.raster.get_mut() = Default::default();
         self.page_rasters.get_mut().clear();
         *self.page_snapshot.get_mut() = None;
@@ -534,6 +556,7 @@ impl App {
             fit_pending: self.fit_pending,
             picked_layer: self.picked_layer,
             selected_layers: self.selected_layers.clone(),
+            objects_collapsed: self.objects_collapsed.clone(),
             view_anchor: self.view_anchor,
             ..DocSlot::default()
         };
@@ -614,6 +637,8 @@ impl App {
         self.pivots = Default::default();
         self.picked_layer = None;
         self.selected_layers.clear();
+        self.objects_collapsed.clear();
+        self.map_gk42 = Default::default();
         *self.raster.get_mut() = Default::default();
         self.page_rasters.get_mut().clear();
         *self.page_snapshot.get_mut() = None;
@@ -762,10 +787,14 @@ impl App {
     pub fn duplicate_page_to_new_document(&mut self) {
         let page = self.page;
         let mut doc = self.doc().clone();
-        if !doc.pages.iter().any(|p| p.id == page) {
+        let Some(index) = doc.pages.iter().position(|p| p.id == page) else {
             return;
+        };
+        if doc.master.iter().any(|l| l.page_range.is_some()) {
+            doc = doc.with_master_layers_on_pages(&[index]);
+        } else {
+            doc.pages.retain(|p| p.id == page);
         }
-        doc.pages.retain(|p| p.id == page);
         doc.comments.retain(|c| c.page == page);
         doc.page_guides_hidden.retain(|p| *p == page);
         doc.selection_groups.clear();
@@ -1032,6 +1061,57 @@ mod tests {
         assert!(app.status.contains("art.tdraw"));
         app.switch_document(1);
         assert!(app.status.is_empty(), "{}", app.status);
+    }
+
+    #[test]
+    fn gk42_draft_and_picks_follow_their_tab() {
+        let mut app = App::headless();
+        app.new_document();
+        let first = app.active_doc;
+        app.map_gk42.on = true;
+        app.map_gk42.gk1.1 = "42531000".to_owned();
+        app.map_gk42.picked.push(tracedraw_core::Point::new(10.0, 20.0));
+        app.new_document();
+        let second = app.active_doc;
+        assert_ne!(first, second);
+        assert!(!app.map_gk42.on);
+        assert!(app.map_gk42.gk1.1.is_empty());
+        assert!(app.map_gk42.picked.is_empty());
+        app.switch_document(first);
+        assert!(app.map_gk42.on);
+        assert_eq!(app.map_gk42.gk1.1, "42531000");
+        assert_eq!(app.map_gk42.picked.len(), 1);
+    }
+
+    #[test]
+    fn opening_a_file_folds_layers_and_tabs_keep_their_own_state() {
+        let dir = temp_dir("folded-layers");
+        let path = dir.join("drawing.tdraw");
+        {
+            let mut app = App::headless();
+            app.new_document();
+            app.save_to(path.clone());
+        }
+
+        let mut app = App::headless();
+        app.new_document();
+        let blank = app.active_doc;
+        assert!(app.objects_collapsed.is_empty());
+
+        app.open_path(path);
+        let loaded = app.active_doc;
+        assert_ne!(loaded, blank);
+        let layers: Vec<_> = app.doc().all_layers().map(|layer| layer.id).collect();
+        assert!(layers.iter().all(|id| app.objects_collapsed.contains(id)));
+        let first = layers.first().expect("drawing has a layer");
+
+        app.switch_document(blank);
+        assert!(app.objects_collapsed.is_empty());
+        app.switch_document(loaded);
+        assert!(app.objects_collapsed.remove(first));
+        app.switch_document(blank);
+        app.switch_document(loaded);
+        assert!(!app.objects_collapsed.contains(first));
     }
 
     /// Opening a file that is open already shows its tab instead of a
