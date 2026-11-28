@@ -903,7 +903,32 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     }
     // Keep sharp pixels just outside the main canvas for a small pan.
     // Pixels view keeps its own sampling window.
-    let render_rect = if cfg!(not(target_arch = "wasm32"))
+    let strict_sharp = crate::raster::strict_sharp_enabled()
+        && preview_ids.is_none()
+        && app.node_drag_revision().is_none()
+        && app.render_focus().is_none()
+        && app.view_mode != crate::app::ViewMode::Pixels;
+    let cache_pan_regions = strict_sharp || crate::raster::pan_regions_enabled();
+    let fixed_sheet = ((cache_pan_regions || crate::raster::fixed_pan_sheet_enabled())
+        && preview_ids.is_none()
+        && app.render_focus().is_none()
+        && app.view_mode != crate::app::ViewMode::Pixels
+        && app.zoom_glide.target_view().is_none())
+        .then(|| {
+            let ppp = painter.ctx().pixels_per_point();
+            let max_side = painter.ctx().input(|i| i.max_texture_side);
+            (!cache_pan_regions)
+                .then(|| crate::raster::whole_pan_page_rect(view.rect_to_screen(app.page_rect()), rect, ppp, max_side))
+                .flatten()
+                .or_else(|| crate::raster::fixed_pan_sheet_rect(rect, ppp, max_side))
+        })
+        .flatten();
+    app.raster.borrow_mut().fixed_pan_sheet = fixed_sheet.is_some();
+    app.raster.borrow_mut().cache_pan_regions = cache_pan_regions;
+    app.raster.borrow_mut().strict_sharp = strict_sharp;
+    let render_rect = if let Some(sheet) = fixed_sheet {
+        sheet
+    } else if cfg!(not(target_arch = "wasm32"))
         && app.view_mode != crate::app::ViewMode::Pixels
     {
         let ppp = painter.ctx().pixels_per_point();
@@ -912,7 +937,8 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         let expanded = rect.expand(margin_px / ppp);
         if expanded.width().max(expanded.height()) * ppp + 2.0 <= limit {
             let now = painter.ctx().input(|i| i.time);
-            app.raster.borrow_mut().pan_render_rect(view, rect, margin_px / ppp, now)
+            let reserve_px = 128.0_f32.min(limit - 2.0 - expanded.width().max(expanded.height()) * ppp + margin_px);
+            app.raster.borrow_mut().pan_render_rect(view, rect, margin_px / ppp, reserve_px / ppp, now)
         } else {
             rect
         }
@@ -942,13 +968,19 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         )
     });
     let main_rendered = app.raster.borrow().render_count() != renders_before;
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::raster::strict_sharp_enabled() && matches!(app.drag, Drag::Move { .. }) {
+        if let Some((tex, _)) = main {
+            app.raster.borrow_mut().remember_move_frame(tex, view, painter.ctx().pixels_per_point(), rect);
+        }
+    }
     // SMOOTH_ZOOM_NO_BACKDROP: kept false so the small whole-page backdrop
     // (#2048) covers the paper around the screen texture while zooming out
     // or panning, instead of flashing white paper gaps.
     #[cfg(not(target_arch = "wasm32"))]
     const SMOOTH_ZOOM_NO_BACKDROP: bool = false;
     #[cfg(not(target_arch = "wasm32"))]
-    let backdrop = if SMOOTH_ZOOM_NO_BACKDROP {
+    let backdrop = if SMOOTH_ZOOM_NO_BACKDROP || strict_sharp {
         None
     } else if preview.is_none()
         && app.render_focus().is_none()
@@ -1063,18 +1095,66 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     }
 
     let mut live_ready = false;
-    if let Some((tex, at)) = main {
+    #[cfg(not(target_arch = "wasm32"))]
+    if strict_sharp {
+        let ppp = painter.ctx().pixels_per_point();
+        let mut raster = app.raster.borrow_mut();
+        let full = ERect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        let mut covered = Vec::new();
+        let (regions, fallback) = raster.strict_frame(view, ppp, rect);
+        for (tex, at) in regions {
+            let visible = at.intersect(rect);
+            for part in outside(visible, &covered) {
+                painter.with_clip_rect(part).image(tex, at, full, Color32::WHITE);
+            }
+            covered.push(visible);
+        }
+        if let Some((tex, at, bands)) = raster.incoming(view, ppp) {
+            for band in bands {
+                let visible = band.intersect(rect);
+                if !visible.is_positive() {
+                    continue;
+                }
+                for part in outside(visible, &covered) {
+                    painter.with_clip_rect(part).image(tex, at, full, Color32::WHITE);
+                }
+                covered.push(visible);
+            }
+        }
+        for (tex, at) in fallback {
+            let visible = at.intersect(rect);
+            for part in outside(visible, &covered) {
+                painter.with_clip_rect(part).image(tex, at, full, Color32::WHITE);
+            }
+            covered.push(visible);
+        }
+        drop(raster);
+        app.paint_edited_text_overlay(painter, rect);
+    }
+    if let Some((tex, at)) = main.filter(|_| !strict_sharp) {
         // The bands of the new picture done so far, sharp over the last
         // one while it is shown scaled after a zoom (#2389). Under them
         // the last picture is left out: both are see-through, and a
         // see-through object showed twice as dark there until the whole
         // picture came (#3639).
         #[cfg(not(target_arch = "wasm32"))]
-        let incoming = app.raster.borrow().incoming(view);
+        let incoming = app.raster.borrow().incoming(view, painter.ctx().pixels_per_point());
         #[cfg(not(target_arch = "wasm32"))]
         let covered: &[ERect] = incoming.as_ref().map_or(&[], |i| &i.2);
         #[cfg(target_arch = "wasm32")]
         let covered: &[ERect] = &[];
+        #[cfg(not(target_arch = "wasm32"))]
+        let sharp = app.raster.borrow().sharp_overlap(view, rect, tex, app.page, revision);
+        #[cfg(target_arch = "wasm32")]
+        let sharp: Option<(egui::TextureId, ERect)> = None;
+        // Each pixel uses only one picture, including translucent artwork.
+        let fallback_holes;
+        let fallback_covered = if let Some((_, sharp_at)) = sharp {
+            fallback_holes = [covered, &[sharp_at]].concat();
+            fallback_holes.as_slice()
+        } else {
+            covered
+        };
         let full = ERect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         // Where the picture does not reach (it is shown scaled or shifted
         // into place while the view moves): the whole page drawn small,
@@ -1082,24 +1162,41 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((back, back_at)) = backdrop {
             for part in backdrop_parts(rect, at, back_at) {
-                for part in outside(part, covered) {
+                for part in outside(part, fallback_covered) {
                     painter
                         .with_clip_rect(part)
                         .image(back, back_at, full, Color32::WHITE);
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::raster::edge_trace_enabled() {
+            app.raster.borrow_mut().trace_canvas_edge(
+                view, app.page, revision, rect, tex, at, backdrop.map(|(_, area)| area), covered,
+            );
+        }
         live_ready = covered.is_empty()
             && preview_ids.as_ref().is_some_and(|(ids, t)| {
                 app.raster.borrow().shows_transform(tex, app.page, revision, ids, *t)
             });
-        if covered.is_empty() {
+        if fallback_covered.is_empty() {
             painter.with_clip_rect(rect).image(tex, at, full, Color32::WHITE);
         } else {
-            for part in outside(at.intersect(rect), covered) {
+            for part in outside(at.intersect(rect), fallback_covered) {
                 painter
                     .with_clip_rect(part)
                     .image(tex, at, full, Color32::WHITE);
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((sharp_tex, sharp_at)) = sharp {
+            let area = sharp_at.intersect(rect);
+            if covered.is_empty() {
+                painter.with_clip_rect(area).image(sharp_tex, sharp_at, full, Color32::WHITE);
+            } else {
+                for part in outside(area, covered) {
+                    painter.with_clip_rect(part).image(sharp_tex, sharp_at, full, Color32::WHITE);
+                }
             }
         }
         #[cfg(not(target_arch = "wasm32"))]

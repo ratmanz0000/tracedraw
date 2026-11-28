@@ -456,6 +456,62 @@ pub fn render_page_progressive(
     first: u32,
     band: &(dyn Fn(u32, &Pixmap) + Sync),
 ) -> Option<Pixmap> {
+    render_page_progressive_prepared(doc, page, opts, cancel, first, band, None, false, |_| {})
+}
+
+/// Reusable geometry for one immutable document snapshot and page.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ProgressivePage {
+    document: std::sync::Arc<Document>,
+    page: PageId,
+    reach: std::sync::OnceLock<(bool, f64)>,
+    bounds: std::sync::OnceLock<PageBounds>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ProgressivePage {
+    pub fn new(document: std::sync::Arc<Document>, page: PageId) -> Self {
+        Self { document, page, reach: Default::default(), bounds: Default::default() }
+    }
+
+    pub fn matches(&self, document: &Document, page: PageId) -> bool {
+        self.page == page && std::ptr::eq(self.document.as_ref(), document)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ProgressivePreparation {
+    pub geometry: std::time::Duration,
+    pub candidates: std::time::Duration,
+    pub reused_bounds: bool,
+    pub stats: BandCandidateStats,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct BandCandidateStats {
+    pub bands: usize,
+    pub shadow_always: usize,
+    pub symbol_always: usize,
+    pub shadow_base_outside: usize,
+    pub symbol_base_outside: usize,
+    pub candidate_entries: usize,
+    pub lists_discarded: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_progressive_prepared(
+    doc: &Document,
+    page: PageId,
+    opts: &RenderOptions,
+    cancel: &std::sync::atomic::AtomicBool,
+    first: u32,
+    band: &(dyn Fn(u32, &Pixmap) + Sync),
+    prepared: Option<&ProgressivePage>,
+    measure_candidates: bool,
+    report: impl FnOnce(ProgressivePreparation),
+) -> Option<Pixmap> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (w, h) = (opts.width.max(1), opts.height.max(1));
     if (w as u64) * (h as u64) > MAX_PIXELS {
@@ -472,8 +528,17 @@ pub fn render_page_progressive(
     if cores < 2 || (w as u64) * (h as u64) < 250_000 || h < 128 {
         return render_page_whole(doc, page, opts, Some(cancel));
     }
+    let start = std::time::Instant::now();
     let layers = doc.layers_drawn_for_page(page).ok()?;
-    let (lens, blur_mm) = page_reach_until(&layers, Some(cancel))?;
+    let prepared = prepared.filter(|p| p.matches(doc, page) && opts.preview.is_none() && opts.focus.is_none());
+    let local_reach = std::sync::OnceLock::new();
+    let reach = prepared.map_or(&local_reach, |p| &p.reach);
+    if reach.get().is_none() {
+        let result = page_reach_until(&layers, Some(cancel))?;
+        if cancelled() { return None; }
+        let _ = reach.set(result);
+    }
+    let &(lens, blur_mm) = reach.get()?;
     let bands = if lens {
         None
     } else {
@@ -488,8 +553,20 @@ pub fn render_page_progressive(
     bands.sort_by_key(|b| middle(b).abs_diff(first));
     // Every band's culling asks every object's box: work the boxes out
     // once here instead of once per band (#3559).
-    let boxes = page_bounds_cache(&layers, Some(cancel))?;
-    let shapes = band_shapes(&layers, opts, &bands, &boxes, Some(cancel))?;
+    let local_bounds = std::sync::OnceLock::new();
+    let bounds = prepared.map_or(&local_bounds, |p| &p.bounds);
+    let reused_bounds = bounds.get().is_some();
+    if !reused_bounds {
+        let result = page_bounds_cache(&layers, Some(cancel))?;
+        if cancelled() { return None; }
+        let _ = bounds.set(result);
+    }
+    let boxes = bounds.get()?;
+    let geometry = start.elapsed();
+    let candidate_start = std::time::Instant::now();
+    let mut stats = BandCandidateStats { bands: bands.len(), ..Default::default() };
+    let shapes = band_shapes(&doc.symbols, &layers, opts, &bands, boxes, Some(cancel), measure_candidates.then_some(&mut stats))?;
+    report(ProgressivePreparation { geometry, candidates: candidate_start.elapsed(), reused_bounds, stats });
     let next = AtomicUsize::new(0);
     // Assemble each band as it finishes instead of keeping a whole
     // picture of bands beside a second whole picture at the end. Only
@@ -512,7 +589,7 @@ pub fn render_page_progressive(
                 o.view.origin_y = opts.view.origin_y - ry0 as f64;
                 let candidates = shapes.as_ref().map(|lists| lists[i].as_slice());
                 let Some(part) = image_cache::with_frame_image(&lease, || {
-                    render_page_whole_in(doc, page, &o, Some(cancel), Some(&boxes), candidates)
+                    render_page_whole_in(doc, page, &o, Some(cancel), Some(boxes), candidates)
                 }) else {
                     return;
                 };
@@ -1172,6 +1249,47 @@ fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Render disjoint patches of the same view, with effect margins. Coordinates
+/// are in target pixels. Callers fall back to a whole picture for lenses.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_pan_patches(
+    doc: &Document,
+    page: PageId,
+    opts: &RenderOptions,
+    patches: &[[u32; 4]],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<Pixmap>> {
+    let layers = doc.layers_drawn_for_page(page).ok()?;
+    let (lens, blur) = page_reach_until(&layers, Some(cancel))?;
+    if lens || opts.preview.is_some() || opts.focus.is_some() || patches.len() > 4 {
+        return None;
+    }
+    let margin = blur_margin(blur, opts.view.zoom);
+    let boxes = page_bounds_cache(&layers, Some(cancel))?;
+    let lease = std::sync::Arc::new(image_cache::FrameImageLease::default());
+    image_cache::with_frame_image(&lease, || {
+        patches.iter().map(|&[x0, y0, x1, y1]| {
+            if x0 >= x1 || y0 >= y1 || x1 > opts.width || y1 > opts.height {
+                return None;
+            }
+            let x = x0.saturating_sub(margin) / BAND_ALIGN * BAND_ALIGN;
+            let y = y0.saturating_sub(margin) / BAND_ALIGN * BAND_ALIGN;
+            let mut sub = opts.clone();
+            sub.width = x1.saturating_add(margin).min(opts.width) - x;
+            sub.height = y1.saturating_add(margin).min(opts.height) - y;
+            sub.view.origin_x -= f64::from(x);
+            sub.view.origin_y -= f64::from(y);
+            let painted = render_page_whole_with_backdrop(
+                doc, page, &sub, Some(cancel), Some(&boxes), None, Some(&layers), None,
+            )?;
+            let rect = tiny_skia::IntRect::from_xywh(
+                (x0 - x) as i32, (y0 - y) as i32, x1 - x0, y1 - y0,
+            )?;
+            painted.clone_rect(rect)
+        }).collect()
+    })
+}
+
 fn page_reach_until(
     layers: &[std::borrow::Cow<'_, tracedraw_core::document::Layer>],
     cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -1252,7 +1370,7 @@ fn render_page_in_bands_with_backdrop(
         local_boxes = page_bounds_cache(&layers, cancel)?;
         &local_boxes
     };
-    let shapes = band_shapes(&layers, opts, &bands, boxes, cancel)?;
+    let shapes = band_shapes(&doc.symbols, &layers, opts, &bands, boxes, cancel, None)?;
     let lease = std::sync::Arc::new(image_cache::FrameImageLease::default());
     let parts: Vec<Option<Pixmap>> = std::thread::scope(|sc| {
         let handles: Vec<_> = bands
@@ -1344,15 +1462,34 @@ fn band_layout(h: u32, cores: u32, margin: u32) -> Option<Vec<(u32, u32, u32, u3
     )
 }
 
+/// A flat definition without outline or effects has a view-independent
+/// extent. Other instances still use the unconditional candidate path.
+#[cfg(not(target_arch = "wasm32"))]
+fn simple_symbol_reach(shape: &Shape, symbol: Option<&tracedraw_core::Symbol>) -> Option<Rect> {
+    let member = &symbol?.shape;
+    if member.scale_grid.is_some() || member.stroke.is_some() || member.shadow.is_some()
+        || !member.extra_strokes.is_empty() || !member.extra_fills.is_empty() || member.spline.is_some()
+        || member.raster_fx.is_some() || !member.effects.is_empty()
+        || !matches!(member.kind, ShapeKind::Rect { .. } | ShapeKind::Ellipse { .. } | ShapeKind::Path { .. })
+        || !matches!(member.fill, Fill::None | Fill::Solid(_))
+    {
+        return None;
+    }
+    let bounds = shape.transform.transform_rect_bbox(member.bounds());
+    bounds.is_finite().then(|| bounds.inflate(1.0, 1.0))
+}
+
 /// Build the list of objects for each band in painting order. Bands are
 /// sorted by page Y only for the search, independent of rendering priority.
 #[cfg(not(target_arch = "wasm32"))]
 fn band_shapes<'a>(
+    symbols: &[tracedraw_core::Symbol],
     layers: &'a [std::borrow::Cow<'_, tracedraw_core::document::Layer>],
     opts: &RenderOptions,
     bands: &[(u32, u32, u32, u32)],
     boxes: &PageBounds,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    mut stats: Option<&mut BandCandidateStats>,
 ) -> Option<Option<Vec<Vec<&'a Shape>>>> {
     // A drag can move any descendant past its cached box.
     if opts.preview.is_some() || !opts.view.zoom.is_finite() || opts.view.zoom <= 0.0 {
@@ -1374,6 +1511,7 @@ fn band_shapes<'a>(
         return Some(None);
     };
     let (left, right) = (visible.x0, visible.x1);
+    let viewport = stats.as_ref().map(|_| limits.iter().fold(*visible, |r, (_, b)| r.union(*b)));
     let mut candidates = vec![Vec::new(); bands.len()];
     if rest_hidden(opts) {
         return Some(Some(candidates));
@@ -1390,9 +1528,10 @@ fn band_shapes<'a>(
             let reach = if !shape.effects.is_empty()
                 || shape.shadow.is_some()
                 || shape.raster_fx.is_some()
-                || matches!(shape.kind, ShapeKind::SymbolInstance { .. })
             {
                 None
+            } else if let ShapeKind::SymbolInstance { index } = shape.kind {
+                simple_symbol_reach(shape, symbols.get(index))
             } else if matches!(shape.kind, ShapeKind::Group { .. } | ShapeKind::ClipFrame { .. }) {
                 boxes.reach.get(&shape.id).copied()
             } else {
@@ -1406,18 +1545,38 @@ fn band_shapes<'a>(
                 let end = limits.partition_point(|(_, band)| band.y0 <= reach.y1);
                 limits.get(start..end).unwrap_or(&[])
             } else {
+                if let (Some(stats), Some(viewport)) = (stats.as_deref_mut(), viewport) {
+                    let shadow = shape.shadow.is_some() || shape.effects.iter().any(|effect|
+                        matches!(effect, tracedraw_core::live::Effect::OuterShadow { .. }
+                            | tracedraw_core::live::Effect::InnerShadow { .. }));
+                    let symbol = matches!(shape.kind, ShapeKind::SymbolInstance { .. });
+                    let outside = (shadow || symbol) && boxes.get(&shape.id).is_some_and(|b|
+                        b.is_finite() && (b.x1 < viewport.x0 || b.x0 > viewport.x1
+                            || b.y1 < viewport.y0 || b.y0 > viewport.y1));
+                    stats.shadow_always += usize::from(shadow);
+                    stats.symbol_always += usize::from(symbol);
+                    stats.shadow_base_outside += usize::from(shadow && outside);
+                    stats.symbol_base_outside += usize::from(symbol && outside);
+                }
                 &limits
             };
             entries += rows.len();
             // A page of very large objects can cover every band. Keep
             // index storage bounded and use ordinary culling in that case.
             if entries > 1_000_000 {
+                if let Some(stats) = stats {
+                    stats.candidate_entries = entries;
+                    stats.lists_discarded = true;
+                }
                 return Some(None);
             }
             for &(i, _) in rows {
                 candidates[i].push(shape);
             }
         }
+    }
+    if let Some(stats) = stats {
+        stats.candidate_entries = entries;
     }
     Some(Some(candidates))
 }
@@ -8090,6 +8249,129 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn band_index_skips_only_offscreen_flat_symbols() {
+        let instance = |id, index, x| {
+            let mut shape = Shape::new(ShapeId(id), ShapeKind::SymbolInstance { index });
+            shape.transform = Affine::translate((x, 0.0));
+            shape
+        };
+        let (mut doc, page) = doc_with(vec![
+            instance(601, 0, 180.0), instance(602, 0, 20.0), instance(603, 1, 180.0),
+        ]);
+        let mut shape = Shape::new(ShapeId(604), ShapeKind::Rect {
+            rect: Rect::new(0.0, 10.0, 10.0, 20.0), radius: 0.0, corners: None,
+        });
+        shape.fill = Fill::Solid(Color::BLACK);
+        shape.stroke = None;
+        doc.symbols.push(tracedraw_core::Symbol { name: "flat".into(), shape: shape.clone() });
+        shape.shadow = Some(tracedraw_core::Shadow::default());
+        doc.symbols.push(tracedraw_core::Symbol { name: "shadow".into(), shape });
+        let opts = RenderOptions {
+            width: 100, height: 100,
+            view: ViewTransform { zoom: 1.0, origin_x: 0.0, origin_y: 100.0, stretch_y: 1.0 },
+            ..Default::default()
+        };
+        let layers = doc.layers_drawn_for_page(page).expect("layers");
+        let boxes = page_bounds_cache(&layers, None).expect("boxes");
+        let bands = [(0, 50, 0, 50), (50, 100, 50, 100)];
+        let lists = band_shapes(&doc.symbols, &layers, &opts, &bands, &boxes, None, None)
+            .expect("not cancelled").expect("indexed bands");
+        let ids = |i: usize| lists[i].iter().map(|s| s.id).collect::<Vec<_>>();
+        assert_eq!(ids(0), [ShapeId(603)]);
+        assert_eq!(ids(1), [ShapeId(602), ShapeId(603)]);
+        for ((_, _, start, end), candidates) in bands.into_iter().zip(&lists) {
+            let mut band = opts.clone();
+            band.height = end - start;
+            band.view.origin_y -= f64::from(start);
+            let indexed = render_page_whole_with_backdrop(
+                &doc, page, &band, None, Some(&boxes), Some(candidates), Some(&layers), None,
+            ).expect("indexed");
+            let reference = render_page_whole_with_backdrop(
+                &doc, page, &band, None, Some(&boxes), None, Some(&layers), None,
+            ).expect("reference");
+            assert_eq!(indexed.data(), reference.data());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn band_probe_counts_offscreen_base_geometry_without_culling_effects() {
+        let mut shadowed = Shape::new(ShapeId(601), ShapeKind::Rect {
+            rect: Rect::new(130.0, 10.0, 140.0, 20.0), radius: 0.0, corners: None,
+        });
+        shadowed.shadow = Some(tracedraw_core::Shadow::default());
+        let symbol = Shape::new(ShapeId(602), ShapeKind::SymbolInstance { index: 0 });
+        let (doc, page) = doc_with(vec![shadowed, symbol]);
+        let opts = RenderOptions {
+            width: 100, height: 100,
+            view: ViewTransform { zoom: 1.0, origin_x: 0.0, origin_y: 100.0, stretch_y: 1.0 },
+            ..Default::default()
+        };
+        let layers = doc.layers_drawn_for_page(page).expect("layers");
+        let boxes = page_bounds_cache(&layers, None).expect("boxes");
+        let bands = [(0,50,0,50), (50,100,50,100)];
+        let mut stats = BandCandidateStats { bands: 2, ..Default::default() };
+        let lists = band_shapes(&doc.symbols, &layers, &opts, &bands, &boxes, None, Some(&mut stats))
+            .expect("not cancelled").expect("indexed bands");
+        assert_eq!(stats.shadow_always, 1);
+        assert_eq!(stats.shadow_base_outside, 1);
+        assert_eq!(stats.symbol_always, 1);
+        assert_eq!(stats.candidate_entries, 4);
+        assert!(lists.iter().all(|band| band.len() == 2));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn move_damage_matches_full_render_under_a_translucent_filter() {
+        use tracedraw_core::live::{Effect, MergeMode};
+        let solid = |id, bounds, color| {
+            let mut shape = Shape::new(ShapeId(id), ShapeKind::Rect { rect: bounds, radius: 0.0, corners: None });
+            shape.fill = Fill::Solid(color);
+            shape.stroke = None;
+            shape
+        };
+        let base = solid(401, Rect::new(0.0, 0.0, 800.0, 640.0), Color::rgb8(206, 182, 101));
+        let mut moving = solid(402, Rect::new(96.0, 300.0, 128.0, 330.0), Color::rgb8(84, 70, 218));
+        moving.shadow = Some(tracedraw_core::Shadow {
+            offset: tracedraw_core::geometry::Vec2::new(8.0, -6.0),
+            blur: 3.0, opacity: 0.6, color: Color::BLACK,
+            ..Default::default()
+        });
+        let mut filter = solid(403, Rect::new(0.0, 0.0, 800.0, 640.0), Color::rgb8(91, 150, 190));
+        filter.effects.push(Effect::Transparency {
+            mask: Fill::Solid(Color::rgb8(120, 120, 120)), merge: MergeMode::Multiply, target: 2,
+        });
+        let (mut doc, page) = doc_with(vec![base, moving, filter]);
+        let opts = RenderOptions {
+            width: 800, height: 640,
+            view: ViewTransform { zoom: 1.0, origin_x: 0.0, origin_y: 640.0, stretch_y: 1.0 },
+            ..Default::default()
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let old = render_page_on_one_thread(&doc, page, &opts).expect("old");
+        let layer = doc.pages[0].layers[0].id;
+        doc.layer_mut(layer).expect("layer").shapes[1].transform =
+            Affine::translate(tracedraw_core::geometry::Vec2::new(132.0, 0.0));
+        let damage = [[75, 288, 158, 368], [207, 288, 290, 368]];
+        let start = std::time::Instant::now();
+        let whole = render_page_cancellable(&doc, page, &opts, &cancel).expect("new");
+        let full = start.elapsed();
+        let start = std::time::Instant::now();
+        let patches = render_pan_patches(&doc, page, &opts, &damage, &cancel).expect("patch");
+        let partial = start.elapsed();
+        for y in 0..640 {
+            for x in 0..800 {
+                let actual = damage.iter().zip(&patches).find_map(|([x0,y0,x1,y1], patch)| {
+                    (x >= *x0 && x < *x1 && y >= *y0 && y < *y1).then(|| patch.pixel(x-*x0, y-*y0)).flatten()
+                }).or_else(|| old.pixel(x, y));
+                assert_eq!(actual, whole.pixel(x, y), "pixel {x},{y}");
+            }
+        }
+        eprintln!("two damage rectangles cover 2.594% of viewport; full={full:?} patches={partial:?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn drag_backdrop_preserves_pixels_and_paint_order() {
         let bytes = Pixmap::new(2, 2).unwrap().encode_png().unwrap();
         let mut bitmap = Shape::new(ShapeId(101), ShapeKind::Bitmap {
@@ -14396,7 +14678,7 @@ mod band_tests {
         let boxes = page_bounds_cache(&layers, None).expect("bounds");
         let mut bands = band_layout(opts.height, 8, 16).expect("bands");
         bands.reverse();
-        let lists = band_shapes(&layers, &opts, &bands, &boxes, None)
+        let lists = band_shapes(&doc.symbols, &layers, &opts, &bands, &boxes, None, None)
             .expect("not cancelled")
             .expect("indexed");
         let total: usize = layers.iter().map(|layer| layer.shapes.len()).sum();
@@ -14897,6 +15179,26 @@ mod inner_shadow_view_tests {
                 }
             }
             assert!(worst <= 1, "zoom {zoom}: {worst}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pan_patches_match_the_full_image_across_shadow_edges() {
+        let (doc, page) = mesh_with_inner_shadow();
+        let options = opts(20.0, 37.0);
+        let areas = [[0, 0, 1200, 101], [937, 101, 1200, 900]];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let patches = render_pan_patches(&doc, page, &options, &areas, &cancel).expect("patches");
+        let reference = render_page(&doc, page, &options).expect("full render");
+        for ([x0, y0, x1, y1], patch) in areas.into_iter().zip(patches) {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let a = patch.pixel(x - x0, y - y0).expect("patch pixel");
+                    let b = reference.pixel(x, y).expect("full pixel");
+                    assert!(diff(a, b) <= 1, "{x},{y}: {a:?} vs {b:?}");
+                }
+            }
         }
     }
 }

@@ -360,7 +360,11 @@ pub fn apply(app: &mut App) -> bool {
         app.map_gk42.error = Some(tr("gk42.broken"));
         return false;
     };
-    app.run(Command::SetGkCalibration { cal: Some(cal) });
+    app.run(Command::SetGkCalibration { cal: Some(cal.clone()) });
+    if app.doc().gk42.as_ref() != Some(&cal) {
+        app.map_gk42.error = Some(tr("gk42.broken"));
+        return false;
+    }
     app.map_gk42.error = None;
     app.map_gk42.note = None;
     true
@@ -724,6 +728,8 @@ pub fn panel(app: &mut App, ui: &mut Ui) {
     // The calibration is saved but its markers are gone or degenerate.
     if saved.is_some() && !applied_ok {
         ui.label(rt(tr("gk42.broken")).color(Color32::from_rgb(230, 90, 90)));
+    } else if applied_ok {
+        ui.label(rt(tr("gk42.saved_hint")).color(Tokens::text_dim()));
     }
 
     ui.add_space(3.0);

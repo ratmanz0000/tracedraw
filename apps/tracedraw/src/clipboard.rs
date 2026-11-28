@@ -31,6 +31,7 @@ pub struct PendingPaste {
 enum PreparedPaste {
     Internal,
     Vector(Vec<tracedraw_core::Shape>),
+    Table(Vec<Vec<String>>),
     External {
         content: ClipboardContent,
         image: Result<Option<crate::ops::PreparedImage>, String>,
@@ -122,8 +123,14 @@ fn read_native_paste_once(seq: Option<u32>, mark: Option<Mark>) -> Result<Prepar
         })
     })
     .ok_or_else(|| "the system clipboard is unavailable".to_string())??;
-    content.vector = read_vector();
-    prepare_paste_content(content, seq, mark, read_native_image)
+    #[cfg(windows)]
+    let spreadsheet = content.text.is_some() && crate::win_clipboard::offers_spreadsheet_cells();
+    #[cfg(not(windows))]
+    let spreadsheet = false;
+    if content.cell_rows(spreadsheet).is_none() {
+        content.vector = read_vector();
+    }
+    prepare_paste_content(content, seq, mark, spreadsheet, read_native_image)
 }
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
@@ -131,12 +138,16 @@ fn prepare_paste_content(
     mut content: ClipboardContent,
     seq: Option<u32>,
     mark: Option<Mark>,
+    spreadsheet: bool,
     read_image: impl FnOnce() -> Result<Option<image::RgbaImage>, String>,
 ) -> Result<PreparedPaste, String> {
     if mark.is_some_and(|m| m.still_holds(seq, &content.text, &content.files, || None))
         && (seq.is_some() || content.text.is_some() || !content.files.is_empty())
     {
         return Ok(PreparedPaste::Internal);
+    }
+    if let Some(rows) = content.cell_rows(spreadsheet) {
+        return Ok(PreparedPaste::Table(rows));
     }
     if content.files.is_empty() {
         if let Some(bytes) = content.vector.take() {
@@ -208,6 +219,18 @@ pub struct ClipboardContent {
 }
 
 impl ClipboardContent {
+    fn cell_rows(&self, spreadsheet: bool) -> Option<Vec<Vec<String>>> {
+        let text = self.text.as_deref()?;
+        if !self.files.is_empty() || self.is_svg() || (!spreadsheet && !text.contains('\t')) {
+            return None;
+        }
+        let rows = crate::table_clipboard::parse_tsv(text);
+        ((!rows.is_empty() && spreadsheet)
+            || (rows.len() >= 2 && rows.iter().all(|row| row.len() >= 2)))
+            .then_some(rows)
+    }
+
+
     pub fn is_empty(&self) -> bool {
         self.text.is_none()
             && self.image.is_none()
@@ -1523,6 +1546,10 @@ impl App {
         let before = self.selection.clone();
         match result {
             Err(error) => self.clipboard_paste_failed(&error),
+            Ok(PreparedPaste::Table(rows)) => {
+                self.paste_rows_as_table(&rows);
+                self.move_pasted_to(&before, pending.at);
+            }
             Ok(PreparedPaste::Vector(shapes)) => {
                 if self.paste_vector_shapes(shapes) {
                     self.move_pasted_to(&before, pending.at);
@@ -1597,6 +1624,10 @@ impl App {
                 self.paste();
                 return;
             }
+        }
+        if let Some(rows) = content.cell_rows(false) {
+            self.paste_rows_as_table(&rows);
+            return;
         }
         // Vector data a drawing program copied with a picture of it:
         // objects, not the picture; the picture when the data cannot be
@@ -3089,6 +3120,36 @@ mod tests {
 
     #[test]
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    fn spreadsheet_unicode_wins_over_vector_and_bitmap() {
+        for (text, spreadsheet, expected) in [
+            ("Кириллица\t\r\nШрифт\t\"два\nряда\"\r\n", false, vec![vec!["Кириллица", ""], vec!["Шрифт", "два\nряда"]]),
+            ("Кириллица\tШрифт\r\n", true, vec![vec!["Кириллица", "Шрифт"]]),
+            ("Кириллица\r\nШрифт\r\n", true, vec![vec!["Кириллица"], vec!["Шрифт"]]),
+        ] {
+            let result = prepare_paste_content(ClipboardContent {
+                text: Some(text.into()),
+                vector: Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20"/></svg>"#.to_vec()),
+                ..Default::default()
+            }, None, None, spreadsheet, || panic!("cell text already available"));
+            let mut app = App::headless();
+            let send = pending_paste(&mut app, None);
+            assert!(matches!(&result, Ok(PreparedPaste::Table(_))));
+            send.send(result).unwrap_or_else(|_| panic!("receiver"));
+            assert!(!app.poll_clipboard_paste());
+            let id = app.lone_selected_table().expect("pasted table");
+            let ShapeKind::Table(table) = &app.doc().find_shape(id).expect("shape").kind else {
+                panic!("expected an editable table");
+            };
+            assert_eq!(table.text_rows(), expected);
+        }
+        assert!(ClipboardContent {
+            text: Some("Кириллица\nШрифт\n".into()),
+            ..Default::default()
+        }.cell_rows(false).is_none());
+    }
+
+    #[test]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     fn valid_vector_data_still_pastes_when_its_bitmap_fallback_is_unreadable() {
         let mut app = App::headless();
         let send = pending_paste(&mut app, None);
@@ -3099,6 +3160,7 @@ mod tests {
             },
             None,
             None,
+            false,
             || panic!("valid vector data never reads its bitmap fallback"),
         );
         assert!(matches!(prepared, Ok(PreparedPaste::Vector(_))));
@@ -3121,6 +3183,7 @@ mod tests {
             },
             None,
             None,
+            false,
             || Ok(picture().image),
         )
         .unwrap_or_else(|e| panic!("{e}"));

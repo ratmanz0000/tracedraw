@@ -4599,6 +4599,37 @@ impl App {
                 let to_page = (self.drop_frame.is_none() && self.page_drag_group.is_none())
                     .then(|| self.multipage_drop_page(total))
                     .flatten();
+                #[cfg(not(target_arch = "wasm32"))]
+                let keep_move_frame = total.hypot() > 1e-6 && to_page.is_none()
+                    && crate::raster::strict_sharp_enabled();
+                #[cfg(not(target_arch = "wasm32"))]
+                let trace_before = (total.hypot() > 1e-6 && crate::raster::edge_trace_enabled())
+                    .then(|| self.selection_bounds()).flatten();
+                #[cfg(not(target_arch = "wasm32"))]
+                if keep_move_frame {
+                    self.raster.borrow_mut().retain_before_move_commit(self.engine.revision());
+                }
+                // A root solid shape with no outline has no paint beyond
+                // its bounds plus AA. Other moves still render a full frame.
+                #[cfg(not(target_arch = "wasm32"))]
+                let damage_before = if keep_move_frame && crate::raster::move_damage_enabled()
+                    && self.drop_frame.is_none() && self.page_drag_group.is_none()
+                    && !self.ctrl_copy && !self.drag_copy
+                {
+                    match self.selection.as_slice() {
+                        [id] => self.page_layers().into_iter().flat_map(|l| &l.shapes)
+                            .find(|s| s.id == *id)
+                            .filter(|s| s.stroke.is_none() && s.shadow.is_none() && s.extra_strokes.is_empty()
+                                && s.extra_fills.is_empty() && s.spline.is_none() && !s.wrap_text
+                                && s.raster_fx.is_none() && s.effects.is_empty()
+                                && matches!(s.fill, tracedraw_core::Fill::Solid(_))
+                                && matches!(s.kind, ShapeKind::Rect { .. } | ShapeKind::Ellipse { .. } | ShapeKind::Path { .. }))
+                            .map(|s| (s.id, s.bounds(), s.transform, self.engine.revision())),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let mark = to_page.map(|_| self.engine.begin_group());
                 if std::mem::take(&mut self.ctrl_copy) {
                     self.drag_copy = true;
@@ -4646,6 +4677,30 @@ impl App {
                 }
                 // A move that went to another page on the way: one step.
                 self.end_page_drag_group();
+                #[cfg(not(target_arch = "wasm32"))]
+                if keep_move_frame {
+                    let revision = self.engine.revision();
+                    let damage = damage_before.and_then(|(id, old, transform, before)| {
+                        let shape = self.doc().find_shape(id)?;
+                        (before.checked_add(1) == Some(revision)
+                            && shape.transform == Affine::translate(total) * transform)
+                            .then(|| (revision, [old, shape.bounds()]))
+                    });
+                    let mut raster = self.raster.borrow_mut();
+                    raster.move_commit_revision = Some(revision);
+                    raster.move_damage = damage;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some((before, after)) = trace_before.and_then(|before| self.selection_bounds().map(|after| (before, after))) {
+                    let a = self.view.rect_to_screen(before).intersect(self.canvas_rect);
+                    let b = self.view.rect_to_screen(after).intersect(self.canvas_rect);
+                    let area = |r: egui::Rect| r.width().max(0.0) * r.height().max(0.0);
+                    let union = area(a) + area(b) - area(a.intersect(b));
+                    log::info!(target: "tracedraw::edge_trace",
+                        "move commit ms={} revision={} base_fraction={:.6}",
+                        crate::raster::edge_trace_ms(), self.engine.revision(),
+                        union / area(self.canvas_rect).max(1.0));
+                }
             }
             Drag::AlongPath { start, current } => self.finish_along_path(start, current),
             Drag::Pivot => {}

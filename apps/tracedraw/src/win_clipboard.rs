@@ -226,6 +226,27 @@ fn read_corel(open: &Open) -> Option<Vec<u8>> {
         .find_map(|f| open.global_bytes(f).and_then(crate::clipboard::corel_file))
 }
 
+/// Spreadsheet-specific formats disambiguate one row or column from
+/// ordinary text without requesting the binary data from the owner.
+pub fn offers_spreadsheet_cells() -> bool {
+    let Some(_open) = Open::new() else { return false };
+    let mut format = 0;
+    loop {
+        // SAFETY: the clipboard stays open while enumerating its formats.
+        format = unsafe { EnumClipboardFormats(format) };
+        if format == 0 {
+            return false;
+        }
+        if format >= FIRST_REGISTERED
+            && format_name(format).is_some_and(|name| {
+                matches!(name.to_ascii_lowercase().as_str(), "biff8" | "biff12" | "biff5" | "xml spreadsheet")
+            })
+        {
+            return true;
+        }
+    }
+}
+
 /// CorelDRAW's CMX or CDR copy data, else SVG, PDF or enhanced metafile
 /// bytes on the clipboard, the first offered in that order; `None` when
 /// it offers none of them.

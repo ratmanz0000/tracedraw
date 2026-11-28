@@ -25,7 +25,7 @@ use tracedraw_core::{geometry::Affine, Document, PageId, ShapeId};
 use tracedraw_render::{render_page, Preview, RenderOptions, ViewTransform};
 #[cfg(not(target_arch = "wasm32"))]
 use tracedraw_render::{
-    render_page_cancellable, render_page_on_one_thread_cancellable, render_page_progressive,
+    render_page_cancellable, render_page_on_one_thread_cancellable, render_page_progressive_prepared,
 };
 
 /// How long the view must rest, seconds, before a moved view is
@@ -278,6 +278,16 @@ struct Level {
     page_rect: tracedraw_core::geometry::Rect,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct SharpFrame {
+    key: Key,
+    viewport: Rect,
+    ppp: f32,
+    view: View,
+    textures: Vec<(TextureHandle, Rect)>,
+}
+
 /// At most this many pictures of earlier zooms are kept (#3894)...
 const MAX_LEVELS: usize = 6;
 /// ...and at most this many bytes of them (a 1600 x 1000 canvas is
@@ -313,10 +323,28 @@ fn nearest_level(
 
 #[derive(Default)]
 pub struct Raster {
+    #[cfg(not(target_arch = "wasm32"))]
+    edge_trace: EdgeTrace,
     texture: Option<TextureHandle>,
     key: Option<Key>,
     // A failed render can record its key without replacing the pixels.
     picture_failed: bool,
+    failed_key: Option<Key>,
+    pub(crate) strict_sharp: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    requested_picture: Option<Key>,
+    #[cfg(not(target_arch = "wasm32"))]
+    progressive_page: Option<std::sync::Arc<tracedraw_render::ProgressivePage>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    sharp_frame: Option<SharpFrame>,
+    #[cfg(not(target_arch = "wasm32"))]
+    move_frame: Option<SharpFrame>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) move_commit_revision: Option<u64>,
+    #[cfg(not(target_arch = "wasm32"))]
+    move_seed: Option<(Key, std::sync::Arc<ColorImage>)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) move_damage: Option<(u64, [tracedraw_core::geometry::Rect; 2])>,
     #[cfg(not(target_arch = "wasm32"))]
     pub drag_backdrop_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -330,6 +358,9 @@ pub struct Raster {
     /// is drawn, sharper than the last picture scaled, and coming back to
     /// one of them shows it at once.
     levels: Vec<Level>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pan_regions: Vec<Level>,
+    pub(crate) cache_pan_regions: bool,
     /// While the view moves: the view last asked for and when (egui
     /// time) it will be rendered if it stays.
     settle: Option<(Key, f64)>,
@@ -364,8 +395,11 @@ pub struct Raster {
     pub defer: bool,
     /// The visible main canvas inside the render's extra margin.
     pub main_viewport: Option<Rect>,
+    pub(crate) fixed_pan_sheet: bool,
     pan_sample: Option<(crate::view::View, Rect, f64)>,
     pan_lead: egui::Vec2,
+    #[cfg(not(target_arch = "wasm32"))]
+    pan_pixels: Option<std::sync::Arc<ColorImage>>,
     /// Light zoom (Options > Tools > Zoom/Pan, for slow computers): a
     /// zoom shows the last picture scaled, like a pan, and the drawing
     /// is drawn anew once, when the view has rested
@@ -522,6 +556,103 @@ fn to_image(pixmap: &tiny_skia::Pixmap, lut: Option<&ProofLut>) -> ColorImage {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn move_picture(
+    doc: &Document,
+    page: PageId,
+    opts: &RenderOptions,
+    old: &ColorImage,
+    damage: [tracedraw_core::geometry::Rect; 2],
+    lut: Option<&ProofLut>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<ColorImage> {
+    let w = opts.width as usize;
+    let h = opts.height as usize;
+    if old.size != [w, h] || !damage.iter().all(|r| r.is_finite()) {
+        return None;
+    }
+    let t = opts.view;
+    let areas: Vec<_> = damage.into_iter().filter_map(|r| {
+        let x0 = (t.origin_x + r.x0 * t.zoom - 4.0).floor().clamp(0.0, w as f64) as u32;
+        let x1 = (t.origin_x + r.x1 * t.zoom + 4.0).ceil().clamp(0.0, w as f64) as u32;
+        let y0 = (t.origin_y - r.y1 * t.zoom - 4.0).floor().clamp(0.0, h as f64) as u32;
+        let y1 = (t.origin_y - r.y0 * t.zoom + 4.0).ceil().clamp(0.0, h as f64) as u32;
+        (x0 < x1 && y0 < y1).then_some([x0, y0, x1, y1])
+    }).collect();
+    if areas.iter().map(|a| u64::from(a[2] - a[0]) * u64::from(a[3] - a[1])).sum::<u64>()
+        > (w as u64 * h as u64) / 4
+    {
+        return None;
+    }
+    let patches = tracedraw_render::render_pan_patches(doc, page, opts, &areas, cancel)?;
+    let mut image = old.clone();
+    for ([x, y, x1, y1], patch) in areas.into_iter().zip(patches) {
+        let patch = to_image(&patch, lut);
+        let stride = (x1 - x) as usize;
+        for row in 0..(y1 - y) as usize {
+            let at = (y as usize + row) * w + x as usize;
+            image.pixels.get_mut(at..at + stride)?
+                .copy_from_slice(patch.pixels.get(row * stride..(row + 1) * stride)?);
+        }
+    }
+    (!cancel.load(std::sync::atomic::Ordering::Relaxed)).then_some(image)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pan_picture(
+    doc: &Document,
+    page: PageId,
+    opts: &RenderOptions,
+    old: &ColorImage,
+    rect: tracedraw_core::geometry::Rect,
+    lut: Option<&ProofLut>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<ColorImage> {
+    let [ow, oh] = old.size.map(|n| n as i64);
+    let (w, h) = (i64::from(opts.width), i64::from(opts.height));
+    let zoom = opts.view.zoom;
+    let dx = opts.view.origin_x + rect.x0 * zoom;
+    let dy = opts.view.origin_y - rect.y1 * zoom;
+    let almost = |a: f64, b: f64| (a - b).abs() < 0.001;
+    if !almost(rect.width() * zoom, ow as f64)
+        || !almost(rect.height() * zoom, oh as f64)
+        || !almost(dx, dx.round()) || !almost(dy, dy.round())
+    {
+        return None;
+    }
+    let (dx, dy) = (dx.round() as i64, dy.round() as i64);
+    let (l, t, r, b) = (dx.max(0), dy.max(0), dx.saturating_add(ow).min(w), dy.saturating_add(oh).min(h));
+    if w.checked_mul(h)? > 8 * 1024 * 1024 || l >= r || t >= b
+        || (r - l) * (b - t) < w * h / 2
+    {
+        return None;
+    }
+    let areas: Vec<_> = [[0, t, l, b], [r, t, w, b], [0, 0, w, t], [0, b, w, h]]
+        .into_iter()
+        .filter(|[x0, y0, x1, y1]| x0 < x1 && y0 < y1)
+        .map(|rect| rect.map(|n| n as u32))
+        .collect();
+    let patches = tracedraw_render::render_pan_patches(doc, page, opts, &areas, cancel)?;
+    let mut out = ColorImage::filled([w as usize, h as usize], egui::Color32::TRANSPARENT);
+    for y in t..b {
+        let source = ((y - dy) * ow + l - dx) as usize;
+        let target = (y * w + l) as usize;
+        let len = (r - l) as usize;
+        out.pixels.get_mut(target..target + len)?
+            .copy_from_slice(old.pixels.get(source..source + len)?);
+    }
+    for ([x, y, x1, y1], patch) in areas.into_iter().zip(patches) {
+        let patch = to_image(&patch, lut);
+        let stride = (x1 - x) as usize;
+        for row in 0..(y1 - y) as usize {
+            let target = (y as usize + row) * w as usize + x as usize;
+            out.pixels.get_mut(target..target + stride)?
+                .copy_from_slice(patch.pixels.get(row * stride..(row + 1) * stride)?);
+        }
+    }
+    (!cancel.load(std::sync::atomic::Ordering::Relaxed)).then_some(out)
+}
+
 #[derive(PartialEq, Clone, Debug)]
 struct Key {
     revision: u64,
@@ -532,6 +663,7 @@ struct Key {
     /// still needs a new render when the view stays put.
     offset: egui::Vec2,
     size: (u32, u32),
+    draft: bool,
     /// The dragged objects as a set: the order the selection was made in
     /// must not invalidate the picture, and the render asks membership.
     preview: Option<(std::collections::HashSet<ShapeId>, [f64; 6])>,
@@ -599,7 +731,179 @@ pub fn pixel_window(view: &View, rect: Rect, dpi: f64, ppp: f32) -> Option<Pixel
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct EdgeTrace {
+    open: Option<u64>,
+    last: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn move_damage_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRACEDRAW_MOVE_DAMAGE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn edge_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRACEDRAW_EDGE_TRACE").is_some())
+}
+
+pub(crate) fn fixed_pan_sheet_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return false;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TRACEDRAW_FIXED_PAN_SHEET").is_some_and(|v| v == "1"))
+    }
+}
+
+pub(crate) fn pan_regions_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return false;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TRACEDRAW_PAN_REGIONS").is_some_and(|v| v == "1"))
+    }
+}
+
+pub(crate) fn strict_sharp_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return false;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TRACEDRAW_STRICT_SHARP").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sharp_region(old: &Key, key: &Key, area: tracedraw_core::geometry::Rect,
+    view: &View, ppp: f32, cover: Rect) -> Option<Rect>
+{
+    let at = exact_placement(old, key, area, view, ppp)?;
+    at.contains_rect(cover).then_some(at)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exact_placement(old: &Key, key: &Key, area: tracedraw_core::geometry::Rect,
+    view: &View, ppp: f32) -> Option<Rect>
+{
+    let device_zoom = f64::from(view.zoom * ppp);
+    let same_sampling = (area.width() * device_zoom - f64::from(old.size.0)).abs() < 0.01
+        && (area.height() * device_zoom - f64::from(old.size.1)).abs() < 0.01;
+    if old.zoom != view.zoom || !same_sampling || !old.same_but_view(key, true) {
+        return None;
+    }
+    let at = view.rect_to_screen(area);
+    let min = at.min.to_vec2() * ppp;
+    let snap = egui::vec2(min.x.round(), min.y.round());
+    Some(Rect::from_min_size(
+        egui::pos2(snap.x / ppp, snap.y / ppp),
+        egui::vec2(old.size.0 as f32 / ppp, old.size.1 as f32 / ppp),
+    ))
+}
+
+pub(crate) fn fixed_pan_sheet_rect(canvas: Rect, ppp: f32, max_side: usize) -> Option<Rect> {
+    let cap = max_side.min(3072) as f32 - 2.0;
+    let width = canvas.width() * ppp;
+    let height = canvas.height() * ppp;
+    let extra = |size: f32| (cap - size).mul_add(0.5, 0.0).clamp(0.0, 768.0).floor() / ppp;
+    let x = extra(width);
+    let y = extra(height);
+    (width <= cap && height <= cap && x > 0.0 && y > 0.0)
+        .then(|| canvas.expand2(egui::vec2(x, y)))
+}
+
+/// Only bake the whole page when it fits the device and the experimental
+/// texture budget. The existing bounded sheet remains the fallback.
+pub(crate) fn whole_pan_page_rect(
+    page: Rect,
+    canvas: Rect,
+    ppp: f32,
+    max_side: usize,
+) -> Option<Rect> {
+    const MAX_BYTES: f64 = 192.0 * 1024.0 * 1024.0;
+    let w = f64::from(page.width() * ppp).ceil() + 2.0;
+    let h = f64::from(page.height() * ppp).ceil() + 2.0;
+    (page.contains_rect(canvas) && w >= 3.0 && h >= 3.0
+        && w <= max_side as f64 && h <= max_side as f64 && w * h * 4.0 <= MAX_BYTES)
+        .then_some(page)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn edge_trace_ms() -> u64 {
+    static START: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(web_time::Instant::now).elapsed().as_millis() as u64
+}
+
 impl Raster {
+    /// Observe what this canvas frame submits, without changing scheduling.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn trace_canvas_edge(
+        &mut self,
+        view: &View,
+        page: PageId,
+        revision: u64,
+        viewport: Rect,
+        tex: TextureId,
+        at: Rect,
+        overview: Option<Rect>,
+        bands: &[Rect],
+    ) {
+        let now = edge_trace_ms();
+        let approximate_zoom = |z: f32| (z / view.zoom - 1.0).abs() < 0.001;
+        let main_sharp = !self.picture_failed && self.key.as_ref().is_some_and(|k| {
+            k.page == page && k.revision == revision && approximate_zoom(k.zoom)
+                && self.texture.as_ref().is_some_and(|t| t.id() == tex)
+        }) || self.levels.iter().any(|l| {
+            l.texture.id() == tex && l.key.page == page && l.key.revision == revision
+                && approximate_zoom(l.key.zoom)
+        });
+        let matching_job = self.job.as_ref().is_some_and(|job| {
+            job.key.page == page && job.key.revision == revision && approximate_zoom(job.key.zoom)
+                && !job.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let job_covers = matching_job && self.job.as_ref().and_then(|j| j.page_rect)
+            .is_some_and(|r| view.rect_to_screen(r).contains_rect(viewport.shrink(0.5)));
+        let holes = if main_sharp {
+            crate::canvas::outside(viewport, &[at])
+        } else {
+            vec![viewport]
+        };
+        let remaining = |areas: Vec<Rect>, cover: &[Rect]| -> f32 {
+            areas.into_iter().flat_map(|r| crate::canvas::outside(r, cover))
+                .map(|r| r.width().max(0.0) * r.height().max(0.0)).sum::<f32>()
+                / (viewport.width() * viewport.height()).max(1.0)
+        };
+        let missing = remaining(holes, if matching_job { bands } else { &[] });
+        let fallback = overview.map_or(0.0, |b| {
+            remaining(crate::canvas::backdrop_parts(viewport, at, b), bands)
+        });
+        let trace = &mut self.edge_trace;
+        if missing > 0.002 {
+            let phase = if trace.open.is_none() {
+                trace.open = Some(now);
+                "open"
+            } else if now.saturating_sub(trace.last) >= 100 {
+                "wait"
+            } else {
+                return;
+            };
+            trace.last = now;
+            log::info!(target: "tracedraw::edge_trace",
+                "edge {phase} ms={now} zoom={:.4} missing={:.3} overview={:.3} drawn_job={} active={} useful={matching_job} covers={job_covers} viewport={:?} main={:?}",
+                view.zoom, missing, fallback, self.renders, self.job.is_some(), viewport, at);
+        } else if let Some(open) = trace.open.take() {
+            log::info!(target: "tracedraw::edge_trace",
+                "edge sharp ms={now} elapsed_ms={} zoom={:.4} missing={:.3} drawn_job={}",
+                now.saturating_sub(open), view.zoom, missing, self.renders);
+        }
+    }
+
     /// One move of a fill (or an outline colour) dragged in a colour
     /// picker: the selection's part of the page (`region`, page mm)
     /// rendered anew into the picture shown, which the next moves render
@@ -659,6 +963,8 @@ impl Raster {
     /// it, and this draws it as the page stands (#3559).
     pub fn end_live_colour_drag(&mut self) {
         self.key = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.pan_pixels = None; }
     }
 
     /// Stop unfinished work while keeping the pictures already drawn.
@@ -668,15 +974,21 @@ impl Raster {
             self.job = None;
             self.backdrop_job = None;
             self.rested = None;
+            self.pan_regions.clear();
+            self.progressive_page = None;
+            self.move_frame = None;
+            self.move_commit_revision = None;
+            self.move_damage = None;
         }
     }
 
-    /// Spend more of the existing render margin in the direction being exposed.
+    /// Extend the render margin only on the edge being exposed.
     pub(crate) fn pan_render_rect(
         &mut self,
         view: &View,
         viewport: Rect,
         margin: f32,
+        reserve: f32,
         now: f64,
     ) -> Rect {
         let previous = self.pan_sample.replace((*view, viewport, now));
@@ -692,16 +1004,20 @@ impl Raster {
                 self.pan_lead = egui::Vec2::ZERO;
             }
         }
-        let limit = margin * 0.75;
+        let limit = (reserve - margin).max(0.0);
         self.pan_lead.x = self.pan_lead.x.clamp(-limit, limit);
         self.pan_lead.y = self.pan_lead.y.clamp(-limit, limit);
-        viewport.expand(margin).translate(self.pan_lead)
+        let mut rect = viewport.expand(margin);
+        rect.min += self.pan_lead.min(egui::Vec2::ZERO);
+        rect.max += self.pan_lead.max(egui::Vec2::ZERO);
+        rect
     }
 
     /// Drop the cached texture so the next frame re-renders (and the
     /// proofed colours, which the colour settings decide).
     pub fn invalidate(&mut self) {
         self.key = None;
+        self.failed_key = None;
         self.levels.clear();
         self.proof = None;
         self.settle = None;
@@ -709,7 +1025,10 @@ impl Raster {
         self.cancel_pending();
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.sharp_frame = None;
+            self.move_seed = None;
             self.backdrop = None;
+            self.pan_pixels = None;
             self.drag_backdrop = None;
             self.drag_backdrop_blocked = false;
             // Freed on a thread of its own, as a render frees its copy.
@@ -829,6 +1148,7 @@ impl Raster {
             zoom: view.zoom,
             offset: view.origin - rect.min,
             size: (w, h),
+            draft: !self.strict_sharp,
             preview: None,
             wireframe: false,
             simulate_overprints: false,
@@ -890,6 +1210,7 @@ impl Raster {
             zoom: key_view.zoom,
             offset: key_view.origin - rect.min,
             size: (w, h),
+            draft: !self.strict_sharp,
             preview: preview
                 .as_ref()
                 .map(|(s, t)| (s.iter().copied().collect(), t.as_coeffs())),
@@ -904,7 +1225,9 @@ impl Raster {
                 .zip(pixel_dpi)
                 .map(|(win, dpi)| ((dpi * 1000.0).round() as u64, win.ix0, win.iy1)),
         };
-        let vt = match (window, pixel_dpi) {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.requested_picture = Some(key.clone()); }
+        let mut vt = match (window, pixel_dpi) {
             // One render pixel per document pixel, the window's top-left
             // one at the corner.
             (Some(win), Some(dpi)) => ViewTransform {
@@ -920,6 +1243,14 @@ impl Raster {
                 stretch_y: 1.0,
             },
         };
+        // Pans keep the document on one physical-pixel lattice. Subpixel
+        // changes in the pointer do not invalidate all the painted pixels.
+        if self.main_viewport.is_some() && window.is_none() && preview.is_none()
+            && focus.is_none() && pixel_dpi.is_none()
+        {
+            vt.origin_x = vt.origin_x.round();
+            vt.origin_y = vt.origin_y.round();
+        }
         // A fill or an outline colour dragged in a colour picker changes
         // only the selection's look: the part of the page it covers is
         // rendered anew into the picture shown, the rest of which still
@@ -928,7 +1259,7 @@ impl Raster {
         // the picture shown is of another view or drawing state: the
         // usual render brings it up to date first.
         let live = self.live_region.filter(|r| {
-            window.is_none()
+            !self.strict_sharp && window.is_none()
                 && key.preview.is_none()
                 && key.focus.is_none()
                 && !self.follows_zoom
@@ -955,11 +1286,68 @@ impl Raster {
         // Rested only while the picture stays the one asked for.
         #[cfg(not(target_arch = "wasm32"))]
         let rested = self.rested.take();
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed_view = self.main_viewport.filter(|_| self.fixed_pan_sheet
+            && key.preview.is_none() && key.focus.is_none() && zoom_target.is_none());
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed_ahead = fixed_view.map(|viewport| {
+            let now = ctx.input(|i| i.time);
+            let previous = self.pan_sample.replace((*view, viewport, now));
+            let Some((before, previous_viewport, time)) = previous else { return viewport };
+            if before.zoom != view.zoom || previous_viewport != viewport || now - time > 0.25 {
+                return viewport;
+            }
+            let delta = before.origin - view.origin;
+            let margin = (rect.size() - viewport.size()) * 0.25;
+            let step = |d: f32, m: f32| if d.abs() * ppp >= 0.5 {
+                d.signum() * m.clamp(0.0, 320.0 / ppp)
+            } else { 0.0 };
+            viewport.translate(egui::vec2(step(delta.x, margin.x), step(delta.y, margin.y)))
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed_picture = |raster: &Self, cover: Rect| {
+            let (old, area, tex) = (raster.key.as_ref()?, raster.page_rect?, raster.texture.as_ref()?);
+            if raster.picture_failed {
+                return None;
+            }
+            sharp_region(old, &key, area, view, ppp, cover).map(|at| (tex.id(), at))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(viewport) = fixed_view.filter(|_| self.cache_pan_regions) {
+            if fixed_picture(self, viewport).is_none() {
+                if let Some((i, at)) = self.pan_regions.iter().enumerate().rev().find_map(|(i, region)| {
+                    sharp_region(&region.key, &key, region.page_rect, view, ppp, viewport)
+                        .map(|at| (i, at))
+                }) {
+                    let region = self.pan_regions.remove(i);
+                    if let Some(job) = &self.job {
+                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.stash_pan_region(&key);
+                    let id = region.texture.id();
+                    self.texture = Some(region.texture);
+                    self.key = Some(region.key);
+                    self.page_rect = Some(region.page_rect);
+                    self.picture_failed = false;
+                    self.rested = rested.or_else(|| Some(ctx.input(|i| i.time)));
+                    return Some((id, at));
+                }
+            }
+        }
         // A render on its thread: taken when ready; while it runs for the
         // view asked for (or the drawing changes faster than it draws), the
         // last picture shows, moved into place.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(job) = &self.job {
+            if let Some(viewport) = fixed_view {
+                if fixed_picture(self, viewport).is_some()
+                    && job.key.zoom == key.zoom && job.key.same_but_view(&key, false)
+                    && job.page_rect.is_some_and(|area| !view.rect_to_screen(area).contains_rect(viewport))
+                {
+                    // A reversal can make the pending sheet worse than the current one.
+                    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // Mark stale results before polling, including a result that
             // arrived since the document changed.
             if !self.follows_zoom && job.key.revision != key.revision {
@@ -1000,9 +1388,22 @@ impl Raster {
                 }
             }
             if self.poll_job(ctx) {
-                return self.shown_meanwhile(view, screen);
+                return fixed_view.and_then(|viewport| fixed_picture(self, viewport))
+                    .or_else(|| self.shown_meanwhile(view, screen));
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed_prefetch = if let Some(viewport) = fixed_view {
+            if let Some(picture) = fixed_picture(self, viewport) {
+                if fixed_ahead.is_some_and(|ahead| picture.1.contains_rect(ahead)) {
+                    self.rested = rested.or_else(|| Some(ctx.input(|i| i.time)));
+                    return Some(picture);
+                }
+                true
+            } else { false }
+        } else { false };
+        #[cfg(target_arch = "wasm32")]
+        let fixed_prefetch = false;
         // Back at a zoom the view showed: its kept picture at once, no
         // render (#3894).
         if window.is_none()
@@ -1014,6 +1415,12 @@ impl Raster {
             if let Some(job) = self.job.take() {
                 job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+        if self.failed_key.as_ref() == Some(&key) {
+            #[cfg(not(target_arch = "wasm32"))]
+            return self.shown_meanwhile(view, screen);
+            #[cfg(target_arch = "wasm32")]
+            return None;
         }
         if self.key.as_ref() == Some(&key) {
             if let Some(t) = &self.texture {
@@ -1064,7 +1471,7 @@ impl Raster {
                         let ahead = viewport.union(viewport.translate(self.pan_lead * 0.5));
                         !view.rect_to_screen(page_rect).contains_rect(ahead)
                     });
-                if moved && !zoom_now && !uncovered_pan {
+                if moved && !zoom_now && !uncovered_pan && !fixed_prefetch {
                     let now = ctx.input(|i| i.time);
                     let due = match &self.settle {
                         Some((k, due)) if *k == key => *due,
@@ -1108,7 +1515,7 @@ impl Raster {
             simulate_overprints,
             complex_effects,
             anti_alias: true,
-            draft: true,
+            draft: !self.strict_sharp,
             focus,
         };
         let lut = proof.then(|| {
@@ -1160,7 +1567,8 @@ impl Raster {
                 if let Some(wait) = turns.retry_after() {
                     ctx.request_repaint_after(wait);
                 }
-                return self.shown_meanwhile(view, screen);
+                return fixed_view.and_then(|viewport| fixed_picture(self, viewport))
+                    .or_else(|| self.shown_meanwhile(view, screen));
             };
             let (doc, stale) = match self.snapshot.clone() {
                 Some(shared) => (shared, None),
@@ -1193,33 +1601,103 @@ impl Raster {
             let progressive_zoom = self.key.as_ref().is_some_and(|old| {
                 self.zooms_at_once(old, &key) && old.same_but_view(&key, true)
             });
+            if self.progressive_page.as_ref().is_some_and(|p| !p.matches(&doc, page)) {
+                self.progressive_page = None;
+            }
+            let prepared = (progressive_zoom && opts.preview.is_none() && opts.focus.is_none())
+                .then(|| self.progressive_page.get_or_insert_with(|| {
+                    std::sync::Arc::new(tracedraw_render::ProgressivePage::new(doc.clone(), page))
+                }).clone());
             let (bands_tx, bands) = if progressive_zoom {
                 let (tx, rx) = std::sync::mpsc::channel();
                 (Some(tx), Some(rx))
             } else {
                 (None, None)
             };
+            let trace_id = self.renders + 1;
+            let trace_zoom = key.zoom;
+            let trace_revision = key.revision;
+            let first_row = if self.strict_sharp {
+                ctx.input(|i| i.pointer.hover_pos())
+                    .map(|p| key_view.to_page(p))
+                    .map_or(h / 2, |p| (vt.origin_y - p.y * vt.zoom).clamp(0.0, f64::from(h)) as u32)
+            } else {
+                h / 2
+            };
+            let reuse = if !self.strict_sharp && !self.fixed_pan_sheet && !self.picture_failed && self.main_viewport.is_some()
+                && key.preview.is_none() && key.focus.is_none() && window.is_none()
+            {
+                self.key.as_ref().zip(self.page_rect).and_then(|(old, rect)| {
+                    (old.zoom == key.zoom && old.same_but_view(&key, true))
+                        .then(|| self.pan_pixels.clone().map(|image| (image, rect)))
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            let move_reuse = self.move_damage.take().and_then(|(revision, damage)| {
+                let (old, image) = self.move_seed.as_ref()?;
+                let mut expected = old.clone();
+                expected.revision = revision;
+                (expected == key && revision == old.revision.checked_add(1)? && !zoom_now)
+                    .then(|| (image.clone(), damage))
+            });
             std::thread::spawn(move || {
                 #[cfg(test)]
                 let _held = hold.as_ref().map(|m| m.lock());
                 let t = web_time::Instant::now();
-                let image = match &bands_tx {
+                if edge_trace_enabled() {
+                    log::info!(target: "tracedraw::edge_trace",
+                        "render start ms={} job={trace_id} revision={trace_revision} zoom={trace_zoom:.4} area={picture_rect:?} progressive={progressive_zoom}",
+                        edge_trace_ms());
+                }
+                let reused = reuse.and_then(|(pixels, rect)| {
+                    pan_picture(&doc, page, &opts, &pixels, rect, lut.as_deref(), &gives_up)
+                });
+                let moved = move_reuse.and_then(|(pixels, damage)| {
+                    move_picture(&doc, page, &opts, &pixels, damage, lut.as_deref(), &gives_up)
+                });
+                let from_move = moved.is_some();
+                let from_patches = reused.is_some();
+                let reused = moved.or(reused);
+                let image = reused.or_else(|| match &bands_tx {
                     Some(bands_tx) => {
                         let band_wake = wake.clone();
                         let lut = lut.as_deref();
+                        let first_sent = std::sync::atomic::AtomicBool::new(false);
                         let band = move |y0: u32, rows: &tiny_skia::Pixmap| {
                             if bands_tx.send((y0, to_image(rows, lut))).is_ok() {
+                                if edge_trace_enabled() && !first_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    log::info!(target: "tracedraw::edge_trace",
+                                        "first band ms={} job={trace_id} row={y0}", edge_trace_ms());
+                                }
                                 band_wake.request_repaint();
                             }
                         };
-                        render_page_progressive(&doc, page, &opts, &gives_up, h / 2, &band)
+                        render_page_progressive_prepared(
+                            &doc, page, &opts, &gives_up, first_row, &band, prepared.as_deref(), edge_trace_enabled(),
+                            |stats| if edge_trace_enabled() {
+                                log::info!(target: "tracedraw::edge_trace",
+                                    "prepare job={trace_id} geometry_us={} candidates_us={} reused_bounds={}",
+                                    stats.geometry.as_micros(), stats.candidates.as_micros(), stats.reused_bounds);
+                                let c = stats.stats;
+                                log::info!(target: "tracedraw::edge_trace",
+                                    "candidates job={trace_id} bands={} entries={} lists_discarded={} shadow_always={} shadow_base_outside={} symbol_always={} symbol_base_outside={}",
+                                    c.bands, c.candidate_entries, c.lists_discarded, c.shadow_always,
+                                    c.shadow_base_outside, c.symbol_always, c.symbol_base_outside);
+                            },
+                        )
                     }
                     None => match drag_backdrop {
                         Some(cache) => cache.render(&opts, &gives_up),
                         None => render_page_cancellable(&doc, page, &opts, &gives_up),
                     },
                 }
-                .map(|pm| to_image(&pm, lut.as_deref()));
+                .map(|pm| to_image(&pm, lut.as_deref())));
+                if edge_trace_enabled() {
+                    log::info!(target: "tracedraw::edge_trace",
+                        "render end ms={} job={trace_id} revision={trace_revision} ready={} pan_patches={from_patches} move_patches={from_move}", edge_trace_ms(), image.is_some());
+                }
                 let _ = tx.send(image.map(|i| (i, t.elapsed().as_secs_f64())));
                 drop(doc);
                 drop(stale);
@@ -1228,7 +1706,7 @@ impl Raster {
             });
             self.renders += 1;
             self.job = Some(Job {
-                key,
+                key: key.clone(),
                 page_rect,
                 rx,
                 cancel,
@@ -1238,13 +1716,17 @@ impl Raster {
                 size: (w, h),
                 filter,
             });
-            return self.shown_meanwhile(view, screen);
+            return fixed_view.and_then(|viewport| fixed_picture(self, viewport))
+                .or_else(|| self.shown_meanwhile(view, screen));
         }
         let t = web_time::Instant::now();
         self.renders += 1;
-        let pixmap = match render_page(doc, page, &opts) {
-            Some(pm) => pm,
-            None => tiny_skia::Pixmap::new(w, h).unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap()),
+        let Some(pixmap) = render_page(doc, page, &opts) else {
+            self.failed_key = Some(key);
+            #[cfg(not(target_arch = "wasm32"))]
+            return self.shown_meanwhile(view, screen);
+            #[cfg(target_arch = "wasm32")]
+            return None;
         };
         let image = to_image(&pixmap, lut.as_deref());
         self.last_seconds = t.elapsed().as_secs_f64();
@@ -1506,15 +1988,116 @@ impl Raster {
     /// see-through object there is drawn twice, darker, until the whole
     /// picture comes (#3639).
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn incoming(&self, view: &View) -> Option<(TextureId, Rect, Vec<Rect>)> {
+    pub fn incoming(&self, view: &View, ppp: f32) -> Option<(TextureId, Rect, Vec<Rect>)> {
         let job = self.job.as_ref()?;
         if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
         let tex = job.incoming.as_ref()?.id();
-        let at = view.rect_to_screen(job.page_rect?);
+        let at = exact_placement(&job.key, self.requested_picture.as_ref()?, job.page_rect?, view, ppp)?;
         let covered = band_rects(at, job.size.1, &job.arrived);
         Some((tex, at, covered))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn strict_regions(&self, view: &View, ppp: f32, wanted: Rect) -> Vec<(TextureId, Rect)> {
+        let Some(key) = self.requested_picture.as_ref() else { return Vec::new() };
+        let locate = |old: &Key, page, texture: &TextureHandle| {
+            let at = exact_placement(old, key, page, view, ppp)?;
+            at.intersect(wanted).is_positive().then_some((texture.id(), at))
+        };
+        let mut regions = Vec::new();
+        if !self.picture_failed {
+            if let (Some(old), Some(page), Some(texture)) = (&self.key, self.page_rect, &self.texture) {
+                regions.extend(locate(old, page, texture));
+            }
+        }
+        regions.extend(self.pan_regions.iter().rev().chain(self.levels.iter().rev())
+            .filter_map(|region| locate(&region.key, region.page_rect, &region.texture)));
+        regions
+    }
+
+    /// Exact regions and a moving, zoom-only fallback. The compositor
+    /// must prefer exact regions and finished bands over the fallback.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn strict_frame(&mut self, view: &View, ppp: f32, wanted: Rect) -> (Vec<(TextureId, Rect)>, Vec<(TextureId, Rect)>) {
+        let regions = self.strict_regions(view, ppp, wanted);
+        let Some(key) = self.requested_picture.as_ref() else { return (regions, Vec::new()) };
+        if self.sharp_frame.as_ref().is_some_and(|f|
+            f.viewport != wanted || f.ppp != ppp || !f.key.same_but_view(key, true))
+        {
+            self.sharp_frame = None;
+        }
+        let complete = !regions.is_empty()
+            && crate::canvas::outside(wanted, &regions.iter().map(|&(_, at)| at).collect::<Vec<_>>()).is_empty();
+        if complete {
+            if edge_trace_enabled() && self.move_commit_revision == Some(key.revision) {
+                log::info!(target: "tracedraw::edge_trace",
+                    "move exact frame submitted ms={} revision={}", edge_trace_ms(), key.revision);
+            }
+            self.move_frame = None;
+            self.move_commit_revision = None;
+            self.move_damage = None;
+            let textures = regions.iter().filter_map(|&(id, at)| {
+                self.texture.iter().chain(self.pan_regions.iter().map(|r| &r.texture))
+                    .chain(self.levels.iter().map(|r| &r.texture))
+                    .find(|t| t.id() == id).map(|t| (t.clone(), at))
+            }).collect();
+            self.sharp_frame = Some(SharpFrame {
+                key: key.clone(), viewport: wanted, ppp, view: *view, textures,
+            });
+        } else if let Some(frame) = &self.move_frame {
+            if frame.viewport == wanted && frame.ppp == ppp
+                && frame.view.zoom == view.zoom && frame.view.origin == view.origin
+                && frame.key.page == key.page
+                && self.move_commit_revision == Some(key.revision)
+                && frame.key.wireframe == key.wireframe
+                && frame.key.simulate_overprints == key.simulate_overprints
+                && frame.key.complex_effects == key.complex_effects && frame.key.proof == key.proof
+                && frame.key.focus == key.focus
+            {
+                return (regions, frame.textures.iter().map(|(t, at)| (t.id(), *at)).collect());
+            }
+            self.move_frame = None;
+        }
+        if !complete {
+          if let Some(frame) = &self.sharp_frame {
+            if frame.view.zoom != view.zoom {
+                let fallback = frame.textures.iter().filter_map(|(t, at)| {
+                    let at = view.rect_to_screen(frame.view.visible_page_rect(*at));
+                    at.intersect(wanted).is_positive().then_some((t.id(), at))
+                }).collect();
+                return (regions, fallback);
+            }
+          }
+        }
+        (regions, Vec::new())
+    }
+
+    /// Retain the exact-scale texture already used to show the move.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn remember_move_frame(
+        &mut self, id: TextureId, view: &View, ppp: f32, viewport: Rect,
+    ) {
+        let Some(key) = self.key.as_ref() else { return };
+        let Some(texture) = self.texture.as_ref().filter(|t| t.id() == id) else { return };
+        let Some(area) = self.page_rect else { return };
+        let Some(at) = exact_placement(key, key, area, view, ppp) else { return };
+        if self.picture_failed || !at.contains_rect(viewport) {
+            return;
+        }
+        self.move_frame = Some(SharpFrame {
+            key: key.clone(), viewport, ppp, view: *view, textures: vec![(texture.clone(), at)],
+        });
+    }
+
+    /// A fast release or outline-only move may never show a drag texture.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn retain_before_move_commit(&mut self, revision: u64) {
+        if !self.move_frame.as_ref().is_some_and(|frame| frame.key.revision == revision) {
+            self.move_frame = self.sharp_frame.as_ref()
+                .filter(|frame| frame.key.revision == revision).cloned();
+        }
     }
 
     /// The last picture, where its part of the page now is on screen
@@ -1548,6 +2131,35 @@ impl Raster {
         ))
     }
 
+    /// Keep the exact-scale overlap when a cached level fills the exposed edge.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn sharp_overlap(
+        &self,
+        view: &View,
+        screen: Rect,
+        fallback: TextureId,
+        page: PageId,
+        revision: u64,
+    ) -> Option<(TextureId, Rect)> {
+        let current = self.key.as_ref()?;
+        let tex = self.texture.as_ref()?.id();
+        if tex == fallback
+            || current.zoom != view.zoom
+            || current.page != page
+            || current.revision != revision
+            || self.picture_failed
+            || self.follows_zoom
+        {
+            return None;
+        }
+        let level = self.levels.iter().find(|level| level.texture.id() == fallback)?;
+        if level.key.zoom >= current.zoom || !current.same_but_view(&level.key, false) {
+            return None;
+        }
+        let at = view.rect_to_screen(self.page_rect?);
+        at.intersect(screen).is_positive().then_some((tex, at))
+    }
+
     /// Take `image`, the picture of `key`: the picture it replaces is
     /// kept as a level when it is of another zoom of the drawing as it
     /// stands, and levels of anything else go (#3894).
@@ -1559,6 +2171,27 @@ impl Raster {
         key: Key,
         page_rect: Option<tracedraw_core::geometry::Rect>,
     ) {
+        let image = std::sync::Arc::new(image);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if move_damage_enabled() && self.strict_sharp && self.main_viewport.is_some()
+                && key.preview.is_none() && key.focus.is_none() && page_rect.is_some()
+            {
+                self.move_seed = (image.pixels.len() <= 8 * 1024 * 1024)
+                    .then(|| (key.clone(), image.clone()));
+            }
+            self.pan_pixels = (!self.fixed_pan_sheet && self.main_viewport.is_some()
+                && page_rect.is_some()
+                && key.preview.is_none()
+                && key.focus.is_none()
+                && image.pixels.len() <= 8 * 1024 * 1024)
+                .then(|| image.clone());
+            if self.cache_pan_regions && self.fixed_pan_sheet && page_rect.is_some() {
+                self.stash_pan_region(&key);
+            } else {
+                self.pan_regions.clear();
+            }
+        }
         let keep = cfg!(not(target_arch = "wasm32"))
             && !self.picture_failed
             && !self.follows_zoom
@@ -1578,6 +2211,8 @@ impl Raster {
                 });
             }
             self.texture = Some(ctx.load_texture("page", image, filter));
+        } else if self.texture.as_ref().is_some_and(|t| self.sharp_frame_owns(t.id(), key.zoom)) {
+            self.texture = Some(ctx.load_texture("page", image, filter));
         } else if let Some(t) = &mut self.texture {
             t.set(image, filter);
         } else {
@@ -1596,8 +2231,41 @@ impl Raster {
             self.levels.remove(0);
         }
         self.key = Some(key);
+        self.failed_key = None;
         self.picture_failed = false;
         self.page_rect = page_rect;
+    }
+
+    fn sharp_frame_owns(&self, _id: TextureId, _new_zoom: f32) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.sharp_frame.as_ref().is_some_and(|f|
+            f.view.zoom != _new_zoom && f.textures.iter().any(|(t, _)| t.id() == _id));
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stash_pan_region(&mut self, key: &Key) {
+        let compatible = |old: &Key| old.zoom == key.zoom && old.same_but_view(key, true);
+        self.pan_regions.retain(|level| compatible(&level.key));
+        if self.picture_failed || !self.key.as_ref().is_some_and(compatible) {
+            return;
+        }
+        if let (Some(texture), Some(key), Some(page_rect)) =
+            (self.texture.take(), self.key.take(), self.page_rect)
+        {
+            self.pan_regions.retain(|region| region.page_rect != page_rect);
+            self.pan_regions.push(Level { key, texture, page_rect });
+        }
+        let bytes = |region: &Level| {
+            let [w, h] = region.texture.size();
+            w * h * 4
+        };
+        while self.pan_regions.len() > 4
+            || self.pan_regions.iter().map(bytes).sum::<usize>() > 96 * 1024 * 1024
+        {
+            self.pan_regions.remove(0);
+        }
     }
 
     /// Let go of the pictures kept of other zooms, as when the view has
@@ -1632,6 +2300,8 @@ impl Raster {
         }
         self.picture_failed = false;
         self.texture = Some(level.texture);
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.pan_pixels = None; }
         self.page_rect = Some(level.page_rect);
         self.key = Some(key.clone());
         true
@@ -1663,8 +2333,7 @@ impl Raster {
                                 job.page_rect,
                             );
                         } else {
-                            self.picture_failed = true;
-                            self.key = Some(job.key.clone());
+                            self.failed_key = Some(job.key.clone());
                         }
                     }
                 }
@@ -1674,8 +2343,7 @@ impl Raster {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 if let Some(job) = self.job.take() {
                     if !job.cancel.load(Ordering::Relaxed) {
-                        self.picture_failed = true;
-                        self.key = Some(job.key.clone());
+                        self.failed_key = Some(job.key.clone());
                     }
                 }
                 false
@@ -1813,6 +2481,7 @@ impl Key {
             && self.zoom == other.zoom
             && self.offset == other.offset
             && self.size == other.size
+            && self.draft == other.draft
             && self.preview == other.preview
             && self.wireframe == other.wireframe
             && self.simulate_overprints == other.simulate_overprints
@@ -1831,6 +2500,7 @@ impl Key {
         self.revision == other.revision
             && self.page == other.page
             && (any_size || self.size == other.size)
+            && self.draft == other.draft
             && self.preview == other.preview
             && self.wireframe == other.wireframe
             && self.simulate_overprints == other.simulate_overprints
@@ -2355,23 +3025,245 @@ mod tests {
         assert!(raster.job.is_none());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn pan_lead_keeps_the_pixel_budget_and_switches_on_reversal() {
+    fn a_move_keeps_the_last_picture_until_the_committed_revision_is_drawn() {
+        let ctx = Context::default();
+        let doc = Document::new("move", Size::new(100.0, 50.0));
+        let view = View::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0));
+        let mut raster = Raster::default();
+        let (id, _) = pass(&ctx, &mut raster, &doc, &view, rect, 0.0);
+        raster.strict_frame(&view, 1.0, rect);
+        let revision = raster.requested_picture.as_ref().expect("request").revision;
+        raster.retain_before_move_commit(revision);
+        let mut committed = raster.requested_picture.clone().expect("request");
+        committed.revision += 1;
+        committed.draft = false;
+        raster.move_commit_revision = Some(committed.revision);
+        raster.requested_picture = Some(committed.clone());
+        let (exact, fallback) = raster.strict_frame(&view, 1.0, rect);
+        assert!(exact.is_empty());
+        assert_eq!(fallback, vec![(id, rect)]);
+        let page_rect = raster.page_rect;
+        raster.take_picture(&ctx, ColorImage::filled([100, 80], egui::Color32::WHITE),
+            TextureOptions::LINEAR, committed, page_rect);
+        let (exact, fallback) = raster.strict_frame(&view, 1.0, rect);
+        assert!(!exact.is_empty() && fallback.is_empty());
+        assert!(raster.move_frame.is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn zoom_fallback_moves_immediately_and_disappears_after_a_complete_render() {
+        let ctx = Context::default();
+        let doc = Document::new("zoom hold", Size::new(100.0, 50.0));
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0));
+        let mut view = View::default();
+        let mut raster = Raster { strict_sharp: true, ..Default::default() };
+        pass(&ctx, &mut raster, &doc, &view, rect, 0.0);
+        let (before, fallback) = raster.strict_frame(&view, 1.0, rect);
+        assert!(fallback.is_empty() && !before.is_empty());
+        let anchor = egui::pos2(20.0, 30.0);
+        let anchored_page_point = view.to_page(anchor);
+        view.zoom_at(anchor, 2.0);
+        raster.requested_picture.as_mut().expect("request").zoom = view.zoom;
+        let (precise, fallback) = raster.strict_frame(&view, 1.0, rect);
+        assert!(precise.is_empty());
+        assert_eq!(fallback[0].0, before[0].0);
+        assert!(fallback[0].1.min.distance(egui::pos2(-20.0, -30.0)) < 0.01);
+        assert!((fallback[0].1.size() - egui::vec2(200.0, 160.0)).length() < 0.01);
+        assert!(view.to_screen(anchored_page_point).distance(anchor) < 0.01);
+        let key = raster.requested_picture.clone().expect("request");
+        let page_rect = view.visible_page_rect(rect);
+        raster.take_picture(
+            &ctx, ColorImage::filled([100, 80], egui::Color32::WHITE),
+            TextureOptions::LINEAR, key, Some(page_rect),
+        );
+        let (after, fallback) = raster.strict_frame(&view, 1.0, rect);
+        assert!(fallback.is_empty() && !after.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sharp_placement_rejects_stale_scale_revision_and_quality() {
+        let ctx = Context::default();
+        let doc = Document::new("sharp", Size::new(100.0, 50.0));
+        let view = View::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0));
+        let mut raster = Raster::default();
+        pass(&ctx, &mut raster, &doc, &view, rect, 0.0);
+        let key = raster.key.expect("picture");
+        let page = raster.page_rect.expect("page area");
+        let mut shifted = view;
+        shifted.pan(egui::vec2(0.4, 0.6));
+        let at = exact_placement(&key, &key, page, &shifted, 1.0).expect("shifted");
+        assert_eq!(at.min, egui::pos2(0.0, 1.0));
+        assert!(exact_placement(&key, &key, page, &shifted, 1.25).is_none());
+        shifted.zoom *= 1.01;
+        assert!(exact_placement(&key, &key, page, &shifted, 1.0).is_none());
+        let mut other = key.clone();
+        other.revision += 1;
+        assert!(exact_placement(&key, &other, page, &view, 1.0).is_none());
+        other.revision = key.revision;
+        other.draft = !key.draft;
+        assert!(exact_placement(&key, &other, page, &view, 1.0).is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_failed_render_does_not_relabel_the_previous_texture() {
+        let ctx = Context::default();
+        let doc = Document::new("failed", Size::new(100.0, 50.0));
+        let view = View::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0));
+        let mut raster = Raster::default();
+        let (tex, _) = pass(&ctx, &mut raster, &doc, &view, rect, 0.0);
+        let old = raster.key.clone().expect("picture");
+        let mut failed = old.clone();
+        failed.zoom *= 2.0;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(None).expect("receiver");
+        raster.job = Some(Job {
+            key: failed.clone(), page_rect: raster.page_rect, rx, bands: None,
+            cancel: Default::default(), incoming: None, arrived: Vec::new(),
+            size: failed.size, filter: TextureOptions::LINEAR,
+        });
+        assert!(!raster.poll_job(&ctx));
+        assert!(raster.key.as_ref() == Some(&old));
+        assert!(raster.failed_key.as_ref() == Some(&failed));
+        assert_eq!(raster.texture.as_ref().map(|t| t.id()), Some(tex));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn visited_pan_regions_restore_without_rendering_in_both_axes() {
+        let ctx = Context::default();
+        let doc = Document::new("regions", Size::new(100.0, 50.0));
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let sheet = fixed_pan_sheet_rect(viewport, 1.0, 512).expect("sheet");
+        let mut raster = Raster {
+            fixed_pan_sheet: true,
+            cache_pan_regions: true,
+            main_viewport: Some(viewport),
+            ..Default::default()
+        };
+        let a = View::default();
+        let (a_tex, _) = pass(&ctx, &mut raster, &doc, &a, sheet, 0.0);
+        for (i, delta) in [egui::vec2(420.0, 0.0), egui::vec2(0.0, 380.0)].into_iter().enumerate() {
+            let mut b = a;
+            b.pan(delta);
+            raster.last_seconds = 0.0;
+            let time = 1.0 + i as f64;
+            let (b_tex, _) = pass(&ctx, &mut raster, &doc, &b, sheet, time);
+            assert_ne!(b_tex, a_tex);
+            let renders = raster.render_count();
+            let (restored, at) = pass(&ctx, &mut raster, &doc, &a, sheet, time + 0.01);
+            assert_eq!(restored, a_tex);
+            assert_eq!(raster.render_count(), renders);
+            assert!(at.contains_rect(viewport));
+        }
+        raster.invalidate();
+        assert!(raster.pan_regions.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn whole_pan_page_respects_texture_and_memory_limits() {
+        let canvas = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 550.0));
+        let page = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(6728.0, 4112.0));
+        assert_eq!(whole_pan_page_rect(page, canvas, 1.25, 16384), Some(page));
+        assert!(whole_pan_page_rect(page, canvas, 1.25, 8192).is_none());
+        assert!(whole_pan_page_rect(page, canvas, 2.0, 16384).is_none());
+        assert!(whole_pan_page_rect(page, canvas.translate(egui::vec2(-1.0, 0.0)), 1.25, 16384).is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fixed_pan_sheet_prefetches_near_edge_without_replacing_visible_picture() {
+        static TURNS: Turns = Turns::new();
+        let ctx = Context::default();
+        let doc = Document::new("sheet", Size::new(100.0, 50.0));
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let sheet = fixed_pan_sheet_rect(viewport, 1.0, 512).expect("sheet");
+        assert!(sheet.width() <= 510.0 && sheet.height() <= 510.0);
+        let mut raster = Raster {
+            turns: Some(&TURNS),
+            fixed_pan_sheet: true,
+            main_viewport: Some(viewport),
+            threaded: true,
+            ..Default::default()
+        };
+        let mut view = View::default();
+        let (tex, _) = pass(&ctx, &mut raster, &doc, &view, sheet, 0.0);
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(()));
+        raster.hold = Some(hold.clone());
+        let _held = hold.lock().expect("hold render");
+        view.pan(egui::vec2(31.25, -10.25));
+        let (moved, at) = pass(&ctx, &mut raster, &doc, &view, sheet, 0.02);
+        assert_eq!(moved, tex);
+        assert_eq!(raster.render_count(), 1);
+        assert!(at.contains_rect(viewport));
+        assert!(at.left().fract().abs() < 0.001);
+        view.pan(egui::vec2(30.0, 0.0));
+        let (shown, at) = pass(&ctx, &mut raster, &doc, &view, sheet, 0.04);
+        assert_eq!(raster.render_count(), 2);
+        assert_eq!(shown, tex);
+        assert!(at.contains_rect(viewport));
+        view.pan(egui::vec2(10.0, 0.0));
+        let (shown, at) = pass(&ctx, &mut raster, &doc, &view, sheet, 0.06);
+        assert_eq!(shown, tex);
+        assert!(at.contains_rect(viewport));
+        assert_eq!(raster.render_count(), 2);
+    }
+
+    #[test]
+    fn pan_lead_extends_only_one_edge_and_switches_on_reversal() {
         let mut raster = Raster::default();
         let mut view = View::default();
         let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
-        let base = raster.pan_render_rect(&view, viewport, 20.0, 0.0);
+        let base = raster.pan_render_rect(&view, viewport, 20.0, 40.0, 0.0);
         view.pan(egui::vec2(12.0, 0.0));
-        let forward = raster.pan_render_rect(&view, viewport, 20.0, 0.016);
-        assert_eq!(forward.size(), base.size());
+        let forward = raster.pan_render_rect(&view, viewport, 20.0, 40.0, 0.016);
+        assert_eq!(forward.right(), base.right());
+        assert_eq!(forward.left(), viewport.left() - 40.0);
         assert!(forward.contains_rect(viewport));
         assert!(forward.left() < base.left());
-        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 0.032), forward);
+        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 40.0, 0.032), forward);
         view.pan(egui::vec2(-12.0, 0.0));
-        let reverse = raster.pan_render_rect(&view, viewport, 20.0, 0.048);
+        let reverse = raster.pan_render_rect(&view, viewport, 20.0, 40.0, 0.048);
         assert!(reverse.right() > base.right());
         view.zoom *= 1.1;
-        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 0.064), base);
+        assert_eq!(raster.pan_render_rect(&view, viewport, 20.0, 40.0, 0.064), base);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_diagonal_pan_paints_only_the_edges_and_copies_the_overlap() {
+        use tracedraw_core::geometry::Rect as R;
+        let doc = Document::new("pan", Size::new(100.0, 50.0));
+        let page = doc.pages[0].id;
+        let old = ColorImage::filled([64, 64], egui::Color32::RED);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            view: ViewTransform { zoom: 1.0, origin_x: 12.0, origin_y: 56.0, stretch_y: 1.0 },
+            ..Default::default()
+        };
+        let image = pan_picture(
+            &doc, page, &opts, &old, R::new(0.0, 0.0, 64.0, 64.0), None,
+            &std::sync::atomic::AtomicBool::new(false),
+        ).expect("reuse");
+        for y in 0..64 {
+            for x in 0..64 {
+                let expected = if x >= 12 && y < 56 {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                assert_eq!(image.pixels[y * 64 + x], expected);
+            }
+        }
     }
 
     /// A pan shows the last render moved into place at once, and renders
@@ -2897,6 +3789,50 @@ mod tests {
         assert_eq!(nearest_level(&pictures, 4.0, visible), Some(1));
         assert_eq!(nearest_level(&pictures, 1.2, visible), Some(0));
         assert_eq!(nearest_level(&pictures[2..], 4.0, visible), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn same_scale_overlap_survives_a_covering_coarse_level() {
+        use tracedraw_core::geometry::Rect as R;
+        let ctx = Context::default();
+        let doc = Document::new("overlap", Size::new(100.0, 50.0));
+        let view = View::default();
+        let canvas = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let mut raster = Raster::default();
+        let (sharp_tex, _) = pass(&ctx, &mut raster, &doc, &view, canvas, 0.0);
+        let key = raster.key.clone().expect("first picture");
+        let sharp = R::new(0.0, 0.0, 40.0, 30.0);
+        let screen = view.rect_to_screen(R::new(20.0, 0.0, 60.0, 30.0));
+        raster.page_rect = Some(sharp);
+        let mut coarse = key.clone();
+        coarse.zoom *= 0.5;
+        let texture = ctx.load_texture(
+            "coarse",
+            ColorImage::filled([1, 1], egui::Color32::WHITE),
+            TextureOptions::LINEAR,
+        );
+        let fallback = texture.id();
+        raster.levels.push(Level {
+            key: coarse,
+            texture,
+            page_rect: R::new(0.0, 0.0, 100.0, 100.0),
+        });
+        assert_eq!(
+            raster.shown_meanwhile(&view, screen).map(|(tex, _)| tex),
+            Some(fallback),
+        );
+        assert_eq!(
+            raster.sharp_overlap(&view, screen, fallback, key.page, key.revision),
+            Some((sharp_tex, view.rect_to_screen(sharp))),
+        );
+        assert!(
+            raster.sharp_overlap(&view, screen, fallback, key.page, key.revision ^ 1).is_none()
+        );
+        let distant = screen.translate(egui::vec2(1000.0, 0.0));
+        assert!(
+            raster.sharp_overlap(&view, distant, fallback, key.page, key.revision).is_none()
+        );
     }
 
     /// Zoomed out and back (#3894): the picture of the first zoom is kept
@@ -3534,6 +4470,7 @@ mod tests {
                         zoom: 1.0,
                         offset: egui::Vec2::ZERO,
                         size: (1, 1),
+                        draft: true,
                         preview: None,
                         wireframe: false,
                         simulate_overprints: false,
@@ -3715,6 +4652,7 @@ fn transform_preview_stale_picture_does_not_hide_outline() {
         zoom: 1.0,
         offset: egui::Vec2::ZERO,
         size: (1, 1),
+        draft: true,
         preview: Some(([id].into_iter().collect(), first.as_coeffs())),
         wireframe: false,
         simulate_overprints: false,
